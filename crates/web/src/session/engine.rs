@@ -56,6 +56,8 @@ struct Inner {
     gfx_channel: Option<u32>,
     display_channel: Option<u32>,
     display_ready: bool,
+    /// Taille voulue (fenêtre) : appliquée dès que le contrôle d'affichage devient prêt.
+    desired: Option<(u32, u32)>,
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
@@ -127,6 +129,7 @@ impl Engine {
             gfx_channel: None,
             display_channel: None,
             display_ready: false,
+            desired: None,
             desktop: (w, h),
             cursors: vec![None; 32],
             pressed: HashSet::new(),
@@ -320,7 +323,16 @@ impl Engine {
                     self.gfx_outputs(channel_id, outs, h264).await?;
                 } else if display {
                     // DISPLAYCONTROL_CAPS_PDU : le serveur accepte désormais des dispositions d'écran.
-                    self.inner.borrow_mut().display_ready = true;
+                    // Windows n'ouvre ce canal que quelques secondes après la connexion : on applique
+                    // alors la taille demandée entre-temps.
+                    let desired = {
+                        let mut i = self.inner.borrow_mut();
+                        i.display_ready = true;
+                        i.desired
+                    };
+                    if let Some((w, h)) = desired {
+                        self.resize(w, h);
+                    }
                 }
             }
             Event::DvcClosed { channel_id } => {
@@ -912,9 +924,7 @@ impl Engine {
         if multi {
             return;
         }
-        web_sys::console::debug_1(
-            &format!("redimensionnement demandé {w}×{h} (actuel {current:?}, canal {channel:?}, prêt {ready})").into(),
-        );
+        self.inner.borrow_mut().desired = Some((w, h));
         let (Some(channel), true) = (channel, ready) else { return };
         if (w, h) == current {
             return;

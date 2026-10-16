@@ -37,6 +37,14 @@ impl Session {
 
 fn main() {
     console_error_panic_hook::set_once();
+    // PWA : appli installable (le service worker ne met jamais l'API ni la session en cache).
+    if let Ok(sw) = js_sys::Reflect::get(&window().navigator(), &"serviceWorker".into())
+        && !sw.is_undefined()
+        && let Ok(register) = js_sys::Reflect::get(&sw, &"register".into())
+        && let Some(f) = wasm_bindgen::JsCast::dyn_ref::<js_sys::Function>(&register)
+    {
+        let _ = f.call1(&sw, &"/sw.js".into());
+    }
     leptos::mount::mount_to_body(App);
 }
 

@@ -14,7 +14,7 @@ mod yuv;
 
 use alloc::{collections::BTreeMap, collections::VecDeque, string::String, vec, vec::Vec};
 
-use rdp_codecs::{clearcodec::ClearCodec, zgfx::Zgfx};
+use rdp_codecs::{clearcodec::ClearCodec, progressive::Progressive, zgfx::Zgfx};
 
 pub use cmd::caps_advertise;
 pub use yuv::Yuv420;
@@ -98,6 +98,7 @@ struct PendingAvc {
 pub struct Gfx {
     zgfx: Zgfx,
     clear: ClearCodec,
+    progressive: Progressive,
     surfaces: BTreeMap<u16, Surface>,
     cache: BTreeMap<u16, Cached>,
     output: Vec<u8>,
@@ -139,6 +140,7 @@ impl Gfx {
         Self {
             zgfx: Zgfx::new(),
             clear: ClearCodec::new(),
+            progressive: Progressive::new(),
             surfaces: BTreeMap::new(),
             cache: BTreeMap::new(),
             output: Vec::new(),

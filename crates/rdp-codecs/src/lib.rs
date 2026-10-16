@@ -10,6 +10,8 @@ extern crate alloc;
 pub mod clearcodec;
 pub mod nscodec;
 pub mod planar;
+pub mod progressive;
+pub mod rfx;
 pub mod zgfx;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

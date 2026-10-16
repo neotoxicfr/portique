@@ -50,8 +50,7 @@ pub fn Home() -> impl IntoView {
                                     <span class="badge">{proto}</span>
                                 </div>
                                 <div class="actions">
-                                    // La session RDP arrive à l'étape 3 (pile RDP maison).
-                                    <button disabled title="Bientôt">"Ouvrir"</button>
+                                    <a class="button" href=format!("/session/{}", c.id)>"Ouvrir"</a>
                                     <Show when=move || can_wake>
                                         {
                                             let c = c2.clone();

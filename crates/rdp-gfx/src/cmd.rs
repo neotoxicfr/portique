@@ -121,7 +121,11 @@ impl Gfx {
         let cmd = r.u16()?;
         r.bytes(6)?;
         match cmd {
-            id::CAPS_CONFIRM | id::DELETE_ENCODING_CONTEXT | id::FRAME_ACKNOWLEDGE | id::CAPS_ADVERTISE => {}
+            id::CAPS_CONFIRM | id::FRAME_ACKNOWLEDGE | id::CAPS_ADVERTISE => {}
+            id::DELETE_ENCODING_CONTEXT => {
+                r.u16()?;
+                self.progressive.delete_context(r.u32()?);
+            }
             id::RESET_GRAPHICS => {
                 let (w, h) = (r.u32()?, r.u32()?);
                 if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
@@ -263,10 +267,29 @@ impl Gfx {
                 }
             }
             id::WIRE_TO_SURFACE_1 => self.wire_to_surface_1(&mut r, out)?,
-            id::WIRE_TO_SURFACE_2 => out.push(Out::Ignored(format!(
-                "WireToSurface2 (RemoteFX Progressive) pas encore décodé ({} o)",
-                pdu.len()
-            ))),
+            id::WIRE_TO_SURFACE_2 => {
+                // RemoteFX Progressive (codecId 0x0009) : décodé directement dans la surface.
+                let sid = r.u16()?;
+                let codec_id = r.u16()?;
+                let context = r.u32()?;
+                let _pixel_format = r.u8()?;
+                let len = r.u32()? as usize;
+                let data = r.bytes(len)?;
+                if codec_id != 0x0009 {
+                    out.push(Out::Ignored(format!(
+                        "WireToSurface2 codec 0x{codec_id:04x} non pris en charge"
+                    )));
+                    return Ok(());
+                }
+                let s = self.surfaces.get_mut(&sid).ok_or(Error::Invalid("surface inconnue"))?;
+                let (w, h, origin) = (s.width, s.height, s.origin);
+                let rects = self.progressive.decode(context, data, &mut s.rgba, w, h)?;
+                for (x, y, rw, rh) in rects {
+                    if let Some(rect) = (Rect { x, y, w: rw, h: rh }).clip(w, h) {
+                        self.touch(sid, rect, origin);
+                    }
+                }
+            }
             other => out.push(Out::Ignored(format!("commande RDPGFX 0x{other:04x} ignorée"))),
         }
         Ok(())

@@ -162,6 +162,8 @@ struct Form {
     allowed: RwSignal<Vec<i64>>,
     editing: RwSignal<Option<i64>>,
     has_password: RwSignal<bool>,
+    fingerprint: RwSignal<Option<String>>,
+    forget_cert: RwSignal<bool>,
 }
 
 impl Form {
@@ -185,6 +187,8 @@ impl Form {
         self.allowed.set(c.map(|c| c.allowed_users.clone()).unwrap_or_default());
         self.editing.set(c.map(|c| c.id));
         self.has_password.set(c.is_some_and(|c| c.has_password));
+        self.fingerprint.set(c.and_then(|c| c.cert_fingerprint.clone()));
+        self.forget_cert.set(false);
     }
 
     fn input(&self) -> ConnectionInput {
@@ -205,6 +209,7 @@ impl Form {
             wol_mac: opt(self.wol_mac),
             wol_target: opt(self.wol_target),
             allowed_users: self.allowed.get_untracked(),
+            forget_certificate: self.forget_cert.get_untracked(),
         }
     }
 }
@@ -311,6 +316,17 @@ fn Connections(
                             </label>
                             <label>"MAC (WoL)"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
                             <label>"Cible WoL"<input type="text" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
+                            <Show when=move || f.fingerprint.with(Option::is_some)>
+                                <fieldset class="full">
+                                    <legend>"Certificat du PC (épinglé)"</legend>
+                                    <span class="mono">{move || f.fingerprint.get().unwrap_or_default()}</span>
+                                    <label class="check">
+                                        <input type="checkbox" prop:checked=move || f.forget_cert.get()
+                                            on:change=move |ev| f.forget_cert.set(event_target_checked(&ev))/>
+                                        "Oublier (PC réinstallé ou certificat renouvelé : il faudra réapprouver)"
+                                    </label>
+                                </fieldset>
+                            </Show>
                             <fieldset class="full">
                                 <legend>"Comptes autorisés (les admins voient tout)"</legend>
                                 <For each=non_admins key=|u| u.id let(u)>

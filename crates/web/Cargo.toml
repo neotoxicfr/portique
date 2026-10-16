@@ -11,6 +11,11 @@ serde.workspace = true
 serde_json.workspace = true
 webauthn-rs-proto = { workspace = true, features = ["wasm"] }
 
+rdp-gfx = { path = "../rdp-gfx" }
+rdp-pdu = { path = "../rdp-pdu" }
+rdp-session = { path = "../rdp-session" }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
 leptos = { version = "0.8.22", features = ["csr"] }
 leptos_router = "0.8.17"
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
@@ -24,5 +29,40 @@ web-sys = { version = "0.3.106", features = [
     "CredentialCreationOptions",
     "CredentialRequestOptions",
     "PublicKeyCredential",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "CssStyleDeclaration",
+    "ImageData",
+    "Location",
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "CloseEvent",
+    "Event",
+    "EventTarget",
+    "KeyboardEvent",
+    "MouseEvent",
+    "PointerEvent",
+    "WheelEvent",
+    "FocusEvent",
+    "DomRect",
+    "DomRectReadOnly",
+    "AddEventListenerOptions",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoDecoderSupport",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "VideoFrame",
+    "VideoFrameCopyToOptions",
+    "PlaneLayout",
+    "VideoPixelFormat",
+    "HardwareAcceleration",
+    "CodecState",
 ] }
 console_error_panic_hook = "0.1.7"

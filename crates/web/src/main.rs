@@ -1,5 +1,6 @@
 mod api;
 mod pages;
+mod session;
 
 use leptos::{prelude::*, task::spawn_local};
 use leptos_router::{
@@ -63,7 +64,12 @@ fn App() -> impl IntoView {
                         view! { <pages::login::Login/> }.into_any()
                     }
                 >
-                    <Shell/>
+                    <Routes fallback=|| view! { <Shell><p>"Page introuvable."</p></Shell> }>
+                        <Route path=path!("/session/:id") view=session::SessionPage/>
+                        <Route path=path!("/") view=|| view! { <Shell><pages::home::Home/></Shell> }/>
+                        <Route path=path!("/compte") view=|| view! { <Shell><pages::account::Account/></Shell> }/>
+                        <Route path=path!("/admin") view=|| view! { <Shell><pages::admin::Admin/></Shell> }/>
+                    </Routes>
                 </Show>
             </Show>
         </Router>
@@ -71,7 +77,7 @@ fn App() -> impl IntoView {
 }
 
 #[component]
-fn Shell() -> impl IntoView {
+fn Shell(children: Children) -> impl IntoView {
     let session = Session::get();
     let is_admin = move || session.me.with(|m| m.as_ref().is_some_and(|m| m.is_admin));
     let logout = move |_| {
@@ -92,13 +98,7 @@ fn Shell() -> impl IntoView {
                 </Show>
             </nav>
         </header>
-        <main>
-            <Routes fallback=|| view! { <p>"Page introuvable."</p> }>
-                <Route path=path!("/") view=pages::home::Home/>
-                <Route path=path!("/compte") view=pages::account::Account/>
-                <Route path=path!("/admin") view=pages::admin::Admin/>
-            </Routes>
-        </main>
+        <main>{children()}</main>
         <footer class="footer">
             // Lien volontairement discret vers les réglages Windows (étape 7).
             <a href="/setup/" class="muted">"Préparer un PC"</a>

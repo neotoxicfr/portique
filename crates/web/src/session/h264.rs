@@ -1,0 +1,219 @@
+//! Décodage H.264 par WebCodecs (accéléré matériel quand le navigateur le peut).
+//!
+//! Le flux RDP est en Annex B, une image par appel. On lit le profil dans le SPS pour configurer
+//! le décodeur, on attend l'image décodée, puis on copie ses plans (I420 ou NV12) pour que
+//! `rdp-gfx` fasse la conversion BT.709 pleine plage elle-même (le navigateur supposerait la
+//! plage limitée et délaverait les couleurs).
+
+use std::{cell::RefCell, rc::Rc};
+
+use futures::channel::oneshot;
+use js_sys::{Array, Uint8Array};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+    EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration, PlaneLayout,
+    VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame, VideoPixelFormat,
+};
+
+/// Plans YUV420 copiés hors du GPU (u et v séparés, même pour une source NV12).
+pub struct Planes {
+    pub width: u32,
+    pub height: u32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+    pub y_stride: u32,
+    pub uv_stride: u32,
+}
+
+type Slot = Rc<RefCell<Option<oneshot::Sender<Result<VideoFrame, String>>>>>;
+
+pub struct H264 {
+    decoder: VideoDecoder,
+    slot: Slot,
+    codec: Option<String>,
+    timestamp: i32,
+    _output: Closure<dyn FnMut(VideoFrame)>,
+    _error: Closure<dyn FnMut(JsValue)>,
+}
+
+/// Unités NAL d'un flux Annex B : (type, octets sans le code de début).
+fn nal_units(data: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &s)| {
+            let mut end = starts.get(k + 1).map_or(data.len(), |n| n - 3);
+            // Code de début sur 4 octets : le zéro de tête appartient au suivant.
+            if k + 1 < starts.len() && end > s && data[end - 1] == 0 {
+                end -= 1;
+            }
+            (s < end).then(|| (data[s] & 0x1F, &data[s..end]))
+        })
+        .collect()
+}
+
+/// Chaîne de codec WebCodecs (« avc1.PPCCLL ») tirée du SPS.
+fn codec_string(data: &[u8]) -> Option<String> {
+    let (_, sps) = nal_units(data).into_iter().find(|(t, n)| *t == 7 && n.len() >= 4)?;
+    Some(format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]))
+}
+
+/// Le navigateur sait-il décoder du H.264 ? (sinon on n'annonce pas AVC420 au serveur)
+pub async fn supported() -> bool {
+    let Ok(ctor) = js_sys::Reflect::get(&js_sys::global(), &"VideoDecoder".into()) else { return false };
+    if ctor.is_undefined() {
+        return false;
+    }
+    let config = VideoDecoderConfig::new("avc1.640028");
+    match JsFuture::from(VideoDecoder::is_config_supported(&config)).await {
+        Ok(v) => {
+            js_sys::Reflect::get(&v, &"supported".into()).ok().and_then(|s| s.as_bool()).unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+impl H264 {
+    pub fn new() -> Result<Self, String> {
+        let slot: Slot = Rc::new(RefCell::new(None));
+        let s = slot.clone();
+        let output =
+            Closure::<dyn FnMut(VideoFrame)>::new(move |frame: VideoFrame| match s.borrow_mut().take() {
+                Some(tx) => {
+                    let _ = tx.send(Ok(frame));
+                }
+                None => frame.close(),
+            });
+        let s = slot.clone();
+        let error = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
+            let msg = e
+                .dyn_ref::<js_sys::Error>()
+                .map(|e| String::from(e.message()))
+                .unwrap_or_else(|| "erreur du décodeur".into());
+            if let Some(tx) = s.borrow_mut().take() {
+                let _ = tx.send(Err(msg));
+            }
+        });
+        let init = VideoDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
+        let decoder = VideoDecoder::new(&init).map_err(|e| format!("{e:?}"))?;
+        Ok(Self { decoder, slot, codec: None, timestamp: 0, _output: output, _error: error })
+    }
+
+    fn configure(&mut self, codec: &str) -> Result<(), String> {
+        if self.decoder.state() == web_sys::CodecState::Closed {
+            *self = Self::new()?;
+        }
+        let config = VideoDecoderConfig::new(codec);
+        config.set_optimize_for_latency(true);
+        config.set_hardware_acceleration(HardwareAcceleration::NoPreference);
+        self.decoder.configure(&config).map_err(|e| format!("configuration H.264 : {e:?}"))?;
+        self.codec = Some(codec.to_owned());
+        Ok(())
+    }
+
+    /// Décode une image Annex B et renvoie ses plans.
+    pub async fn decode(&mut self, data: &[u8]) -> Result<Planes, String> {
+        let key = nal_units(data).iter().any(|(t, _)| *t == 5);
+        if key
+            && let Some(codec) = codec_string(data)
+            && self.codec.as_deref() != Some(&codec)
+        {
+            self.configure(&codec)?;
+        }
+        if self.codec.is_none() || self.decoder.state() != web_sys::CodecState::Configured {
+            return Err("en attente d'une image clé".into());
+        }
+        let (tx, rx) = oneshot::channel();
+        *self.slot.borrow_mut() = Some(tx);
+        let bytes = Uint8Array::from(data);
+        let kind = if key { EncodedVideoChunkType::Key } else { EncodedVideoChunkType::Delta };
+        self.timestamp = self.timestamp.wrapping_add(16_667);
+        let init = EncodedVideoChunkInit::new(&bytes, self.timestamp, kind);
+        let chunk = EncodedVideoChunk::new(&init).map_err(|e| format!("{e:?}"))?;
+        if let Err(e) = self.decoder.decode(&chunk) {
+            self.codec = None;
+            return Err(format!("décodage refusé : {e:?}"));
+        }
+        let frame = match rx.await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                self.codec = None;
+                return Err(e);
+            }
+            Err(_) => return Err("image perdue".into()),
+        };
+        let planes = copy_planes(&frame).await;
+        frame.close();
+        planes
+    }
+}
+
+impl Drop for H264 {
+    fn drop(&mut self) {
+        let _ = self.decoder.close();
+    }
+}
+
+async fn copy_planes(frame: &VideoFrame) -> Result<Planes, String> {
+    let rect = frame.visible_rect().ok_or("image sans zone visible")?;
+    let (width, height) = (rect.width() as u32, rect.height() as u32);
+    let format = frame.format().ok_or("format d'image inconnu")?;
+    let size = frame.allocation_size().map_err(|e| format!("{e:?}"))?;
+    let buf = Uint8Array::new_with_length(size);
+    let layouts =
+        JsFuture::from(frame.copy_to_with_u8_array(&buf)).await.map_err(|e| format!("copie : {e:?}"))?;
+    let layouts: Array = layouts.unchecked_into();
+    let plane = |i: u32| -> (u32, u32) {
+        let l: PlaneLayout = layouts.get(i).unchecked_into();
+        (l.get_offset(), l.get_stride())
+    };
+    let data = buf.to_vec();
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    let slice = |off: u32, stride: u32, rows: u32| -> Result<Vec<u8>, String> {
+        let end = off as usize + (stride * rows) as usize;
+        data.get(off as usize..end).map(<[u8]>::to_vec).ok_or_else(|| "plan tronqué".into())
+    };
+    match format {
+        VideoPixelFormat::I420 | VideoPixelFormat::I420a => {
+            let ((yo, ys), (uo, us), (vo, vs)) = (plane(0), plane(1), plane(2));
+            if us != vs {
+                return Err("plans U et V de pas différents".into());
+            }
+            Ok(Planes {
+                width,
+                height,
+                y: slice(yo, ys, height)?,
+                u: slice(uo, us, ch)?,
+                v: slice(vo, vs, ch)?,
+                y_stride: ys,
+                uv_stride: us,
+            })
+        }
+        VideoPixelFormat::Nv12 => {
+            let ((yo, ys), (uvo, uvs)) = (plane(0), plane(1));
+            let uv = slice(uvo, uvs, ch)?;
+            let (mut u, mut v) = (vec![0u8; (cw * ch) as usize], vec![0u8; (cw * ch) as usize]);
+            for row in 0..ch as usize {
+                for col in 0..cw as usize {
+                    let s = row * uvs as usize + col * 2;
+                    u[row * cw as usize + col] = uv[s];
+                    v[row * cw as usize + col] = uv[s + 1];
+                }
+            }
+            Ok(Planes { width, height, y: slice(yo, ys, height)?, u, v, y_stride: ys, uv_stride: cw })
+        }
+        other => Err(format!("format d'image non géré : {other:?}")),
+    }
+}

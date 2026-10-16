@@ -97,6 +97,9 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     send(tls, &session.start()).await?;
     let mut buf = Vec::new();
     let mut gfx = rdp_gfx::Gfx::new();
+    // YAWRDP_PROBE_DUMP : enregistre les messages EGFX bruts (longueur u32 + octets) pour le rejeu
+    // hors ligne (`gfx-replay`). Contient l'écran : à garder hors du dépôt.
+    let mut dump = env("DUMP").map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
     let mut ignored = std::collections::BTreeMap::<String, u32>::new();
     let (mut frames, mut avc) = (0u32, 0u32);
     let t0 = std::time::Instant::now();
@@ -127,6 +130,11 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                 Event::DvcData { channel_id, data }
                     if session.dvc_name(channel_id) == Some(rdp_session::DVC_GRAPHICS) =>
                 {
+                    if let Some(f) = dump.as_mut() {
+                        use std::io::Write;
+                        f.write_all(&(data.len() as u32).to_le_bytes())?;
+                        f.write_all(&data)?;
+                    }
                     let mut queue: std::collections::VecDeque<rdp_gfx::Out> =
                         gfx.process(&data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
                     while let Some(o) = queue.pop_front() {

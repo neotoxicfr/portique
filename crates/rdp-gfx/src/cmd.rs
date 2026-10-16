@@ -122,10 +122,10 @@ impl Gfx {
         r.bytes(6)?;
         match cmd {
             id::CAPS_CONFIRM | id::FRAME_ACKNOWLEDGE | id::CAPS_ADVERTISE => {}
-            id::DELETE_ENCODING_CONTEXT => {
-                r.u16()?;
-                self.progressive.delete_context(r.u32()?);
-            }
+            // L'état des tuiles Progressive vit avec la SURFACE : les tuiles « différence » d'un
+            // nouveau contexte s'ajoutent aux coefficients déjà décodés au même endroit (mesuré sur
+            // Windows : effacer l'état ici laisse des tuiles grises).
+            id::DELETE_ENCODING_CONTEXT => {}
             id::RESET_GRAPHICS => {
                 let (w, h) = (r.u32()?, r.u32()?);
                 if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
@@ -159,12 +159,15 @@ impl Gfx {
                     px[3] = 0xFF;
                 }
                 self.surface_bytes = total;
+                self.progressive.delete_context(sid as u32);
                 self.surfaces.insert(sid, Surface { width: w, height: h, rgba, origin: None });
             }
             id::DELETE_SURFACE => {
-                if let Some(s) = self.surfaces.remove(&r.u16()?) {
+                let sid = r.u16()?;
+                if let Some(s) = self.surfaces.remove(&sid) {
                     self.surface_bytes -= s.rgba.len();
                 }
+                self.progressive.delete_context(sid as u32);
             }
             id::MAP_SURFACE_TO_OUTPUT => {
                 let sid = r.u16()?;
@@ -283,7 +286,8 @@ impl Gfx {
                 }
                 let s = self.surfaces.get_mut(&sid).ok_or(Error::Invalid("surface inconnue"))?;
                 let (w, h, origin) = (s.width, s.height, s.origin);
-                let rects = self.progressive.decode(context, data, &mut s.rgba, w, h)?;
+                let _ = context;
+                let rects = self.progressive.decode(sid as u32, data, &mut s.rgba, w, h)?;
                 for (x, y, rw, rh) in rects {
                     if let Some(rect) = (Rect { x, y, w: rw, h: rh }).clip(w, h) {
                         self.touch(sid, rect, origin);

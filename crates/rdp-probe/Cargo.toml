@@ -10,6 +10,7 @@ publish = false
 rdp-auth = { path = "../rdp-auth" }
 rdp-connect = { path = "../rdp-connect" }
 rdp-gfx = { path = "../rdp-gfx" }
+rdp-codecs = { path = "../rdp-codecs" }
 rdp-pdu = { path = "../rdp-pdu" }
 rdp-session = { path = "../rdp-session" }
 anyhow = "1.0.104"

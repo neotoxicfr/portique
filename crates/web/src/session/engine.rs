@@ -16,7 +16,7 @@ use web_sys::{
 };
 use yawrdp_proto::SessionMessage;
 
-use super::h264::H264;
+use super::{clip, h264::H264};
 
 /// État visible par l'interface.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +56,17 @@ struct Inner {
     connected: bool,
     closing: bool,
     avc: bool,
+    clip: rdp_clip::Clipboard,
+    /// Formats encore à demander au serveur pour son contenu courant.
+    clip_wanted: Vec<rdp_clip::ClipFormat>,
+    clip_received: Vec<rdp_clip::LocalData>,
+    /// Écriture locale refusée (page sans focus) : retentée au prochain geste.
+    clip_pending_write: Option<Vec<rdp_clip::LocalData>>,
+    /// Empreinte du dernier contenu échangé (évite l'écho PC → navigateur → PC).
+    clip_last: Option<u64>,
+    /// Ctrl+V en cours : les entrées attendent la synchronisation du presse-papier.
+    holding: bool,
+    held: Vec<Input>,
 }
 
 /// Poignée partagée sur une session en cours.
@@ -116,6 +127,13 @@ impl Engine {
             connected: false,
             closing: false,
             avc: opts.avc,
+            clip: rdp_clip::Clipboard::new(),
+            clip_wanted: Vec::new(),
+            clip_received: Vec::new(),
+            clip_pending_write: None,
+            clip_last: None,
+            holding: false,
+            held: Vec::new(),
         }));
         let engine = Engine { inner, status };
         (engine.status)(Status::Connecting("connexion au PC…".into()));
@@ -311,7 +329,8 @@ impl Engine {
                 self.inner.borrow_mut().connected = false;
                 (self.status)(Status::Closed { reason: t, retry: false });
             }
-            Event::Deactivated | Event::Clipboard(_) | Event::KeyboardIndicators(_) | Event::Ignored(_) => {}
+            Event::Clipboard(msg) => self.clipboard(&msg).await,
+            Event::Deactivated | Event::KeyboardIndicators(_) | Event::Ignored(_) => {}
         }
         Ok(())
     }
@@ -402,7 +421,152 @@ impl Engine {
 
     // --- Entrées ---
 
+    // --- Presse-papier ---
+
+    fn clip_send(&self, events: Vec<rdp_clip::ClipEvent>) -> Vec<rdp_clip::ClipEvent> {
+        let mut rest = Vec::new();
+        for ev in events {
+            match ev {
+                rdp_clip::ClipEvent::Send(m) => {
+                    let frames = match self.inner.borrow().session.as_ref() {
+                        Some(s) => s.static_send(rdp_session::CLIPRDR, &m),
+                        None => Vec::new(),
+                    };
+                    for f in frames {
+                        self.send(&f);
+                    }
+                }
+                other => rest.push(other),
+            }
+        }
+        rest
+    }
+
+    async fn clipboard(&self, msg: &[u8]) {
+        let events = match self.inner.borrow_mut().clip.receive(msg) {
+            Ok(e) => e,
+            Err(e) => {
+                web_sys::console::warn_1(&format!("presse-papier : {e:?}").into());
+                return;
+            }
+        };
+        let mut queue = self.clip_send(events);
+        while let Some(ev) = queue.pop() {
+            match ev {
+                rdp_clip::ClipEvent::RemoteChanged(formats) => {
+                    let mut i = self.inner.borrow_mut();
+                    i.clip_wanted = clip::wanted(&formats);
+                    i.clip_wanted.reverse();
+                    i.clip_received.clear();
+                    let next = i.clip_wanted.pop();
+                    let ev = next.map(|f| i.clip.request(&[f])).unwrap_or_default();
+                    drop(i);
+                    queue.extend(self.clip_send(ev));
+                }
+                rdp_clip::ClipEvent::RemoteData(data) => {
+                    let next = {
+                        let mut i = self.inner.borrow_mut();
+                        if let Some(d) = data {
+                            i.clip_received.push(d);
+                        }
+                        match i.clip_wanted.pop() {
+                            Some(f) => Some(i.clip.request(&[f])),
+                            None => None,
+                        }
+                    };
+                    match next {
+                        Some(ev) => queue.extend(self.clip_send(ev)),
+                        None => {
+                            let items = std::mem::take(&mut self.inner.borrow_mut().clip_received);
+                            if items.is_empty() {
+                                continue;
+                            }
+                            self.inner.borrow_mut().clip_last = Some(clip::fingerprint(&items));
+                            if let Err(e) = clip::write_local(&items).await {
+                                web_sys::console::debug_1(
+                                    &format!("presse-papier local : {e} (nouvel essai au prochain geste)")
+                                        .into(),
+                                );
+                                self.inner.borrow_mut().clip_pending_write = Some(items);
+                            }
+                        }
+                    }
+                }
+                rdp_clip::ClipEvent::Send(_) => {}
+            }
+        }
+    }
+
+    /// Envoie au PC le contenu du presse-papier local s'il a changé.
+    pub async fn sync_local_clipboard(&self) {
+        if !self.is_connected() {
+            return;
+        }
+        let Some(items) = clip::read_local().await else { return };
+        if items.is_empty() {
+            return;
+        }
+        let fp = clip::fingerprint(&items);
+        let events = {
+            let mut i = self.inner.borrow_mut();
+            if i.clip_last == Some(fp) {
+                return;
+            }
+            i.clip_last = Some(fp);
+            i.clip.set_local(items)
+        };
+        self.clip_send(events);
+    }
+
+    /// Geste utilisateur : occasion de réussir une écriture locale refusée plus tôt.
+    pub fn user_gesture(&self) {
+        let pending = self.inner.borrow_mut().clip_pending_write.take();
+        if let Some(items) = pending {
+            let e = self.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if clip::write_local(&items).await.is_err() {
+                    e.inner.borrow_mut().clip_pending_write = Some(items);
+                }
+            });
+        }
+    }
+
+    /// Ctrl+V : synchronise d'abord le presse-papier, puis laisse passer les touches retenues.
+    pub fn paste_guard(&self) {
+        if self.inner.borrow().holding {
+            return;
+        }
+        self.inner.borrow_mut().holding = true;
+        let e = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let sync = e.sync_local_clipboard();
+            let timeout = async {
+                let p = js_sys::Promise::new(&mut |resolve, _| {
+                    let _ = web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 800);
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            };
+            futures::pin_mut!(sync, timeout);
+            futures::future::select(sync, timeout).await;
+            let held = {
+                let mut i = e.inner.borrow_mut();
+                i.holding = false;
+                std::mem::take(&mut i.held)
+            };
+            e.input(&held);
+        });
+    }
+
     pub fn input(&self, events: &[Input]) {
+        {
+            let mut i = self.inner.borrow_mut();
+            if i.holding {
+                i.held.extend_from_slice(events);
+                return;
+            }
+        }
         let frame = match self.inner.borrow().session.as_ref() {
             Some(s) => s.input(events),
             None => return,

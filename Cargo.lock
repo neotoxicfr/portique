@@ -4928,6 +4928,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "leptos_router",
+ "rdp-clip",
  "rdp-gfx",
  "rdp-pdu",
  "rdp-session",

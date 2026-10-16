@@ -1,5 +1,6 @@
 //! Page de session : canevas plein écran, entrées, menu, reconnexion automatique.
 
+mod clip;
 mod engine;
 mod h264;
 mod keys;
@@ -134,6 +135,11 @@ pub fn SessionPage() -> impl IntoView {
             if !eng.is_connected() {
                 return;
             }
+            eng.user_gesture();
+            // Ctrl+V / Cmd+V : le presse-papier local part vers le PC avant la touche V.
+            if down && (e.ctrl_key() || e.meta_key()) && e.code() == "KeyV" {
+                eng.paste_guard();
+            }
             if let Some((code, ext)) = keys::scancode(&e.code()) {
                 e.prevent_default();
                 eng.key(code, ext, down);
@@ -156,6 +162,13 @@ pub fn SessionPage() -> impl IntoView {
     let kd = window_event_listener(ev::keydown, move |e| key_handler(e, true));
     let ku = window_event_listener(ev::keyup, move |e| key_handler(e, false));
     let blur = window_event_listener(ev::blur, move |_| with_engine(&|e| e.release_all()));
+    // Retour sur la page : le presse-papier local a pu changer.
+    let focus = window_event_listener(ev::focus, move |_| {
+        with_engine(&|e| {
+            let e = e.clone();
+            spawn_local(async move { e.sync_local_clipboard().await });
+        })
+    });
 
     // Taille : la session suit la fenêtre (contrôle d'affichage), après 400 ms de calme.
     let resize_timer = StoredValue::new_local(None::<i32>);
@@ -173,13 +186,14 @@ pub fn SessionPage() -> impl IntoView {
         }
     });
 
-    let listeners = StoredValue::new_local(Some((kd, ku, blur, resize)));
+    let listeners = StoredValue::new_local(Some((kd, ku, blur, resize, focus)));
     on_cleanup(move || {
-        if let Some((kd, ku, blur, resize)) = listeners.try_update_value(Option::take).flatten() {
+        if let Some((kd, ku, blur, resize, focus)) = listeners.try_update_value(Option::take).flatten() {
             kd.remove();
             ku.remove();
             blur.remove();
             resize.remove();
+            focus.remove();
         }
         if let Some(e) = engine.try_update_value(Option::take).flatten() {
             e.close();
@@ -194,6 +208,9 @@ pub fn SessionPage() -> impl IntoView {
                 return;
             }
             e.prevent_default();
+            if kind == "down" {
+                eng.user_gesture();
+            }
             let (x, y) = desktop_point(&canvas, e.client_x() as f64, e.client_y() as f64);
             let event = match kind {
                 "move" => Input::Mouse { flags: ptr::MOVE, x, y },

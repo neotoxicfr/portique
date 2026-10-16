@@ -175,6 +175,8 @@ struct Form {
     cmd_command: RwSignal<String>,
     cmd_has_password: RwSignal<bool>,
     cmd_hostkey: RwSignal<Option<String>>,
+    cmd_pending: RwSignal<Option<String>>,
+    cmd_approve: RwSignal<bool>,
 }
 
 impl Form {
@@ -208,6 +210,8 @@ impl Form {
         self.cmd_password.set(String::new());
         self.cmd_has_password.set(w.is_some_and(|w| w.has_password));
         self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
+        self.cmd_pending.set(w.and_then(|w| w.pending_hostkey.clone()));
+        self.cmd_approve.set(false);
     }
 
     fn input(&self) -> ConnectionInput {
@@ -234,6 +238,11 @@ impl Form {
                 user: self.cmd_user.get_untracked(),
                 command: self.cmd_command.get_untracked(),
                 password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
+                approve_hostkey: self
+                    .cmd_approve
+                    .get_untracked()
+                    .then(|| self.cmd_pending.get_untracked())
+                    .flatten(),
             }),
         }
     }
@@ -370,7 +379,18 @@ fn Connections(
                                             <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/>
                                         </label>
                                     </div>
-                                    {move || f.cmd_hostkey.get().map(|k| view! { <p class="muted mono">"Clé SSH épinglée : " {k}</p> })}
+                                    {move || f.cmd_hostkey.get().map(|k| view! { <p class="muted mono">"Clé SSH approuvée : " {k}</p> })}
+                                    {move || f.cmd_pending.get().map(|k| view! {
+                                        <div class="full">
+                                            <p>"Clé présentée par l'hôte, à comparer avec la sienne (MikroTik : " <code>"/ip ssh print"</code> ") :"</p>
+                                            <p class="mono">{k}</p>
+                                            <label class="check">
+                                                <input type="checkbox" prop:checked=move || f.cmd_approve.get()
+                                                    on:change=move |ev| f.cmd_approve.set(event_target_checked(&ev))/>
+                                                "Elle est identique : approuver"
+                                            </label>
+                                        </div>
+                                    })}
                                 </Show>
                             </fieldset>
                             <Show when=move || f.fingerprint.with(Option::is_some)>

@@ -151,7 +151,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                             rdp_gfx::Out::Reset { width, height } => {
                                 println!("  EGFX : sortie {width}×{height}")
                             }
-                            rdp_gfx::Out::Avc420 { .. } => {
+                            rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {
                                 // Pas de décodeur H.264 natif dans la sonde : image sautée.
                                 avc += 1;
                                 queue.extend(gfx.skip_frame().map_err(|e| anyhow::anyhow!("{e}"))?);
@@ -177,7 +177,11 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                     for ev in clip.receive(&msg).map_err(|e| anyhow::anyhow!("{e:?}"))? {
                         match ev {
                             rdp_clip::ClipEvent::Send(m) => {
-                                println!("  {:>6} ms cliprdr → type {}", t0.elapsed().as_millis(), u16::from_le_bytes([m[0], m[1]]));
+                                println!(
+                                    "  {:>6} ms cliprdr → type {}",
+                                    t0.elapsed().as_millis(),
+                                    u16::from_le_bytes([m[0], m[1]])
+                                );
                                 for f in session.static_send(rdp_session::CLIPRDR, &m) {
                                     send(tls, &f).await?;
                                 }
@@ -195,6 +199,79 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                             rdp_clip::ClipEvent::RemoteData(d) => println!("  données du PC : {d:?}"),
                         }
                     }
+                    if env("DRAG").is_some() && !clip_started && kind == 1 {
+                        clip_started = true;
+                        // Win+R puis glisser la boîte Exécuter en cercles : du mouvement continu,
+                        // pour voir si Windows passe des zones en H.264.
+                        use rdp_pdu::fastpath::{Input, kbd, ptr};
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let k = |code: u8, ext: bool, up: bool| Input::Scancode {
+                            code,
+                            flags: if ext { kbd::EXTENDED } else { 0 } | if up { kbd::RELEASE } else { 0 },
+                        };
+                        send(
+                            tls,
+                            &session.input(&[
+                                k(0x5B, true, false),
+                                k(0x13, false, false),
+                                k(0x13, false, true),
+                                k(0x5B, true, true),
+                            ]),
+                        )
+                        .await?;
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let (mut x, mut y) = (120u16, 830u16);
+                        send(tls, &session.input(&[Input::Mouse { flags: ptr::MOVE, x, y }])).await?;
+                        send(tls, &session.input(&[Input::Mouse { flags: ptr::BUTTON1 | ptr::DOWN, x, y }]))
+                            .await?;
+                        for i in 0..240u32 {
+                            let a = i as f32 / 20.0;
+                            x = (900.0 + 500.0 * a.cos()) as u16;
+                            y = (500.0 + 300.0 * a.sin()) as u16;
+                            send(tls, &session.input(&[Input::Mouse { flags: ptr::MOVE, x, y }])).await?;
+                            tokio::time::sleep(Duration::from_millis(16)).await;
+                            // Lecture opportuniste pour ne pas bloquer le serveur (accusés d'image).
+                            while let Ok(Ok(f)) = tokio::time::timeout(
+                                Duration::from_millis(1),
+                                read_frame(tls, &mut buf, x224::frame_len),
+                            )
+                            .await
+                            {
+                                for ev in session.feed(&f).map_err(|e| anyhow::anyhow!("session : {e}"))? {
+                                    if let Event::DvcData { channel_id, ref data } = ev
+                                        && session.dvc_name(channel_id) == Some(rdp_session::DVC_GRAPHICS)
+                                    {
+                                        let mut q: std::collections::VecDeque<rdp_gfx::Out> =
+                                            gfx.process(data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
+                                        while let Some(o) = q.pop_front() {
+                                            match o {
+                                                rdp_gfx::Out::Send(m) => {
+                                                    for fr in session.dvc_send(channel_id, &m) {
+                                                        send(tls, &fr).await?;
+                                                    }
+                                                }
+                                                rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {
+                                                    avc += 1;
+                                                    q.extend(
+                                                        gfx.skip_frame()
+                                                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                                                    );
+                                                }
+                                                rdp_gfx::Out::Present { .. } => frames += 1,
+                                                _ => {}
+                                            }
+                                        }
+                                    } else if let Event::Send(b) = ev {
+                                        send(tls, &b).await?;
+                                    }
+                                }
+                            }
+                        }
+                        send(tls, &session.input(&[Input::Mouse { flags: ptr::BUTTON1, x, y }])).await?;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        send(tls, &session.input(&[k(0x01, false, false), k(0x01, false, true)])).await?;
+                        println!("  glisser terminé : {frames} images, {avc} H.264");
+                    }
                     if clip_test && !clip_started && kind == 1 {
                         clip_started = true;
                         // Win+R, « abc », Ctrl+A, Ctrl+C (scancodes), avec des pauses.
@@ -205,13 +282,52 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                         };
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         let steps: Vec<Vec<Input>> = vec![
-                            vec![k(0x5B, true, false), k(0x13, false, false), k(0x13, false, true), k(0x5B, true, true)],
-                            vec![k(0x1E, false, false), k(0x1E, false, true), k(0x30, false, false), k(0x30, false, true), k(0x2E, false, false), k(0x2E, false, true)],
-                            vec![k(0x1D, false, false), k(0x1E, false, false), k(0x1E, false, true), k(0x1D, false, true)],
-                            vec![k(0x1D, false, false), k(0x2E, false, false), k(0x2E, false, true), k(0x1D, false, true)],
-                            vec![k(0x1D, false, false), k(0x1E, false, false), k(0x1E, false, true), k(0x1D, false, true)],
-                            vec![k(0x2C, false, false), k(0x2C, false, true), k(0x2C, false, false), k(0x2C, false, true), k(0x2C, false, false), k(0x2C, false, true)],
-                            vec![k(0x2A, false, false), k(0x52, true, false), k(0x52, true, true), k(0x2A, false, true)],
+                            vec![
+                                k(0x5B, true, false),
+                                k(0x13, false, false),
+                                k(0x13, false, true),
+                                k(0x5B, true, true),
+                            ],
+                            vec![
+                                k(0x1E, false, false),
+                                k(0x1E, false, true),
+                                k(0x30, false, false),
+                                k(0x30, false, true),
+                                k(0x2E, false, false),
+                                k(0x2E, false, true),
+                            ],
+                            vec![
+                                k(0x1D, false, false),
+                                k(0x1E, false, false),
+                                k(0x1E, false, true),
+                                k(0x1D, false, true),
+                            ],
+                            vec![
+                                k(0x1D, false, false),
+                                k(0x2E, false, false),
+                                k(0x2E, false, true),
+                                k(0x1D, false, true),
+                            ],
+                            vec![
+                                k(0x1D, false, false),
+                                k(0x1E, false, false),
+                                k(0x1E, false, true),
+                                k(0x1D, false, true),
+                            ],
+                            vec![
+                                k(0x2C, false, false),
+                                k(0x2C, false, true),
+                                k(0x2C, false, false),
+                                k(0x2C, false, true),
+                                k(0x2C, false, false),
+                                k(0x2C, false, true),
+                            ],
+                            vec![
+                                k(0x2A, false, false),
+                                k(0x52, true, false),
+                                k(0x52, true, true),
+                                k(0x2A, false, true),
+                            ],
                         ];
                         for (i, step) in steps.iter().enumerate() {
                             send(tls, &session.input(step)).await?;
@@ -232,7 +348,8 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     if clip_test {
         // Referme la boîte Exécuter (Échap) après la capture ci-dessous.
         use rdp_pdu::fastpath::{Input, kbd};
-        let esc = [Input::Scancode { code: 0x01, flags: 0 }, Input::Scancode { code: 0x01, flags: kbd::RELEASE }];
+        let esc =
+            [Input::Scancode { code: 0x01, flags: 0 }, Input::Scancode { code: 0x01, flags: kbd::RELEASE }];
         let _ = send(tls, &session.input(&esc)).await;
     }
     if let Some(path) = env("PNG") {

@@ -24,17 +24,44 @@ fn clamp(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// Un pixel YUV pleine plage BT.709 → RGBA opaque.
+#[inline]
+pub(crate) fn to_rgb(y: u8, u: u8, v: u8) -> [u8; 4] {
+    let yv = (y as i32) << 16;
+    let (u, v) = (u as i32 - 128, v as i32 - 128);
+    [
+        clamp((yv + RV * v + 0x8000) >> 16),
+        clamp((yv - GU * u - GV * v + 0x8000) >> 16),
+        clamp((yv + BU * u + 0x8000) >> 16),
+        0xFF,
+    ]
+}
+
 impl Yuv420<'_> {
+    /// Vérifie que les plans couvrent bien les dimensions annoncées.
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::Invalid("image H.264 vide"));
+        }
+        let need_y = ((self.height - 1) * self.y_stride + self.width) as usize;
+        let need_uv = ((self.height.div_ceil(2) - 1) * self.uv_stride + self.width.div_ceil(2)) as usize;
+        if self.y_stride < self.width
+            || self.uv_stride < self.width.div_ceil(2)
+            || self.y.len() < need_y
+            || self.u.len() < need_uv
+            || self.v.len() < need_uv
+        {
+            return Err(Error::Truncated("plans YUV"));
+        }
+        Ok(())
+    }
+
     /// Convertit la zone `r` (coordonnées image = coordonnées surface) dans `dst` (RGBA).
     pub fn to_rgba(&self, r: Rect, dst: &mut [u8], dst_width: u32) -> Result<(), Error> {
         if r.x + r.w > self.width || r.y + r.h > self.height {
             return Err(Error::Invalid("zone H.264 hors de l'image décodée"));
         }
-        let need_y = ((self.height - 1) * self.y_stride + self.width) as usize;
-        let need_uv = (((self.height - 1) / 2) * self.uv_stride + self.width.div_ceil(2)) as usize;
-        if self.y.len() < need_y || self.u.len() < need_uv || self.v.len() < need_uv {
-            return Err(Error::Truncated("plans YUV"));
-        }
+        self.check()?;
         for row in r.y..r.y + r.h {
             let yrow = &self.y[(row * self.y_stride) as usize..];
             let crow = ((row / 2) * self.uv_stride) as usize;

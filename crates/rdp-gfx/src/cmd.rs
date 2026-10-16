@@ -23,6 +23,7 @@ mod id {
     pub const FRAME_ACKNOWLEDGE: u16 = 0x000D;
     pub const RESET_GRAPHICS: u16 = 0x000E;
     pub const MAP_SURFACE_TO_OUTPUT: u16 = 0x000F;
+    pub const MAP_SURFACE_TO_SCALED_OUTPUT: u16 = 0x0017;
     pub const CAPS_ADVERTISE: u16 = 0x0012;
     pub const CAPS_CONFIRM: u16 = 0x0013;
 }
@@ -33,21 +34,47 @@ mod codec {
     pub const PLANAR: u16 = 0x000A;
     pub const AVC420: u16 = 0x000B;
     pub const ALPHA: u16 = 0x000C;
+    pub const AVC444: u16 = 0x000E;
+    pub const AVC444V2: u16 = 0x000F;
 }
 
-/// Annonce des capacités : EGFX 8.1, petit cache, AVC420 si le navigateur sait décoder le H.264.
-/// (La spec n'admet que certaines combinaisons : AVC420 va toujours avec SMALL_CACHE.)
-pub fn caps_advertise(avc420: bool) -> Vec<u8> {
-    let flags: u32 = if avc420 { 0x02 | 0x10 } else { 0x02 };
-    let mut p = Vec::with_capacity(22);
+/// Annonce des capacités, le serveur choisit la plus haute qu'il connaît :
+/// - EGFX 10.7 : AVC420 et AVC444 (v1/v2), sauf AVC_DISABLED (0x20) sans décodeur H.264 ;
+///   SCALEDMAP_DISABLE (0x80) : la sortie suit la taille des surfaces, le navigateur met à l'échelle ;
+/// - EGFX 8.1 en repli : AVC420 avec SMALL_CACHE (seules combinaisons admises par la spec).
+pub fn caps_advertise(avc: bool) -> Vec<u8> {
+    let sets: [(u32, u32); 2] = if avc {
+        [(0x000A_0701, 0x02 | 0x80), (0x0008_0105, 0x02 | 0x10)]
+    } else {
+        [(0x000A_0701, 0x02 | 0x20 | 0x80), (0x0008_0105, 0x02)]
+    };
+    let len = 8 + 2 + sets.len() * 12;
+    let mut p = Vec::with_capacity(len);
     p.extend_from_slice(&id::CAPS_ADVERTISE.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes());
-    p.extend_from_slice(&22u32.to_le_bytes());
-    p.extend_from_slice(&1u16.to_le_bytes());
-    p.extend_from_slice(&0x0008_0105u32.to_le_bytes());
-    p.extend_from_slice(&4u32.to_le_bytes());
-    p.extend_from_slice(&flags.to_le_bytes());
+    p.extend_from_slice(&(len as u32).to_le_bytes());
+    p.extend_from_slice(&(sets.len() as u16).to_le_bytes());
+    for (version, flags) in sets {
+        p.extend_from_slice(&version.to_le_bytes());
+        p.extend_from_slice(&4u32.to_le_bytes());
+        p.extend_from_slice(&flags.to_le_bytes());
+    }
     p
+}
+
+/// RFX_AVC420_BITMAP_STREAM : (régions, flux Annex B).
+fn avc420_stream(data: &[u8]) -> Result<(Vec<Rect>, Vec<u8>), Error> {
+    let mut m = R { b: data, p: 0 };
+    let n = m.u32()? as usize;
+    if n > 4096 {
+        return Err(Error::Invalid("trop de régions H.264"));
+    }
+    let mut rects = Vec::with_capacity(n);
+    for _ in 0..n {
+        rects.push(m.rect16()?);
+    }
+    m.bytes(n * 2)?; // quantQualityVals, informatifs
+    Ok((rects, data[m.p..].to_vec()))
 }
 
 struct R<'a> {
@@ -160,12 +187,15 @@ impl Gfx {
                 }
                 self.surface_bytes = total;
                 self.progressive.delete_context(sid as u32);
-                self.surfaces.insert(sid, Surface { width: w, height: h, rgba, origin: None });
+                if let Some(old) = self.surfaces.get(&sid).and_then(|s| s.p444.as_ref()) {
+                    self.surface_bytes -= old.bytes();
+                }
+                self.surfaces.insert(sid, Surface { width: w, height: h, rgba, origin: None, p444: None });
             }
             id::DELETE_SURFACE => {
                 let sid = r.u16()?;
                 if let Some(s) = self.surfaces.remove(&sid) {
-                    self.surface_bytes -= s.rgba.len();
+                    self.surface_bytes -= s.rgba.len() + s.p444.as_ref().map_or(0, |p| p.bytes());
                 }
                 self.progressive.delete_context(sid as u32);
             }
@@ -173,6 +203,24 @@ impl Gfx {
                 let sid = r.u16()?;
                 r.u16()?;
                 let (x, y) = (r.u32()?, r.u32()?);
+                let s = self.surface_mut(sid)?;
+                s.origin = Some((x, y));
+                let full = Rect { x: 0, y: 0, w: s.width, h: s.height };
+                self.touch(sid, full, Some((x, y)));
+            }
+            id::MAP_SURFACE_TO_SCALED_OUTPUT => {
+                // Mesuré : Windows l'emploie en EGFX 10.x. Sans mise à l'échelle demandée (cible =
+                // taille de la surface), c'est un placement ordinaire ; sinon placé à l'échelle 1.
+                let sid = r.u16()?;
+                r.u16()?;
+                let (x, y, tw, th) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+                let s = self.surface_mut(sid)?;
+                if (tw, th) != (s.width, s.height) {
+                    out.push(Out::Ignored(format!(
+                        "mise à l'échelle {}×{} → {tw}×{th} non gérée, placée telle quelle",
+                        s.width, s.height
+                    )));
+                }
                 let s = self.surface_mut(sid)?;
                 s.origin = Some((x, y));
                 let full = Rect { x: 0, y: 0, w: s.width, h: s.height };
@@ -353,19 +401,34 @@ impl Gfx {
                 // Opacité seule ; le bureau est composé opaque, rien à afficher en plus.
             }
             codec::AVC420 => {
+                let (rects, stream) = avc420_stream(data)?;
+                self.pending_avc = Some(PendingAvc { surface: sid, rects, aux: None });
+                out.push(Out::Avc420 { data: stream });
+            }
+            codec::AVC444 | codec::AVC444V2 => {
+                // avc420EncodedBitstreamInfo : taille du 1er sous-flux (30 bits) et LC (2 bits).
                 let mut m = R { b: data, p: 0 };
-                let n = m.u32()? as usize;
-                if n > 4096 {
-                    return Err(Error::Invalid("trop de régions H.264"));
-                }
-                let mut rects = Vec::with_capacity(n);
-                for _ in 0..n {
-                    rects.push(m.rect16()?);
-                }
-                m.bytes(n * 2)?; // quantQualityVals, informatifs
-                let stream = &data[m.p..];
-                self.pending_avc = Some(PendingAvc { surface: sid, rects });
-                out.push(Out::Avc420 { data: stream.to_vec() });
+                let info = m.u32()?;
+                let (cb1, lc) = ((info & 0x3FFF_FFFF) as usize, info >> 30);
+                let body = &data[4..];
+                let (main, aux) = match lc {
+                    0 => {
+                        let first = body.get(..cb1).ok_or(Error::Truncated("sous-flux AVC444"))?;
+                        (Some(first), Some(&body[cb1..]))
+                    }
+                    1 => (Some(body.get(..cb1).ok_or(Error::Truncated("sous-flux AVC444"))?), None),
+                    2 => (None, Some(body)),
+                    _ => return Err(Error::Invalid("AVC444 : LC invalide")),
+                };
+                let main = main.map(avc420_stream).transpose()?;
+                let aux = aux.map(avc420_stream).transpose()?;
+                let v2 = codec_id == codec::AVC444V2;
+                self.pending_avc = Some(PendingAvc {
+                    surface: sid,
+                    rects: main.as_ref().map(|(r, _)| r.clone()).unwrap_or_default(),
+                    aux: aux.as_ref().map(|(r, _)| (r.clone(), v2)),
+                });
+                out.push(Out::Avc444 { main: main.map(|(_, s)| s), aux: aux.map(|(_, s)| s) });
             }
             other => out.push(Out::Ignored(format!("codec EGFX 0x{other:04x} non pris en charge"))),
         }

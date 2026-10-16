@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         let mut outs: std::collections::VecDeque<_> =
             gfx.process(msg).map_err(|e| anyhow::anyhow!("msg {n} : {e}"))?.into();
         while let Some(o) = outs.pop_front() {
-            if let rdp_gfx::Out::Avc420 { .. } = o {
+            if let rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } = o {
                 outs.extend(gfx.skip_frame().map_err(|e| anyhow::anyhow!("{e}"))?);
             }
         }

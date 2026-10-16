@@ -27,6 +27,20 @@ pub struct Planes {
     pub uv_stride: u32,
 }
 
+impl Planes {
+    pub fn view(&self) -> rdp_gfx::Yuv420<'_> {
+        rdp_gfx::Yuv420 {
+            width: self.width,
+            height: self.height,
+            y: &self.y,
+            u: &self.u,
+            v: &self.v,
+            y_stride: self.y_stride,
+            uv_stride: self.uv_stride,
+        }
+    }
+}
+
 type Slot = Rc<RefCell<Option<oneshot::Sender<Result<VideoFrame, String>>>>>;
 
 pub struct H264 {

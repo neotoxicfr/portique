@@ -380,6 +380,46 @@ impl Engine {
                     .map_err(|e| e.to_string())?;
                     queue.extend(more);
                 }
+                Out::Avc444 { main, aux } => {
+                    if h264.is_none() {
+                        *h264 = H264::new().ok();
+                    }
+                    // Un seul décodeur pour les deux sous-images, dans l'ordre (MS-RDPEGFX 2.2.4.5).
+                    let mut decoded = Vec::new();
+                    let mut failed = None;
+                    for part in [main, aux] {
+                        let planes = match (part, h264.as_mut()) {
+                            (None, _) => None,
+                            (Some(d), Some(dec)) => match dec.decode(&d).await {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    failed = Some(e);
+                                    None
+                                }
+                            },
+                            (Some(_), None) => {
+                                failed = Some("décodeur H.264 indisponible".into());
+                                None
+                            }
+                        };
+                        decoded.push(planes);
+                    }
+                    let more = match failed {
+                        Some(e) => {
+                            web_sys::console::warn_1(&format!("H.264 (4:4:4) : {e}").into());
+                            self.inner.borrow_mut().gfx.skip_frame()
+                        }
+                        None => {
+                            let (m, a) = (
+                                decoded[0].as_ref().map(|p| p.view()),
+                                decoded[1].as_ref().map(|p| p.view()),
+                            );
+                            self.inner.borrow_mut().gfx.submit_avc444(m.as_ref(), a.as_ref())
+                        }
+                    }
+                    .map_err(|e| e.to_string())?;
+                    queue.extend(more);
+                }
                 Out::Ignored(t) => web_sys::console::debug_1(&t.into()),
             }
         }

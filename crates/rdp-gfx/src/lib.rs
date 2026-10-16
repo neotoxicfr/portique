@@ -9,6 +9,7 @@
 #![no_std]
 extern crate alloc;
 
+mod avc444;
 mod cmd;
 mod yuv;
 
@@ -72,6 +73,9 @@ pub enum Out {
     Present { damage: Vec<Rect> },
     /// Image H.264 à décoder puis à rendre par `submit_yuv420` (ou `skip_frame`).
     Avc420 { data: Vec<u8> },
+    /// Image 4:4:4 en deux sous-images à décoder avec le MÊME décodeur, dans l'ordre (principale
+    /// puis auxiliaire), puis à rendre par `submit_avc444` (ou `skip_frame`).
+    Avc444 { main: Option<Vec<u8>>, aux: Option<Vec<u8>> },
     /// Commande ignorée (codec non pris en charge…), pour le journal.
     Ignored(String),
 }
@@ -81,6 +85,8 @@ struct Surface {
     height: u32,
     rgba: Vec<u8>,
     origin: Option<(u32, u32)>,
+    /// Plans YUV 4:4:4 reconstitués (créés à la première image AVC444).
+    p444: Option<avc444::Planes444>,
 }
 
 struct Cached {
@@ -92,7 +98,10 @@ struct Cached {
 /// Commande H.264 en attente de décodage.
 struct PendingAvc {
     surface: u16,
+    /// Zones de la vue principale (luma).
     rects: Vec<Rect>,
+    /// AVC444 : zones de la vue auxiliaire (chroma) et variante v2.
+    aux: Option<(Vec<Rect>, bool)>,
 }
 
 pub struct Gfx {
@@ -203,6 +212,55 @@ impl Gfx {
                     }
                 }
             }
+            for r in done {
+                self.touch(p.surface, r, origin);
+            }
+        }
+        self.run()
+    }
+
+    /// Applique une image AVC444 décodée (sous-images principale et/ou auxiliaire) puis reprend.
+    pub fn submit_avc444(
+        &mut self,
+        main: Option<&Yuv420<'_>>,
+        aux: Option<&Yuv420<'_>>,
+    ) -> Result<Vec<Out>, Error> {
+        if let Some(p) = self.pending_avc.take() {
+            let mut done = Vec::new();
+            let mut origin = None;
+            let mut grew = 0usize;
+            if let Some(s) = self.surfaces.get_mut(&p.surface) {
+                origin = s.origin;
+                if s.p444.is_none() {
+                    let planes = avc444::Planes444::new(s.width, s.height);
+                    grew = planes.bytes();
+                    if self.surface_bytes + grew > MAX_SURFACE_BYTES {
+                        return Err(Error::Invalid("mémoire de surface épuisée (AVC444)"));
+                    }
+                    s.p444 = Some(planes);
+                }
+                let (sw, sh) = (s.width, s.height);
+                let planes = s.p444.as_mut().unwrap();
+                if let Some(f) = main {
+                    planes.apply_main(f, &p.rects)?;
+                    for r in &p.rects {
+                        if let Some(r) = r.clip(sw.min(f.width), sh.min(f.height)) {
+                            planes.to_rgba_420(r, &mut s.rgba, sw);
+                            done.push(r);
+                        }
+                    }
+                }
+                if let (Some(f), Some((rects, v2))) = (aux, p.aux.as_ref()) {
+                    planes.apply_aux(f, rects, *v2)?;
+                    for r in rects {
+                        if let Some(r) = r.clip(sw, sh) {
+                            planes.to_rgba_444(r, &mut s.rgba, sw);
+                            done.push(r);
+                        }
+                    }
+                }
+            }
+            self.surface_bytes += grew;
             for r in done {
                 self.touch(p.surface, r, origin);
             }

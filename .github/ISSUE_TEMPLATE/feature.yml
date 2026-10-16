@@ -1,0 +1,21 @@
+name: Idée de fonction
+description: Proposer une amélioration
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Le besoin
+      description: Ce que tu veux faire et pourquoi, avant la solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Piste
+      description: Comment tu l'imagines ; la spec concernée si tu la connais (MS-RDPE…).
+  - type: textarea
+    id: others
+    attributes:
+      label: Ailleurs
+      description: Comment font Guacamole, mstsc, FreeRDP… s'ils le font.

@@ -130,22 +130,29 @@ async fn run(
     tracing::info!(user = user.username, %ip, connection = row.name, "ouverture de session");
     let connected = match rdp_connect::connect(&target, pinned).await {
         Ok(c) => c,
+        Err(rdp_connect::ConnectError::UntrustedCertificate(fingerprint)) => {
+            send_text(&mut socket, &SessionMessage::UntrustedCertificate { fingerprint, can_approve: user.is_admin })
+                .await;
+            let _ = socket.close().await;
+            return;
+        }
         Err(e) => {
             tracing::warn!(user = user.username, connection = row.name, "échec de connexion : {e}");
             return fail(socket, e.to_string()).await;
         }
     };
-    if pinned.is_none() {
-        // Confiance au premier usage : l'empreinte est mémorisée pour les fois suivantes.
+    if stored.is_none() {
+        // Empreinte approuvée par un admin et vérifiée avant CredSSP : on l'épingle.
         let _ = sqlx::query("UPDATE connections SET cert_sha256 = ? WHERE id = ? AND cert_sha256 IS NULL")
             .bind(connected.cert_sha256.to_vec())
             .bind(row.id)
             .execute(&state.db)
             .await;
         tracing::info!(
+            user = user.username,
             connection = row.name,
             fingerprint = rdp_connect::hex(&connected.cert_sha256),
-            "certificat épinglé"
+            "certificat approuvé et épinglé"
         );
     }
     send_text(

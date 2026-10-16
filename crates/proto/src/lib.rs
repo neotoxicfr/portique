@@ -200,6 +200,9 @@ pub struct UserInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMessage {
+    /// Premier contact : l'empreinte du certificat du PC doit être approuvée par un admin
+    /// (à comparer avec celle qu'affiche le script de préparation sur le PC).
+    UntrustedCertificate { fingerprint: String, can_approve: bool },
     /// Le serveur a fait TLS + NLA : le navigateur reprend à MCS Connect Initial.
     Ready {
         selected_protocol: u32,

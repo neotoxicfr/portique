@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/server", "crates/web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+yawrdp-proto = { path = "crates/proto" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.28", features = ["serde"] }
+webauthn-rs-proto = "0.5.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.release.package.yawrdp-web]
+opt-level = "z"

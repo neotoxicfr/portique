@@ -1,0 +1,8 @@
+/target
+/dist
+/data
+.audit/
+*.db
+*.db-*
+.env
+secrets/

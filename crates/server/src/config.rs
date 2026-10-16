@@ -27,6 +27,9 @@ pub struct Config {
     pub secure_cookies: bool,
 }
 
+/// Résultat d'une résolution de noms de proxys : instant et adresses.
+pub type Resolved = (std::time::Instant, Vec<std::net::IpAddr>);
+
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub trusted: Vec<IpNet>,
@@ -34,7 +37,7 @@ pub struct ProxyConfig {
     /// l'adresse change à chaque redémarrage) ; résolus régulièrement (`refresh_trusted_hosts`).
     pub trusted_hosts: Vec<String>,
     /// Dernière résolution réussie des noms : (instant, adresses).
-    pub resolved: std::sync::Arc<std::sync::RwLock<Option<(std::time::Instant, Vec<std::net::IpAddr>)>>>,
+    pub resolved: std::sync::Arc<std::sync::RwLock<Option<Resolved>>>,
     pub user_header: String,
     pub groups_header: String,
     pub admin_group: Option<String>,

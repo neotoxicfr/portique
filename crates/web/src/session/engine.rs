@@ -912,6 +912,9 @@ impl Engine {
         if multi {
             return;
         }
+        web_sys::console::debug_1(
+            &format!("redimensionnement demandé {w}×{h} (actuel {current:?}, canal {channel:?}, prêt {ready})").into(),
+        );
         let (Some(channel), true) = (channel, ready) else { return };
         if (w, h) == current {
             return;

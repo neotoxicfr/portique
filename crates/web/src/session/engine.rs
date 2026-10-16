@@ -67,6 +67,9 @@ struct Inner {
     /// Ctrl+V en cours : les entrées attendent la synchronisation du presse-papier.
     holding: bool,
     held: Vec<Input>,
+    /// Attente de l'accusé (Format List Response) de notre dernière liste de formats : Windows ne
+    /// l'envoie qu'une fois notre contenu installé, c'est le moment de relâcher un Ctrl+V.
+    clip_ack: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 /// Poignée partagée sur une session en cours.
@@ -134,6 +137,7 @@ impl Engine {
             clip_last: None,
             holding: false,
             held: Vec::new(),
+            clip_ack: None,
         }));
         let engine = Engine { inner, status };
         (engine.status)(Status::Connecting("connexion au PC…".into()));
@@ -450,8 +454,28 @@ impl Engine {
                 return;
             }
         };
+        let kind = u16::from_le_bytes([msg.first().copied().unwrap_or(0), msg.get(1).copied().unwrap_or(0)]);
+        if kind == 3
+            && let Some(tx) = self.inner.borrow_mut().clip_ack.take()
+        {
+            let _ = tx.send(());
+        }
+        web_sys::console::debug_1(
+            &format!("cliprdr ← type {kind} ({} o) → {} événement(s)", msg.len(), events.len()).into(),
+        );
         let mut queue = self.clip_send(events);
         while let Some(ev) = queue.pop() {
+            web_sys::console::debug_1(
+                &format!(
+                    "cliprdr : {}",
+                    match &ev {
+                        rdp_clip::ClipEvent::RemoteChanged(f) => format!("le PC propose {f:?}"),
+                        rdp_clip::ClipEvent::RemoteData(d) => format!("données reçues : {}", d.is_some()),
+                        rdp_clip::ClipEvent::Send(_) => "envoi".into(),
+                    }
+                )
+                .into(),
+            );
             match ev {
                 rdp_clip::ClipEvent::RemoteChanged(formats) => {
                     let mut i = self.inner.borrow_mut();
@@ -502,20 +526,29 @@ impl Engine {
         if !self.is_connected() {
             return;
         }
-        let Some(items) = clip::read_local().await else { return };
+        let t0 = js_sys::Date::now();
+        let items = clip::read_local().await;
+        web_sys::console::debug_1(
+            &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),
+        );
+        let Some(items) = items else { return };
         if items.is_empty() {
             return;
         }
         let fp = clip::fingerprint(&items);
+        let (tx, rx) = futures::channel::oneshot::channel();
         let events = {
             let mut i = self.inner.borrow_mut();
             if i.clip_last == Some(fp) {
                 return;
             }
             i.clip_last = Some(fp);
+            i.clip_ack = Some(tx);
             i.clip.set_local(items)
         };
         self.clip_send(events);
+        // Attend que Windows ait installé notre contenu (borné par l'appelant).
+        let _ = rx.await;
     }
 
     /// Geste utilisateur : occasion de réussir une écriture locale refusée plus tôt.
@@ -531,7 +564,7 @@ impl Engine {
         }
     }
 
-    /// Ctrl+V : synchronise d'abord le presse-papier, puis laisse passer les touches retenues.
+    /// Ctrl+V : synchronise d'abord le presse-papier (2 s au plus), puis laisse passer les touches retenues.
     pub fn paste_guard(&self) {
         if self.inner.borrow().holding {
             return;
@@ -544,7 +577,7 @@ impl Engine {
                 let p = js_sys::Promise::new(&mut |resolve, _| {
                     let _ = web_sys::window()
                         .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 800);
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 2000);
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(p).await;
             };

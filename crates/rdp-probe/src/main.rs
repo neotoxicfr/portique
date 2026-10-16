@@ -97,6 +97,9 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     send(tls, &session.start()).await?;
     let mut buf = Vec::new();
     let mut gfx = rdp_gfx::Gfx::new();
+    let mut clip = rdp_clip::Clipboard::new();
+    let clip_test = env("CLIPTEST").is_some();
+    let mut clip_started = false;
     // YAWRDP_PROBE_DUMP : enregistre les messages EGFX bruts (longueur u32 + octets) pour le rejeu
     // hors ligne (`gfx-replay`). Contient l'écran : à garder hors du dépôt.
     let mut dump = env("DUMP").map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
@@ -168,7 +171,56 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                     println!("✗ {t}");
                     break 'outer;
                 }
-                Event::Ignored(_) | Event::Pointer(_) | Event::Clipboard(_) | Event::DvcData { .. } => {}
+                Event::Clipboard(msg) => {
+                    let kind = u16::from_le_bytes([msg[0], msg[1]]);
+                    println!("  {:>6} ms cliprdr ← type {kind} ({} o)", t0.elapsed().as_millis(), msg.len());
+                    for ev in clip.receive(&msg).map_err(|e| anyhow::anyhow!("{e:?}"))? {
+                        match ev {
+                            rdp_clip::ClipEvent::Send(m) => {
+                                println!("  {:>6} ms cliprdr → type {}", t0.elapsed().as_millis(), u16::from_le_bytes([m[0], m[1]]));
+                                for f in session.static_send(rdp_session::CLIPRDR, &m) {
+                                    send(tls, &f).await?;
+                                }
+                            }
+                            rdp_clip::ClipEvent::RemoteChanged(f) => {
+                                println!("  le PC propose {f:?}");
+                                for ev in clip.request(&[rdp_clip::ClipFormat::Text]) {
+                                    if let rdp_clip::ClipEvent::Send(m) = ev {
+                                        for fr in session.static_send(rdp_session::CLIPRDR, &m) {
+                                            send(tls, &fr).await?;
+                                        }
+                                    }
+                                }
+                            }
+                            rdp_clip::ClipEvent::RemoteData(d) => println!("  données du PC : {d:?}"),
+                        }
+                    }
+                    if clip_test && !clip_started && kind == 1 {
+                        clip_started = true;
+                        // Win+R, « abc », Ctrl+A, Ctrl+C (scancodes), avec des pauses.
+                        use rdp_pdu::fastpath::{Input, kbd};
+                        let k = |code: u8, ext: bool, up: bool| Input::Scancode {
+                            code,
+                            flags: if ext { kbd::EXTENDED } else { 0 } | if up { kbd::RELEASE } else { 0 },
+                        };
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let steps: Vec<Vec<Input>> = vec![
+                            vec![k(0x5B, true, false), k(0x13, false, false), k(0x13, false, true), k(0x5B, true, true)],
+                            vec![k(0x1E, false, false), k(0x1E, false, true), k(0x30, false, false), k(0x30, false, true), k(0x2E, false, false), k(0x2E, false, true)],
+                            vec![k(0x1D, false, false), k(0x1E, false, false), k(0x1E, false, true), k(0x1D, false, true)],
+                            vec![k(0x1D, false, false), k(0x2E, false, false), k(0x2E, false, true), k(0x1D, false, true)],
+                            vec![k(0x1D, false, false), k(0x1E, false, false), k(0x1E, false, true), k(0x1D, false, true)],
+                            vec![k(0x2C, false, false), k(0x2C, false, true), k(0x2C, false, false), k(0x2C, false, true), k(0x2C, false, false), k(0x2C, false, true)],
+                            vec![k(0x2A, false, false), k(0x52, true, false), k(0x52, true, true), k(0x2A, false, true)],
+                        ];
+                        for (i, step) in steps.iter().enumerate() {
+                            send(tls, &session.input(step)).await?;
+                            println!("  {:>6} ms → touches étape {i}", t0.elapsed().as_millis());
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                        }
+                    }
+                }
+                Event::Ignored(_) | Event::Pointer(_) | Event::DvcData { .. } => {}
                 other => println!("  {other:?}"),
             }
         }
@@ -176,6 +228,12 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     println!("  {frames} images rendues, {avc} images H.264 sautées en {seconds} s");
     for (k, n) in &ignored {
         println!("  ignoré ×{n} : {k}");
+    }
+    if clip_test {
+        // Referme la boîte Exécuter (Échap) après la capture ci-dessous.
+        use rdp_pdu::fastpath::{Input, kbd};
+        let esc = [Input::Scancode { code: 0x01, flags: 0 }, Input::Scancode { code: 0x01, flags: kbd::RELEASE }];
+        let _ = send(tls, &session.input(&esc)).await;
     }
     if let Some(path) = env("PNG") {
         let (rgba, w, h) = gfx.output();

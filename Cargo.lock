@@ -2841,6 +2841,7 @@ dependencies = [
  "anyhow",
  "png",
  "rdp-auth",
+ "rdp-clip",
  "rdp-codecs",
  "rdp-connect",
  "rdp-gfx",

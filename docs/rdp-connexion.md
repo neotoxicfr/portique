@@ -1,0 +1,48 @@
+# Pile RDP : connexion et NLA (étape 2)
+
+Sources : MS-RDPBCGR (2.2.1.1 à 2.2.1.4, 2.2.10.2), MS-NLMP (3.3.2, 3.4, 4.2.4), MS-CSSP.
+IronRDP et FreeRDP ne servent que de référence légère.
+
+## Séquence
+
+1. **X.224 Connection Request** : cookie `mstshash`, protocoles demandés `SSL | HYBRID | HYBRID_EX`.
+2. **Connection Confirm** : protocole retenu, ou `RDP_NEG_FAILURE` avec un message clair.
+3. **TLS** (rustls, ring). Le certificat RDP est auto-signé ; il sera épinglé par connexion
+   (confiance au premier usage) dans le serveur.
+4. **CredSSP v6 + NTLMv2** (`rdp-auth`) : la preuve de clé publique lie l'authentification au
+   certificat TLS (SHA-256 avec nonce, versions 5 et plus). Un code NTSTATUS du serveur est traduit
+   (ex. `0xC000006D` = identifiants refusés).
+5. **Early User Authorization Result** (HYBRID_EX) : 4 octets, 0 = autorisé, 5 = accès RDP refusé.
+6. **MCS Connect Initial / Response** (BER) avec GCC Conference Create (PER) et blocs client/serveur.
+
+## Choix
+
+- NTLM : drapeaux de mstsc (`0xE2088235`), MIC toujours présent (`MsvAvFlags`), SPN `TERMSRV/hôte`,
+  liaison de canal vide (16 zéros), réponse LM à zéro quand le serveur fournit un horodatage.
+- Aucune crypto maison : MD4, MD5, HMAC, RC4, SHA-256 viennent de RustCrypto ; seuls les messages
+  sont écrits ici. Le hasard et l'heure sont fournis par l'appelant, pour pouvoir tester.
+- Client annoncé en RDP 10.7, avec les drapeaux précoces qui ouvrent EGFX, 32 bpp, heartbeat et
+  disposition des écrans.
+
+## Mesuré sur le PC cible (16/10/2026, via wireguard)
+
+- Protocole retenu : HYBRID_EX ; drapeaux de négociation `0x2f` (EGFX supporté, restricted admin,
+  redirected auth).
+- TLS 1.3.
+- NLA réussie avec un compte local (domaine vide).
+- Serveur RDP 10.12 (`0x00080011`), capacités précoces `0x4` (edge actions v2), chiffrement RDP 0/0.
+- Canaux : E/S 1003, `cliprdr` 1004, `drdynvc` 1005.
+
+## Sonde
+
+`crates/rdp-probe` rejoue toute la séquence et affiche le résultat. Le mot de passe est lu depuis
+`YAWRDP_PROBE_PASSWORD_FILE` et n'est jamais affiché.
+
+```sh
+docker run --rm --network container:wireguard \
+  -v /srv/yawrdp/probe/rdp-probe:/rdp-probe:ro \
+  -v /srv/yawrdp/secrets/rdp_password:/run/secrets/rdp_password:ro \
+  -e YAWRDP_PROBE_HOST=192.0.2.50 -e YAWRDP_PROBE_USER=alice \
+  -e YAWRDP_PROBE_PASSWORD_FILE=/run/secrets/rdp_password \
+  debian:bookworm-slim /rdp-probe
+```

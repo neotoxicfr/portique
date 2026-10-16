@@ -3,8 +3,9 @@
 Client RDP web auto-hébergé, en Rust de bout en bout : serveur axum et front Leptos (wasm). La pile RDP est
 écrite maison à partir des spécifications Microsoft. Elle remplace Apache Guacamole.
 
-État : **étape 1/8**. Comptes, connexions, Wake-on-LAN et front sont en place ; la session RDP arrive à
-partir de l'étape 2.
+État : **étape 2/8**. Comptes, connexions, Wake-on-LAN et front sont en place. La pile RDP maison
+négocie, chiffre en TLS, s'authentifie en NLA et échange les blocs MCS avec un vrai Windows
+(voir `docs/rdp-connexion.md`). L'affichage arrive à l'étape 3.
 
 ## Configuration
 

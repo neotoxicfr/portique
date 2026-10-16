@@ -1,8 +1,30 @@
-/target
-/dist
-/data
-.audit/
+# Compilation
+/target/
+/dist/
+/pkg/
+
+# Données locales et secrets (jamais dans Git)
+/data/
+/secrets/
 *.db
 *.db-*
 .env
-secrets/
+.env.*
+!.env.example
+
+# Sorties de la sonde : captures et enregistrements EGFX de l'écran distant
+*.png
+!crates/web/pwa/*.png
+*.egfx
+*.dump
+
+# Scratch des sessions d'analyse
+/.audit/
+
+# Éditeurs et systèmes
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

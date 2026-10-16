@@ -116,10 +116,13 @@ pub async fn screens() -> Result<(Vec<ScreenGeom>, usize), String> {
     Ok((out, cur))
 }
 
+/// Écran envoyé au PC : x, y relatifs à l'écran principal, largeur, hauteur.
+pub type Monitor = (i32, i32, u32, u32);
+
 /// Disposition à envoyer (relative à l'écran principal) et rectangles attendus en sortie.
-pub fn layout(screens: &[ScreenGeom], primary: usize) -> (Vec<(i32, i32, u32, u32)>, Vec<Rect>) {
+pub fn layout(screens: &[ScreenGeom], primary: usize) -> (Vec<Monitor>, Vec<Rect>) {
     let p = &screens[primary];
-    let rel: Vec<(i32, i32, u32, u32)> = screens
+    let rel: Vec<Monitor> = screens
         .iter()
         .map(|s| {
             let (w, h) = crate::session::engine::clamp_size(s.width, s.height);
@@ -134,7 +137,7 @@ pub fn layout(screens: &[ScreenGeom], primary: usize) -> (Vec<(i32, i32, u32, u3
 }
 
 /// DISPLAYCONTROL_MONITOR_LAYOUT_PDU (MS-RDPEDISP 2.2.2.2), écran `primary` principal.
-pub fn layout_pdu(monitors: &[(i32, i32, u32, u32)], primary: usize) -> Vec<u8> {
+pub fn layout_pdu(monitors: &[Monitor], primary: usize) -> Vec<u8> {
     let mut p = Vec::with_capacity(16 + 40 * monitors.len());
     p.extend_from_slice(&2u32.to_le_bytes());
     p.extend_from_slice(&((16 + 40 * monitors.len()) as u32).to_le_bytes());

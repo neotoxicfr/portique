@@ -247,14 +247,17 @@ pub fn SessionPage() -> impl IntoView {
                 <Show when=move || menu_open.get()>
                     <div class="session-actions">
                         <button on:click=fullscreen>"Plein écran"</button>
-                        {move || if { multi_label.track(); multi_active.get() } {
-                            view! { <button on:click=single>"Un seul écran"</button> }.into_any()
-                        } else if screens.with_value(Option::is_some) {
-                            view! { <button on:click=extend>{multi_label.get().unwrap_or_default()}</button> }.into_any()
-                        } else {
-                            view! {
-                                <button on:click=detect title=move || multi_label.get().unwrap_or_default()>"Multi-écran"</button>
-                            }.into_any()
+                        {move || {
+                            multi_label.track();
+                            if multi_active.get() {
+                                view! { <button on:click=single>"Un seul écran"</button> }.into_any()
+                            } else if screens.with_value(Option::is_some) {
+                                view! { <button on:click=extend>{multi_label.get().unwrap_or_default()}</button> }.into_any()
+                            } else {
+                                view! {
+                                    <button on:click=detect title=move || multi_label.get().unwrap_or_default()>"Multi-écran"</button>
+                                }.into_any()
+                            }
                         }}
                         <button on:click=cad>"Ctrl+Alt+Suppr"</button>
                         <button class="secondary" on:click=quit.clone()>"Quitter"</button>

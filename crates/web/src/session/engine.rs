@@ -585,7 +585,7 @@ impl Engine {
         if kind == "pointerdown" {
             self.user_gesture();
         }
-        let Some((x, y)) = self.desktop_point(idx, e.client_x() as f64, e.client_y() as f64) else { return };
+        let Some((x, y)) = self.desktop_point(idx, e.client_x(), e.client_y()) else { return };
         let event = match kind {
             "pointermove" => Input::Mouse { flags: ptr::MOVE, x, y },
             _ => {
@@ -618,7 +618,7 @@ impl Engine {
             return;
         }
         e.prevent_default();
-        let Some((x, y)) = self.desktop_point(idx, e.client_x() as f64, e.client_y() as f64) else { return };
+        let Some((x, y)) = self.desktop_point(idx, e.client_x(), e.client_y()) else { return };
         let unit = match e.delta_mode() {
             0 => 1.2,
             1 => 40.0,

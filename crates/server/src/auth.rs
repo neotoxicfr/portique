@@ -136,7 +136,7 @@ pub async fn close_session(state: &AppState, jar: CookieJar) -> Result<CookieJar
 /// IP réelle du client : le pair TCP, ou le premier saut non fiable de `X-Forwarded-For`
 /// si le pair est un proxy de confiance.
 pub fn client_ip(peer: IpAddr, headers: &HeaderMap, proxy: &ProxyConfig) -> IpAddr {
-    let trusted = |ip: &IpAddr| proxy.trusted.iter().any(|n| n.contains(ip));
+    let trusted = |ip: &IpAddr| proxy.is_trusted(ip);
     if !trusted(&peer) {
         return peer;
     }
@@ -223,7 +223,7 @@ async fn from_cookie(state: &AppState, parts: &Parts) -> Result<UserRow, AppErro
 
 async fn from_proxy(state: &AppState, parts: &Parts, peer: IpAddr) -> Result<UserRow, AppError> {
     let proxy = &state.cfg.proxy;
-    if !proxy.trusted.iter().any(|n| n.contains(&peer)) {
+    if !proxy.is_trusted(&peer) {
         tracing::warn!(%peer, "requête hors proxy de confiance refusée");
         return Err(AppError::Unauthorized);
     }
@@ -257,6 +257,8 @@ mod tests {
     fn proxy(trusted: &[&str]) -> ProxyConfig {
         ProxyConfig {
             trusted: trusted.iter().map(|s| s.parse().unwrap()).collect(),
+            trusted_hosts: Vec::new(),
+            resolved: Default::default(),
             user_header: "Remote-User".into(),
             groups_header: "Remote-Groups".into(),
             admin_group: None,

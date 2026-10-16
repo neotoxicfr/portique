@@ -30,6 +30,10 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub trusted: Vec<IpNet>,
+    /// Proxys de confiance désignés par leur nom (ex. `traefik` sur un réseau Docker, dont
+    /// l'adresse change à chaque redémarrage) ; résolus régulièrement (`refresh_trusted_hosts`).
+    pub trusted_hosts: Vec<String>,
+    pub resolved: std::sync::Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
     pub user_header: String,
     pub groups_header: String,
     pub admin_group: Option<String>,
@@ -98,17 +102,18 @@ impl Config {
             Some(other) => bail!("YAWRDP_AUTH_MODE inconnu : {other} (builtin ou proxy)"),
         };
 
-        let trusted = plain(env, "TRUSTED_PROXIES")
-            .map(|list| {
-                list.split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(parse_net)
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        if auth_mode == AuthMode::Proxy && trusted.is_empty() {
-            bail!("YAWRDP_AUTH_MODE=proxy exige YAWRDP_TRUSTED_PROXIES (IP ou CIDR du proxy)");
+        let (mut trusted, mut trusted_hosts) = (Vec::new(), Vec::new());
+        for item in
+            plain(env, "TRUSTED_PROXIES").unwrap_or_default().split([',', ' ']).filter(|s| !s.is_empty())
+        {
+            match parse_net(item) {
+                Ok(n) => trusted.push(n),
+                Err(_) if is_hostname(item) => trusted_hosts.push(item.to_owned()),
+                Err(e) => return Err(e),
+            }
+        }
+        if auth_mode == AuthMode::Proxy && trusted.is_empty() && trusted_hosts.is_empty() {
+            bail!("YAWRDP_AUTH_MODE=proxy exige YAWRDP_TRUSTED_PROXIES (IP, CIDR ou nom du proxy)");
         }
 
         Ok(Self {
@@ -121,12 +126,52 @@ impl Config {
             auth_mode,
             proxy: ProxyConfig {
                 trusted,
+                trusted_hosts,
+                resolved: Default::default(),
                 user_header: plain(env, "PROXY_USER_HEADER").unwrap_or_else(|| "Remote-User".into()),
                 groups_header: plain(env, "PROXY_GROUPS_HEADER").unwrap_or_else(|| "Remote-Groups".into()),
                 admin_group: plain(env, "PROXY_ADMIN_GROUP"),
             },
             secure_cookies: plain(env, "INSECURE_COOKIES").as_deref() != Some("1"),
         })
+    }
+}
+
+fn is_hostname(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+impl ProxyConfig {
+    /// Adresse d'un proxy de confiance (CIDR configurés ou noms résolus) ?
+    pub fn is_trusted(&self, ip: &std::net::IpAddr) -> bool {
+        self.trusted.iter().any(|n| n.contains(ip)) || self.resolved.read().unwrap().contains(ip)
+    }
+
+    /// Résout les noms de proxys (au démarrage puis périodiquement). Une résolution ratée garde
+    /// les adresses connues : une panne DNS passagère ne coupe pas l'accès.
+    pub async fn refresh_trusted_hosts(&self) {
+        if self.trusted_hosts.is_empty() {
+            return;
+        }
+        let mut ips = Vec::new();
+        for host in &self.trusted_hosts {
+            match tokio::net::lookup_host((host.as_str(), 0)).await {
+                Ok(addrs) => ips.extend(addrs.map(|a| a.ip())),
+                Err(e) => tracing::warn!(host, "résolution du proxy de confiance impossible : {e}"),
+            }
+        }
+        if !ips.is_empty() {
+            ips.sort();
+            ips.dedup();
+            let mut cur = self.resolved.write().unwrap();
+            if *cur != ips {
+                tracing::info!(?ips, "proxys de confiance résolus");
+                *cur = ips;
+            }
+        }
     }
 }
 
@@ -185,12 +230,13 @@ mod tests {
             ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
             ("YAWRDP_MASTER_KEY", KEY),
             ("YAWRDP_AUTH_MODE", "proxy"),
-            ("YAWRDP_TRUSTED_PROXIES", "172.16.0.0/12, 10.0.0.1"),
+            ("YAWRDP_TRUSTED_PROXIES", "172.16.0.0/12, 10.0.0.1, traefik"),
             ("YAWRDP_PROXY_ADMIN_GROUP", "admins"),
         ];
         let c = Config::from_env(&env).unwrap();
         assert_eq!(c.auth_mode, AuthMode::Proxy);
         assert_eq!(c.proxy.trusted.len(), 2);
+        assert_eq!(c.proxy.trusted_hosts, ["traefik"]);
         assert_eq!(c.master_key[31], 31);
         assert!(c.secure_cookies);
     }

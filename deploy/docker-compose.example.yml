@@ -1,0 +1,44 @@
+# Exemple : yawrdp derrière Traefik + Authelia (mode proxy), dans l'espace réseau d'un conteneur
+# WireGuard qui joint le réseau du PC (ici `wireguard`). Secrets en fichiers (Docker secrets).
+services:
+  yawrdp:
+    image: yawrdp:0.1.0
+    container_name: yawrdp
+    network_mode: "container:wireguard"   # le PC n'est joignable que par ce tunnel
+    environment:
+      YAWRDP_LISTEN: 0.0.0.0:8090        # 8080-8083 déjà pris dans cet espace réseau
+      YAWRDP_PUBLIC_URL: https://yawrdp.example.net
+      YAWRDP_AUTH_MODE: proxy
+      YAWRDP_TRUSTED_PROXIES: traefik    # nom résolu toutes les 30 s (IP Docker non fixe)
+      YAWRDP_PROXY_ADMIN_GROUP: admin
+      YAWRDP_MASTER_KEY_FILE: /run/secrets/master_key
+    secrets:
+      - master_key
+    volumes:
+      - ./data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges=true
+    cap_drop: [ALL]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+secrets:
+  master_key:
+    file: ./secrets/master_key           # openssl rand -base64 32 > secrets/master_key ; chmod 600
+
+# Route Traefik (fichier dynamique, le conteneur partageant le réseau de wireguard) :
+# http:
+#   routers:
+#     yawrdp:
+#       rule: Host(`yawrdp.example.net`)
+#       service: yawrdp
+#       middlewares: [admin-chain-app]    # Authelia devant ; la CSP de yawrdp n'est pas écrasée
+#   services:
+#     yawrdp:
+#       loadBalancer:
+#         servers:
+#           - url: http://wireguard:8090

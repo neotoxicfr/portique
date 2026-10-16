@@ -1,0 +1,7 @@
+target
+dist
+data
+.audit
+.git
+**/*.db
+secrets

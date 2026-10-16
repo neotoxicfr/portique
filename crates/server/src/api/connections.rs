@@ -15,22 +15,23 @@ use crate::{
 };
 
 #[derive(sqlx::FromRow)]
-struct Row {
-    id: i64,
-    name: String,
-    protocol: String,
-    host: String,
-    port: i64,
-    username: String,
-    domain: String,
-    password: Option<Vec<u8>>,
-    wol_mac: Option<String>,
-    wol_target: Option<String>,
+pub(crate) struct Row {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) protocol: String,
+    pub(crate) host: String,
+    pub(crate) port: i64,
+    pub(crate) username: String,
+    pub(crate) domain: String,
+    pub(crate) password: Option<Vec<u8>>,
+    pub(crate) wol_mac: Option<String>,
+    pub(crate) wol_target: Option<String>,
+    pub(crate) cert_sha256: Option<Vec<u8>>,
 }
 
 macro_rules! columns {
     () => {
-        "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target"
+        "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target, cert_sha256"
     };
 }
 
@@ -46,7 +47,7 @@ fn protocol_str(p: Protocol) -> &'static str {
 }
 
 /// Connexion accessible à l'utilisateur ? Les admins voient tout.
-async fn find_allowed(db: &SqlitePool, user_id: i64, is_admin: bool, id: i64) -> ApiResult<Row> {
+pub(crate) async fn find_allowed(db: &SqlitePool, user_id: i64, is_admin: bool, id: i64) -> ApiResult<Row> {
     sqlx::query_as(concat!(
         "SELECT ",
         columns!(),
@@ -120,6 +121,7 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
         wol_mac: r.wol_mac,
         wol_target: r.wol_target,
         allowed_users,
+        cert_fingerprint: r.cert_sha256.as_deref().map(hex::encode),
     })
 }
 
@@ -257,6 +259,12 @@ pub async fn update(
     }
     save_password(&state, id, &i.password).await?;
     save_access(&state.db, id, &i.allowed_users).await?;
+    if i.forget_certificate {
+        sqlx::query("UPDATE connections SET cert_sha256 = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
     let row = find_allowed(&state.db, 0, true, id).await?;
     Ok(Json(to_admin(&state.db, row).await?))
 }

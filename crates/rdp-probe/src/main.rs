@@ -1,36 +1,19 @@
-//! Sonde RDP : se connecte, négocie, chiffre en TLS, s'authentifie en NLA (CredSSP/NTLMv2)
-//! puis échange les blocs MCS/GCC et affiche ce que le serveur annonce.
+//! Sonde RDP : connexion authentifiée (rdp-connect), session complète (rdp-session), rendu EGFX
+//! (rdp-gfx) et capture PNG du bureau.
 //!
 //! Variables : YAWRDP_PROBE_HOST, YAWRDP_PROBE_PORT (3389), YAWRDP_PROBE_USER,
-//! YAWRDP_PROBE_DOMAIN (vide), YAWRDP_PROBE_PASSWORD ou YAWRDP_PROBE_PASSWORD_FILE.
-//! Le mot de passe n'est jamais affiché.
+//! YAWRDP_PROBE_DOMAIN (vide), YAWRDP_PROBE_PASSWORD ou YAWRDP_PROBE_PASSWORD_FILE,
+//! YAWRDP_PROBE_SECONDS (8), YAWRDP_PROBE_PNG (chemin de capture). Le mot de passe n'est
+//! jamais affiché.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
-use rand::Rng;
-use rdp_auth::{
-    credssp::{self, CredSspClient, Step},
-    ntlm::{Credentials, Randomness},
-};
-use rdp_pdu::x224::{self, protocol};
+use rdp_auth::ntlm::Credentials;
+use rdp_connect::{Target, read_frame};
+use rdp_pdu::x224;
 use rdp_session::{Config, Event, Session};
-use rustls::{
-    DigitallySignedStruct, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
-};
-use sha2::{Digest, Sha256};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-    time::timeout,
-};
-
-const IO_TIMEOUT: Duration = Duration::from_secs(15);
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(format!("YAWRDP_PROBE_{name}")).ok().filter(|v| !v.is_empty())
@@ -50,77 +33,9 @@ fn password() -> anyhow::Result<String> {
     }
 }
 
-/// Le certificat RDP est presque toujours auto-signé : on l'accepte ici et on affiche son
-/// empreinte. Le produit final l'épinglera par connexion (confiance au premier usage).
-#[derive(Debug)]
-struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
-
-impl ServerCertVerifier for AcceptAny {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        msg: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(msg, cert, dss, &self.0.signature_verification_algorithms)
-    }
-    fn verify_tls13_signature(
-        &self,
-        msg: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(msg, cert, dss, &self.0.signature_verification_algorithms)
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Lit exactement une trame dont la longueur se déduit de l'en-tête.
-async fn read_frame<S: AsyncRead + Unpin>(
-    s: &mut S,
-    buf: &mut Vec<u8>,
-    len_of: fn(&[u8]) -> Option<usize>,
-) -> anyhow::Result<Vec<u8>> {
-    loop {
-        if let Some(n) = len_of(buf) {
-            anyhow::ensure!((2..1 << 20).contains(&n), "longueur de trame aberrante ({n})");
-            if buf.len() >= n {
-                return Ok(buf.drain(..n).collect());
-            }
-        }
-        let mut chunk = [0u8; 8192];
-        let got = timeout(IO_TIMEOUT, s.read(&mut chunk)).await.context("délai dépassé")??;
-        anyhow::ensure!(got > 0, "connexion fermée par le serveur");
-        buf.extend_from_slice(&chunk[..got]);
-    }
-}
-
 async fn send<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> anyhow::Result<()> {
-    timeout(IO_TIMEOUT, s.write_all(data)).await.context("délai dépassé")??;
+    tokio::time::timeout(Duration::from_secs(15), s.write_all(data)).await.context("délai dépassé")??;
     Ok(())
-}
-
-fn filetime_now() -> u64 {
-    let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    (unix.as_secs() + 11_644_473_600) * 10_000_000 + u64::from(unix.subsec_nanos() / 100)
-}
-
-fn random<const N: usize>() -> [u8; N] {
-    let mut b = [0u8; N];
-    rand::rng().fill_bytes(&mut b);
-    b
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -129,75 +44,21 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = env("PORT").map(|p| p.parse()).transpose()?.unwrap_or(3389);
     let user = env("USER").context("YAWRDP_PROBE_USER manquant")?;
     let domain = env("DOMAIN").unwrap_or_default();
-    let creds = Credentials { username: user.clone(), domain, password: password()? };
-
-    println!("→ connexion TCP à {host}:{port}");
-    let mut tcp =
-        timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port))).await.context("délai TCP")??;
-    tcp.set_nodelay(true)?;
-
-    let requested = protocol::SSL | protocol::HYBRID | protocol::HYBRID_EX;
-    send(&mut tcp, &x224::connection_request(Some(&user), requested)).await?;
-    let mut buf = Vec::new();
-    let cc = x224::connection_confirm(&read_frame(&mut tcp, &mut buf, x224::frame_len).await?)?;
-    println!(
-        "✓ négociation : {} (drapeaux 0x{:02x}{})",
-        x224::protocol_name(cc.selected_protocol),
-        cc.flags,
-        if cc.flags & x224::neg_flags::DYNVC_GFX_PROTOCOL_SUPPORTED != 0 { ", EGFX supporté" } else { "" }
-    );
-    if cc.selected_protocol == protocol::RDP {
-        bail!("le serveur ne propose que la sécurité RDP standard, refusée");
-    }
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
-        .with_no_client_auth();
-    let name = ServerName::try_from(host.clone())?;
-    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp).await?;
-    let (version, cert) = {
-        let conn = tls.get_ref().1;
-        let cert = conn.peer_certificates().and_then(|c| c.first()).context("aucun certificat")?.to_vec();
-        (conn.protocol_version(), cert)
+    let target = Target {
+        host: host.clone(),
+        port,
+        credentials: Credentials { username: user.clone(), domain, password: password()? },
     };
+    println!("→ connexion à {host}:{port}");
+    let mut c = rdp_connect::connect(&target, None).await?;
     println!(
-        "✓ TLS {:?}, certificat SHA-256 {}",
-        version.context("version TLS")?,
-        hex::encode(Sha256::digest(&cert))
+        "✓ NLA réussie pour {user} ({}, drapeaux 0x{:02x}), certificat SHA-256 {}",
+        x224::protocol_name(c.selected_protocol),
+        c.negotiation_flags,
+        rdp_connect::hex(&c.cert_sha256)
     );
-
-    if cc.selected_protocol & (protocol::HYBRID | protocol::HYBRID_EX) != 0 {
-        let rand = Randomness {
-            client_challenge: random(),
-            exported_session_key: random(),
-            now_filetime: filetime_now(),
-        };
-        let mut cssp = CredSspClient::new(creds, &cert, &host, rand, random())?;
-        send(&mut tls, &cssp.start()?).await?;
-        let mut buf = Vec::new();
-        loop {
-            let msg = read_frame(&mut tls, &mut buf, credssp::frame_len).await?;
-            match cssp.step(&msg).map_err(|e| anyhow::anyhow!("NLA : {e}"))? {
-                Step::Send(out) => send(&mut tls, &out).await?,
-                Step::Finish(out) => {
-                    send(&mut tls, &out).await?;
-                    break;
-                }
-            }
-        }
-        if cc.selected_protocol == protocol::HYBRID_EX {
-            let mut res = [0u8; 4];
-            timeout(IO_TIMEOUT, tls.read_exact(&mut res)).await.context("délai")??;
-            credssp::early_user_auth_result(&res).map_err(|e| anyhow::anyhow!("NLA : {e}"))?;
-        }
-        println!("✓ NLA réussie pour {user}");
-    }
-
-    run_session(&mut tls, &user, cc.selected_protocol).await?;
-    let _ = tls.shutdown().await;
+    run_session(&mut c.stream, &user, c.selected_protocol).await?;
+    let _ = c.stream.shutdown().await;
     Ok(())
 }
 

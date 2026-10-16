@@ -1,6 +1,7 @@
 pub mod account;
 pub mod auth;
 pub mod connections;
+pub mod session;
 pub mod users;
 
 use axum::{
@@ -28,6 +29,7 @@ pub fn router() -> Router<AppState> {
         .route("/account/passkeys/register/finish", post(account::passkey_register_finish))
         .route("/connections", get(connections::list))
         .route("/connections/{id}/wake", post(connections::wake))
+        .route("/connections/{id}/session", get(session::open))
         .route("/admin/connections", get(connections::admin_list).post(connections::create))
         .route("/admin/connections/{id}", put(connections::update).delete(connections::delete))
         .route("/admin/users", get(users::list).post(users::create))

@@ -142,6 +142,8 @@ pub struct ConnectionAdmin {
     pub wol_mac: Option<String>,
     pub wol_target: Option<String>,
     pub allowed_users: Vec<i64>,
+    /// Empreinte SHA-256 (hexa) du certificat épinglé, si déjà vu.
+    pub cert_fingerprint: Option<String>,
 }
 
 /// Création ou modification d'une connexion. `password: None` garde l'ancien,
@@ -165,6 +167,9 @@ pub struct ConnectionInput {
     pub wol_target: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<i64>,
+    /// Oublie le certificat épinglé (PC réinstallé, certificat renouvelé).
+    #[serde(default)]
+    pub forget_certificate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,6 +193,23 @@ pub struct UserInput {
     /// Supprime le TOTP et les passkeys (compte perdu).
     #[serde(default)]
     pub reset_2fa: bool,
+}
+
+/// Messages texte du WebSocket de session (`/api/connections/{id}/session`) ; les messages
+/// binaires portent les octets RDP bruts dans les deux sens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionMessage {
+    /// Le serveur a fait TLS + NLA : le navigateur reprend à MCS Connect Initial.
+    Ready {
+        selected_protocol: u32,
+        negotiation_flags: u8,
+        username: String,
+        domain: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

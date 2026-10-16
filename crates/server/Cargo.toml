@@ -20,8 +20,11 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
-axum = "0.8.9"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+rdp-connect = { path = "../rdp-connect" }
+rdp-auth = { path = "../rdp-auth" }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 tower-http = { version = "0.7.1", features = ["fs", "trace", "set-header"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }

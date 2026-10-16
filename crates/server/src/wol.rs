@@ -48,44 +48,6 @@ pub async fn send(mac: [u8; 6], target: SocketAddr) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mac_formats() {
-        let m = [0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E];
-        assert_eq!(parse_mac("00:1a:2b:3c:4d:5e"), Some(m));
-        assert_eq!(parse_mac("00-1A-2B-3C-4D-5E"), Some(m));
-        assert_eq!(parse_mac("001a.2b3c.4d5e"), Some(m));
-        assert_eq!(parse_mac("00:1a:2b:3c:4d"), None);
-        assert_eq!(parse_mac("zz:1a:2b:3c:4d:5e"), None);
-        assert_eq!(format_mac(m), "00:1A:2B:3C:4D:5E");
-    }
-
-    #[test]
-    fn packet_layout() {
-        let p = magic_packet([1, 2, 3, 4, 5, 6]);
-        assert_eq!(&p[..6], &[0xFF; 6]);
-        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn command_template() {
-        assert!(validate_command(MIKROTIK_COMMAND).is_ok());
-        assert!(validate_command("/tool wol interface=ether1").is_err(), "{{mac}} obligatoire");
-        assert!(validate_command("a {mac}\n/system reboot").is_err(), "une seule ligne");
-        assert!(validate_command("").is_err());
-    }
-
-    #[test]
-    fn target_default_port() {
-        assert_eq!(parse_target("192.168.1.255").unwrap().port(), 9);
-        assert_eq!(parse_target("192.168.1.255:7").unwrap().port(), 7);
-        assert!(parse_target("pc.local").is_none());
-    }
-}
-
 /// Valide un gabarit de commande de réveil : une ligne, `{mac}` présent, longueur raisonnable.
 pub fn validate_command(template: &str) -> Result<(), &'static str> {
     if template.trim().is_empty() || template.len() > 500 {
@@ -190,4 +152,42 @@ pub async fn ssh_command(
         .any(|m| text.contains(m));
     anyhow::ensure!(status.unwrap_or(0) == 0 && !failed, "la commande a échoué : {text}");
     Ok(seen.lock().unwrap().clone().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_formats() {
+        let m = [0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E];
+        assert_eq!(parse_mac("00:1a:2b:3c:4d:5e"), Some(m));
+        assert_eq!(parse_mac("00-1A-2B-3C-4D-5E"), Some(m));
+        assert_eq!(parse_mac("001a.2b3c.4d5e"), Some(m));
+        assert_eq!(parse_mac("00:1a:2b:3c:4d"), None);
+        assert_eq!(parse_mac("zz:1a:2b:3c:4d:5e"), None);
+        assert_eq!(format_mac(m), "00:1A:2B:3C:4D:5E");
+    }
+
+    #[test]
+    fn packet_layout() {
+        let p = magic_packet([1, 2, 3, 4, 5, 6]);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn command_template() {
+        assert!(validate_command(MIKROTIK_COMMAND).is_ok());
+        assert!(validate_command("/tool wol interface=ether1").is_err(), "{{mac}} obligatoire");
+        assert!(validate_command("a {mac}\n/system reboot").is_err(), "une seule ligne");
+        assert!(validate_command("").is_err());
+    }
+
+    #[test]
+    fn target_default_port() {
+        assert_eq!(parse_target("192.168.1.255").unwrap().port(), 9);
+        assert_eq!(parse_target("192.168.1.255:7").unwrap().port(), 7);
+        assert!(parse_target("pc.local").is_none());
+    }
 }

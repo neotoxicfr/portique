@@ -1,5 +1,5 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use yawrdp_proto::{ChangePassword, PasskeyInfo, TotpConfirm, TotpSetup};
+use yawrdp_proto::{ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup};
 
 use crate::{Session, api};
 
@@ -33,30 +33,72 @@ fn show_status(s: RwSignal<Option<Result<String, String>>>) -> impl IntoView {
     }
 }
 
+fn totp_enabled() -> bool {
+    Session::get().me.with(|m| m.as_ref().is_some_and(|m| m.totp_enabled))
+}
+
+/// Champs de réauthentification : mot de passe actuel, et code TOTP s'il est actif.
+#[derive(Clone, Copy)]
+struct Proof {
+    password: RwSignal<String>,
+    totp: RwSignal<String>,
+}
+
+impl Proof {
+    fn new() -> Self {
+        Self { password: RwSignal::new(String::new()), totp: RwSignal::new(String::new()) }
+    }
+
+    /// Lit puis efface les champs : un secret ne reste pas affiché après envoi.
+    fn take(&self) -> ReAuth {
+        let proof = ReAuth {
+            password: self.password.get_untracked(),
+            totp: Some(self.totp.get_untracked()).filter(|c| !c.is_empty()),
+        };
+        self.password.set(String::new());
+        self.totp.set(String::new());
+        proof
+    }
+
+    fn view(self, label: &'static str) -> impl IntoView {
+        let p = self;
+        view! {
+            <label>{label}
+                <input type="password" autocomplete="current-password" required
+                    prop:value=move || p.password.get() on:input=move |ev| p.password.set(event_target_value(&ev))/>
+            </label>
+            <Show when=totp_enabled>
+                <label>"Code TOTP"
+                    <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required
+                        prop:value=move || p.totp.get() on:input=move |ev| p.totp.set(event_target_value(&ev))/>
+                </label>
+            </Show>
+        }
+    }
+}
+
 #[component]
 fn Password() -> impl IntoView {
-    let current = RwSignal::new(String::new());
+    let proof = Proof::new();
     let new = RwSignal::new(String::new());
     let st = status();
     let submit = move |ev: SubmitEvent| {
         ev.prevent_default();
-        let body = ChangePassword { current: current.get_untracked(), new: new.get_untracked() };
+        let body = ChangePassword { auth: proof.take(), new: new.get_untracked() };
+        new.set(String::new());
         spawn_local(async move {
             let r = api::send_empty("POST", "/api/account/password", Some(&body)).await;
             st.set(Some(
                 r.map(|_| "Mot de passe changé, les autres sessions sont fermées.".into())
                     .map_err(|e| e.to_string()),
             ));
-            current.set(String::new());
-            new.set(String::new());
         });
     };
     view! {
         <section class="card">
             <h2>"Mot de passe"</h2>
             <form on:submit=submit class="stack">
-                <label>"Actuel"<input type="password" autocomplete="current-password" required
-                    prop:value=move || current.get() on:input=move |ev| current.set(event_target_value(&ev))/></label>
+                {proof.view("Actuel")}
                 <label>"Nouveau (12 caractères minimum)"<input type="password" autocomplete="new-password" minlength="12" required
                     prop:value=move || new.get() on:input=move |ev| new.set(event_target_value(&ev))/></label>
                 {show_status(st)}
@@ -69,8 +111,8 @@ fn Password() -> impl IntoView {
 #[component]
 fn Totp() -> impl IntoView {
     let session = Session::get();
-    let enabled = move || session.me.with(|m| m.as_ref().is_some_and(|m| m.totp_enabled));
     let setup = RwSignal::new(None::<TotpSetup>);
+    let proof = Proof::new();
     let code = RwSignal::new(String::new());
     let st = status();
 
@@ -82,56 +124,80 @@ fn Totp() -> impl IntoView {
         })
     };
 
-    let start = move |_| {
-        spawn_local(async move {
-            match api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &()).await {
-                Ok(s) => setup.set(Some(s)),
-                Err(e) => st.set(Some(Err(e.to_string()))),
-            }
-        });
-    };
-    let confirm = move |ev: SubmitEvent| {
+    // Étape 1 : mot de passe → graine et QR code.
+    let start = move |ev: SubmitEvent| {
         ev.prevent_default();
-        let body = TotpConfirm { code: code.get_untracked() };
-        let url = if enabled() { "/api/account/totp/disable" } else { "/api/account/totp/confirm" };
-        let turning_on = !enabled();
+        let body = proof.take();
         spawn_local(async move {
-            match api::send_empty("POST", url, Some(&body)).await {
-                Ok(()) => {
-                    set_enabled(turning_on);
-                    setup.set(None);
-                    st.set(Some(Ok(if turning_on { "TOTP activé." } else { "TOTP désactivé." }.into())));
+            match api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &body).await {
+                Ok(s) => {
+                    setup.set(Some(s));
+                    st.set(None);
                 }
                 Err(e) => st.set(Some(Err(e.to_string()))),
             }
-            code.set(String::new());
         });
     };
-
-    let code_form = move |label: &'static str| {
-        view! {
-            <form on:submit=confirm class="row">
-                <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required
-                    prop:value=move || code.get() on:input=move |ev| code.set(event_target_value(&ev))/>
-                <button type="submit">{label}</button>
-            </form>
-        }
+    // Étape 2 : premier code de l'appli → activation.
+    let confirm = move |ev: SubmitEvent| {
+        ev.prevent_default();
+        let body = TotpConfirm { code: code.get_untracked() };
+        code.set(String::new());
+        spawn_local(async move {
+            match api::send_empty("POST", "/api/account/totp/confirm", Some(&body)).await {
+                Ok(()) => {
+                    set_enabled(true);
+                    setup.set(None);
+                    st.set(Some(Ok("TOTP activé.".into())));
+                }
+                Err(e) => st.set(Some(Err(e.to_string()))),
+            }
+        });
+    };
+    let disable = move |ev: SubmitEvent| {
+        ev.prevent_default();
+        let body = proof.take();
+        spawn_local(async move {
+            match api::send_empty("POST", "/api/account/totp/disable", Some(&body)).await {
+                Ok(()) => {
+                    set_enabled(false);
+                    st.set(Some(Ok("TOTP désactivé.".into())));
+                }
+                Err(e) => st.set(Some(Err(e.to_string()))),
+            }
+        });
     };
 
     view! {
         <section class="card">
             <h2>"Double authentification (TOTP)"</h2>
-            {move || if enabled() {
-                view! { <p>"Activée. Saisis un code pour la désactiver."</p> {code_form("Désactiver")} }.into_any()
+            {move || if totp_enabled() {
+                view! {
+                    <p>"Activée."</p>
+                    <form on:submit=disable class="stack">
+                        {proof.view("Mot de passe")}
+                        <button type="submit" class="secondary">"Désactiver"</button>
+                    </form>
+                }.into_any()
             } else if let Some(s) = setup.get() {
                 view! {
                     <p>"Scanne ce QR code avec ton appli d'authentification, puis saisis le code affiché."</p>
                     <div class="qr" inner_html=s.qr_svg></div>
                     <p class="muted mono">{s.secret_base32}</p>
-                    {code_form("Activer")}
+                    <form on:submit=confirm class="row">
+                        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required
+                            prop:value=move || code.get() on:input=move |ev| code.set(event_target_value(&ev))/>
+                        <button type="submit">"Activer"</button>
+                    </form>
                 }.into_any()
             } else {
-                view! { <p>"Non activée."</p> <button on:click=start>"Configurer"</button> }.into_any()
+                view! {
+                    <p>"Non activée."</p>
+                    <form on:submit=start class="stack">
+                        {proof.view("Mot de passe")}
+                        <button type="submit">"Configurer"</button>
+                    </form>
+                }.into_any()
             }}
             {show_status(st)}
         </section>
@@ -142,6 +208,7 @@ fn Totp() -> impl IntoView {
 fn Passkeys() -> impl IntoView {
     let list = RwSignal::new(Vec::<PasskeyInfo>::new());
     let name = RwSignal::new(String::new());
+    let proof = Proof::new();
     let st = status();
     let reload = move || {
         spawn_local(async move {
@@ -155,8 +222,9 @@ fn Passkeys() -> impl IntoView {
     let add = move |ev: SubmitEvent| {
         ev.prevent_default();
         let n = name.get_untracked();
+        let body = proof.take();
         spawn_local(async move {
-            match api::passkey_register(n).await {
+            match api::passkey_register(n, body).await {
                 Ok(()) => {
                     st.set(Some(Ok("Passkey ajoutée.".into())));
                     name.set(String::new());
@@ -187,10 +255,13 @@ fn Passkeys() -> impl IntoView {
                     </li>
                 </For>
             </ul>
-            <form on:submit=add class="row">
-                <input type="text" placeholder="Nom (ex. Téléphone)" maxlength="64"
-                    prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev))/>
-                <button type="submit">"Ajouter"</button>
+            <form on:submit=add class="stack">
+                <label>"Nom"
+                    <input type="text" placeholder="ex. Téléphone" maxlength="64"
+                        prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev))/>
+                </label>
+                {proof.view("Mot de passe")}
+                <button type="submit">"Ajouter une passkey"</button>
             </form>
             {show_status(st)}
         </section>

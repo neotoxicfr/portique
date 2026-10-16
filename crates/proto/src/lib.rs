@@ -67,9 +67,19 @@ pub struct Me {
     pub external: bool,
 }
 
+/// Preuve d'identité exigée pour toute opération sensible sur le compte : une session
+/// volée ne suffit pas à changer le mot de passe ni à toucher à la 2FA.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReAuth {
+    pub password: String,
+    /// Obligatoire si le TOTP est actif.
+    #[serde(default)]
+    pub totp: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangePassword {
-    pub current: String,
+    pub auth: ReAuth,
     pub new: String,
 }
 

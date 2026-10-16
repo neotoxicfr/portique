@@ -194,7 +194,15 @@ async fn rate_limit_after_failures() {
 async fn totp_enrolment_then_required() {
     let app = setup(&[], "203.0.113.5:4000").await;
     let admin = login(&app, "admin", ADMIN_PW).await;
-    let setup = call(&app, "POST", "/api/account/totp/setup", Some(&admin), None, &[]).await.body;
+    // Session seule (mot de passe absent ou faux) : refusé.
+    for body in [json!({}), json!({"password": "nope"})] {
+        let r = call(&app, "POST", "/api/account/totp/setup", Some(&admin), Some(body), &[]).await;
+        assert!(r.status.is_client_error(), "{:?}", r.body);
+    }
+    let setup =
+        call(&app, "POST", "/api/account/totp/setup", Some(&admin), Some(json!({"password": ADMIN_PW})), &[])
+            .await
+            .body;
     let secret = setup["secret_base32"].as_str().unwrap();
     assert!(setup["qr_svg"].as_str().unwrap().starts_with("<?xml"));
 
@@ -285,4 +293,72 @@ async fn proxy_mode() {
     let outsider = setup(&extra, "198.51.100.7:5000").await;
     let r = call(&outsider, "GET", "/api/me", None, None, &[("Remote-User", "alice")]).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn stolen_session_cannot_touch_2fa() {
+    let app = setup(&[], "203.0.113.5:4000").await;
+    let admin = login(&app, "admin", ADMIN_PW).await;
+
+    // Ajout de passkey : le mot de passe est exigé avant même le défi WebAuthn.
+    let r = call(
+        &app,
+        "POST",
+        "/api/account/passkeys/register/start",
+        Some(&admin),
+        Some(json!({"password": "x"})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = call(
+        &app,
+        "POST",
+        "/api/account/passkeys/register/start",
+        Some(&admin),
+        Some(json!({"password": ADMIN_PW})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(r.body["ceremony"].is_string());
+
+    // Active le TOTP, puis tente de le remplacer : refusé tant qu'il est actif.
+    let s =
+        call(&app, "POST", "/api/account/totp/setup", Some(&admin), Some(json!({"password": ADMIN_PW})), &[])
+            .await
+            .body;
+    let totp = totp_rs::Builder::new()
+        .with_secret(totp_rs::Secret::try_from_base32(s["secret_base32"].as_str().unwrap()).unwrap())
+        .with_account_name("admin")
+        .build()
+        .unwrap();
+    let code = totp.generate_current().to_string();
+    call(&app, "POST", "/api/account/totp/confirm", Some(&admin), Some(json!({"code": code})), &[]).await;
+    let r =
+        call(&app, "POST", "/api/account/totp/setup", Some(&admin), Some(json!({"password": ADMIN_PW})), &[])
+            .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    // Avec TOTP actif, mot de passe seul ne suffit plus pour une passkey ni pour désactiver.
+    let r = call(
+        &app,
+        "POST",
+        "/api/account/passkeys/register/start",
+        Some(&admin),
+        Some(json!({"password": ADMIN_PW})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = call(
+        &app,
+        "POST",
+        "/api/account/totp/disable",
+        Some(&admin),
+        Some(json!({"password": ADMIN_PW, "totp": code})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "code déjà utilisé : rejeu refusé");
 }

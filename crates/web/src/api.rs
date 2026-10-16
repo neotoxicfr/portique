@@ -108,9 +108,9 @@ pub async fn passkey_login(username: &str) -> Result<yawrdp_proto::LoginResponse
     send("POST", "/api/auth/passkey/finish", &finish).await
 }
 
-pub async fn passkey_register(name: String) -> Result<()> {
+pub async fn passkey_register(name: String, proof: yawrdp_proto::ReAuth) -> Result<()> {
     let start: CeremonyChallenge<CreationChallengeResponse> =
-        send("POST", "/api/account/passkeys/register/start", &()).await?;
+        send("POST", "/api/account/passkeys/register/start", &proof).await?;
     let opts: web_sys::CredentialCreationOptions = start.options.into();
     let promise = credentials()?.create_with_options(&opts).map_err(js_err)?;
     let cred: web_sys::PublicKeyCredential = JsFuture::from(promise).await.map_err(js_err)?.unchecked_into();

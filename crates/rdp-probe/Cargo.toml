@@ -9,6 +9,9 @@ publish = false
 [dependencies]
 rdp-auth = { path = "../rdp-auth" }
 rdp-pdu = { path = "../rdp-pdu" }
+rdp-session = { path = "../rdp-session" }
+rdp-gfx = { path = "../rdp-gfx" }
+png = "0.18.1"
 anyhow = "1.0.104"
 tokio = { version = "1.53", features = ["macros", "rt", "net", "io-util", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }

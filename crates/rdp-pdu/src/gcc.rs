@@ -86,7 +86,7 @@ impl ClientData {
         core.extend_from_slice(&0x000Fu16.to_le_bytes()); // supportedColorDepths : 24/16/15/32
         core.extend_from_slice(&c.early_capability_flags.to_le_bytes());
         core.extend_from_slice(&[0; 64]); // clientDigProductId
-        core.push(7); // connectionType : détection automatique
+        core.push(6); // connectionType : LAN (pas de détection réseau à mener)
         core.push(0); // pad1octet
         core.extend_from_slice(&c.selected_protocol.to_le_bytes());
 

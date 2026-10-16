@@ -5,8 +5,11 @@
 extern crate alloc;
 
 pub mod cursor;
+pub mod fastpath;
 pub mod gcc;
 pub mod mcs;
+pub mod slowpath;
+pub mod vc;
 pub mod x224;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

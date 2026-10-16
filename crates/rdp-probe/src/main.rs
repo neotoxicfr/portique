@@ -16,11 +16,8 @@ use rdp_auth::{
     credssp::{self, CredSspClient, Step},
     ntlm::{Credentials, Randomness},
 };
-use rdp_pdu::{
-    gcc::{self, Channel, ClientCore, ClientData, channel_opts, early_caps},
-    mcs,
-    x224::{self, protocol},
-};
+use rdp_pdu::x224::{self, protocol};
+use rdp_session::{Config, Event, Session};
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -199,75 +196,112 @@ async fn main() -> anyhow::Result<()> {
         println!("✓ NLA réussie pour {user}");
     }
 
-    let client = ClientData {
-        core: ClientCore {
-            version: gcc::RDP_VERSION_10_7,
-            width: 1920,
-            height: 1080,
-            keyboard_layout: 0x040C,
-            client_build: 1,
-            client_name: "yawrdp".into(),
-            early_capability_flags: early_caps::SUPPORT_ERRINFO_PDU
-                | early_caps::WANT_32BPP_SESSION
-                | early_caps::SUPPORT_STATUSINFO_PDU
-                | early_caps::STRONG_ASYMMETRIC_KEYS
-                | early_caps::VALID_CONNECTION_TYPE
-                | early_caps::SUPPORT_MONITOR_LAYOUT_PDU
-                | early_caps::SUPPORT_DYNVC_GFX_PROTOCOL
-                | early_caps::SUPPORT_HEARTBEAT_PDU,
-            selected_protocol: cc.selected_protocol,
-        },
-        channels: vec![
-            Channel {
-                name: "cliprdr",
-                options: channel_opts::INITIALIZED
-                    | channel_opts::ENCRYPT_RDP
-                    | channel_opts::COMPRESS_RDP
-                    | channel_opts::SHOW_PROTOCOL,
-            },
-            Channel {
-                name: "drdynvc",
-                options: channel_opts::INITIALIZED | channel_opts::ENCRYPT_RDP | channel_opts::COMPRESS_RDP,
-            },
-        ],
-    };
-    send(&mut tls, &mcs::connect_initial(&client)).await?;
-    let mut buf = Vec::new();
-    let server = mcs::connect_response(&read_frame(&mut tls, &mut buf, x224::frame_len).await?)?;
+    run_session(&mut tls, &user, cc.selected_protocol).await?;
+    let _ = tls.shutdown().await;
+    Ok(())
+}
 
-    println!("✓ MCS Connect Response");
-    println!("  version RDP du serveur : {} (0x{:08x})", gcc::version_name(server.version), server.version);
-    if let Some(p) = server.client_requested_protocols {
-        println!("  protocoles demandés (écho) : 0x{p:x}");
-    }
-    if let Some(f) = server.early_capability_flags {
-        let mut caps = vec![];
-        for (bit, name) in [
-            (gcc::server_early_caps::EDGE_ACTIONS_SUPPORTED_V1, "edge actions v1"),
-            (gcc::server_early_caps::DYNAMIC_DST_SUPPORTED, "heure d'été dynamique"),
-            (gcc::server_early_caps::EDGE_ACTIONS_SUPPORTED_V2, "edge actions v2"),
-            (gcc::server_early_caps::SKIP_CHANNELJOIN_SUPPORTED, "saut du Channel Join"),
-        ] {
-            if f & bit != 0 {
-                caps.push(name);
+/// Session complète après NLA : séquence de connexion, EGFX rendu par `rdp-gfx` pendant
+/// YAWRDP_PROBE_SECONDS (8 par défaut), puis capture PNG du bureau dans YAWRDP_PROBE_PNG.
+async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
+    tls: &mut S,
+    user: &str,
+    selected_protocol: u32,
+) -> anyhow::Result<()> {
+    let seconds: u64 = env("SECONDS").map(|s| s.parse()).transpose()?.unwrap_or(8);
+    let mut session = Session::new(Config {
+        width: 1920,
+        height: 1080,
+        keyboard_layout: 0x040C,
+        client_name: "yawrdp".into(),
+        selected_protocol,
+        username: user.into(),
+        domain: String::new(),
+        display_control: true,
+    });
+    send(tls, &session.start()).await?;
+    let mut buf = Vec::new();
+    let mut gfx = rdp_gfx::Gfx::new();
+    let mut ignored = std::collections::BTreeMap::<String, u32>::new();
+    let (mut frames, mut avc) = (0u32, 0u32);
+    let t0 = std::time::Instant::now();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    'outer: loop {
+        let frame = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, read_frame(tls, &mut buf, x224::frame_len)).await {
+                Ok(f) => f?,
+                Err(_) => break,
+            },
+            None => read_frame(tls, &mut buf, x224::frame_len).await?,
+        };
+        for ev in session.feed(&frame).map_err(|e| anyhow::anyhow!("session : {e}"))? {
+            match ev {
+                Event::Send(b) => send(tls, &b).await?,
+                Event::Connected { width, height } => {
+                    println!("✓ session active, bureau {width}×{height} ({} ms)", t0.elapsed().as_millis());
+                    deadline = Some(tokio::time::Instant::now() + Duration::from_secs(seconds));
+                }
+                Event::DvcOpened { channel_id, name } => {
+                    println!("  canal dynamique ouvert : {name} (#{channel_id})");
+                    if name == rdp_session::DVC_GRAPHICS {
+                        for f in session.dvc_send(channel_id, &rdp_gfx::caps_advertise(true)) {
+                            send(tls, &f).await?;
+                        }
+                    }
+                }
+                Event::DvcData { channel_id, data }
+                    if session.dvc_name(channel_id) == Some(rdp_session::DVC_GRAPHICS) =>
+                {
+                    let mut queue: std::collections::VecDeque<rdp_gfx::Out> =
+                        gfx.process(&data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
+                    while let Some(o) = queue.pop_front() {
+                        match o {
+                            rdp_gfx::Out::Send(m) => {
+                                for f in session.dvc_send(channel_id, &m) {
+                                    send(tls, &f).await?;
+                                }
+                            }
+                            rdp_gfx::Out::Present { .. } => frames += 1,
+                            rdp_gfx::Out::Reset { width, height } => {
+                                println!("  EGFX : sortie {width}×{height}")
+                            }
+                            rdp_gfx::Out::Avc420 { .. } => {
+                                // Pas de décodeur H.264 natif dans la sonde : image sautée.
+                                avc += 1;
+                                queue.extend(gfx.skip_frame().map_err(|e| anyhow::anyhow!("{e}"))?);
+                            }
+                            rdp_gfx::Out::Ignored(t) => {
+                                *ignored.entry(t.split(" (").next().unwrap_or(&t).to_owned()).or_default() +=
+                                    1
+                            }
+                        }
+                    }
+                }
+                Event::ServerError(t) => {
+                    println!("✗ erreur serveur : {t}");
+                    break 'outer;
+                }
+                Event::Disconnected(t) => {
+                    println!("✗ {t}");
+                    break 'outer;
+                }
+                Event::Ignored(_) | Event::Pointer(_) | Event::Clipboard(_) | Event::DvcData { .. } => {}
+                other => println!("  {other:?}"),
             }
         }
-        println!("  capacités précoces : 0x{f:x} [{}]", caps.join(", "));
     }
-    println!(
-        "  chiffrement RDP : méthode {} niveau {} (0/0 attendu sous TLS)",
-        server.encryption_method, server.encryption_level
-    );
-    println!("  canal E/S : {}", server.io_channel);
-    for (ch, id) in client.channels.iter().zip(&server.channel_ids) {
-        println!("  canal {} → {id}", ch.name);
+    println!("  {frames} images rendues, {avc} images H.264 sautées en {seconds} s");
+    for (k, n) in &ignored {
+        println!("  ignoré ×{n} : {k}");
     }
-    if let Some(m) = server.message_channel {
-        println!("  canal de messages : {m}");
+    if let Some(path) = env("PNG") {
+        let (rgba, w, h) = gfx.output();
+        let file = std::fs::File::create(&path)?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(rgba)?;
+        println!("  capture : {path}");
     }
-    if let Some(m) = server.multitransport_flags {
-        println!("  multitransport (UDP) : 0x{m:x}");
-    }
-    let _ = tls.shutdown().await;
     Ok(())
 }

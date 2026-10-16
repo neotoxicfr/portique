@@ -156,6 +156,99 @@ pub fn connect_response(frame: &[u8]) -> Result<gcc::ServerData, Error> {
     gcc::ServerData::parse(g.bytes(n, "données serveur")?)
 }
 
+// --- PDU de domaine MCS (T.125, encodage PER aligné), MS-RDPBCGR 2.2.1.5 à 2.2.1.9 ---
+
+/// Identifiant d'utilisateur MCS : les PDU portent `initiator - 1001`.
+const USER_BASE: u16 = 1001;
+
+pub fn erect_domain_request() -> Vec<u8> {
+    crate::x224::data(&[0x04, 0x01, 0x00, 0x01, 0x00])
+}
+
+pub fn attach_user_request() -> Vec<u8> {
+    crate::x224::data(&[0x28])
+}
+
+/// Attach User Confirm : renvoie l'identifiant d'utilisateur (canal utilisateur).
+pub fn attach_user_confirm(frame: &[u8]) -> Result<u16, Error> {
+    let mut r = Reader::new(crate::x224::read_data(frame)?);
+    if r.u8("Attach User Confirm")? >> 2 != 11 {
+        return Err(Error::Invalid("Attach User Confirm attendu"));
+    }
+    if r.u8("Attach User Confirm")? != 0 {
+        return Err(Error::McsRefused(1));
+    }
+    Ok(r.u16_be("Attach User Confirm")? + USER_BASE)
+}
+
+pub fn channel_join_request(user: u16, channel: u16) -> Vec<u8> {
+    let mut p = alloc::vec![0x38];
+    p.extend_from_slice(&(user - USER_BASE).to_be_bytes());
+    p.extend_from_slice(&channel.to_be_bytes());
+    crate::x224::data(&p)
+}
+
+/// Channel Join Confirm : renvoie le canal rejoint.
+pub fn channel_join_confirm(frame: &[u8]) -> Result<u16, Error> {
+    let mut r = Reader::new(crate::x224::read_data(frame)?);
+    if r.u8("Channel Join Confirm")? >> 2 != 15 {
+        return Err(Error::Invalid("Channel Join Confirm attendu"));
+    }
+    let result = r.u8("Channel Join Confirm")?;
+    if result != 0 {
+        return Err(Error::McsRefused(result));
+    }
+    r.skip(2, "Channel Join Confirm")?;
+    let requested = r.u16_be("Channel Join Confirm")?;
+    Ok(if r.remaining() >= 2 { r.u16_be("Channel Join Confirm")? } else { requested })
+}
+
+/// Send Data Request (client → serveur) sur `channel`.
+pub fn send_data_request(user: u16, channel: u16, payload: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(payload.len() + 8);
+    p.push(0x64);
+    p.extend_from_slice(&(user - USER_BASE).to_be_bytes());
+    p.extend_from_slice(&channel.to_be_bytes());
+    p.push(0x70); // priorité haute, segmentation début + fin
+    per_len(&mut p, payload.len());
+    p.extend_from_slice(payload);
+    crate::x224::data(&p)
+}
+
+/// PDU MCS reçue dans une trame X.224 Data.
+#[derive(Debug, PartialEq)]
+pub enum DomainPdu<'a> {
+    SendDataIndication {
+        channel: u16,
+        data: &'a [u8],
+    },
+    /// Disconnect Provider Ultimatum : le serveur coupe (raison T.125).
+    Disconnect {
+        reason: u8,
+    },
+    Other(u8),
+}
+
+pub fn read_domain_pdu(frame: &[u8]) -> Result<DomainPdu<'_>, Error> {
+    let mcs = crate::x224::read_data(frame)?;
+    let mut r = Reader::new(mcs);
+    let first = r.u8("PDU MCS")?;
+    match first >> 2 {
+        26 => {
+            r.skip(2, "Send Data Indication")?;
+            let channel = r.u16_be("Send Data Indication")?;
+            r.skip(1, "Send Data Indication")?;
+            let len = read_per_len(&mut r)?;
+            Ok(DomainPdu::SendDataIndication { channel, data: r.bytes(len, "Send Data Indication")? })
+        }
+        8 => {
+            let second = r.u8("Disconnect Provider Ultimatum").unwrap_or(0);
+            Ok(DomainPdu::Disconnect { reason: ((first & 0x03) << 1) | (second >> 7) })
+        }
+        other => Ok(DomainPdu::Other(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +294,31 @@ mod tests {
         assert_eq!(connect_response(&response(2, &blocks)), Err(Error::McsRefused(2)));
         let big = [0x80u8; 300];
         assert!(connect_response(&response(0, &big)).is_err(), "blocs corrompus refusés");
+    }
+
+    #[test]
+    fn domain_pdus() {
+        // MS-RDPBCGR 4.1.6 à 4.1.8.
+        assert_eq!(attach_user_confirm(&crate::x224::data(&[0x2e, 0x00, 0x00, 0x06])).unwrap(), 1007);
+        assert_eq!(channel_join_request(1007, 1007), crate::x224::data(&[0x38, 0x00, 0x06, 0x03, 0xef]));
+        let confirm = crate::x224::data(&[0x3e, 0x00, 0x00, 0x06, 0x03, 0xef, 0x03, 0xef]);
+        assert_eq!(channel_join_confirm(&confirm).unwrap(), 1007);
+        let refused = crate::x224::data(&[0x3e, 0x0e, 0x00, 0x06, 0x03, 0xef]);
+        assert_eq!(channel_join_confirm(&refused), Err(Error::McsRefused(14)));
+
+        let req = send_data_request(1007, 1003, &[1, 2, 3]);
+        assert_eq!(
+            crate::x224::read_data(&req).unwrap(),
+            [0x64, 0x00, 0x06, 0x03, 0xeb, 0x70, 0x03, 1, 2, 3]
+        );
+        let mut ind = alloc::vec![0x68, 0x00, 0x01, 0x03, 0xeb, 0x70, 0x81, 0x00];
+        ind.extend([9u8; 256]);
+        match read_domain_pdu(&crate::x224::data(&ind)).unwrap() {
+            DomainPdu::SendDataIndication { channel, data } => assert_eq!((channel, data.len()), (1003, 256)),
+            other => panic!("{other:?}"),
+        }
+        let dpum = crate::x224::data(&[0x21, 0x80]);
+        assert_eq!(read_domain_pdu(&dpum).unwrap(), DomainPdu::Disconnect { reason: 3 });
     }
 
     #[test]

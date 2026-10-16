@@ -108,11 +108,24 @@ pub struct Gfx {
     queue: VecDeque<Vec<u8>>,
     pending_avc: Option<PendingAvc>,
     frames_decoded: u32,
+    surface_bytes: usize,
+    cache_bytes: usize,
+    queued_bytes: usize,
 }
 
-/// Plafonds : surfaces jusqu'en 8K, 4 096 emplacements de cache (petit cache EGFX).
+// Plafonds : les données viennent du réseau, aucune allocation ni boucle n'est laissée libre.
+/// Côté maximal d'une surface ou de la sortie.
 const MAX_SIDE: u32 = 8192;
+/// Nombre de surfaces simultanées et mémoire totale qu'elles occupent.
+const MAX_SURFACES: usize = 64;
+const MAX_SURFACE_BYTES: usize = 512 * 1024 * 1024;
+/// Petit cache EGFX annoncé (RDPGFX_CAPS_FLAG_SMALL_CACHE) : 16 Mo et 4 096 emplacements.
 const MAX_CACHE_SLOTS: u16 = 4096;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Pixels qu'une seule commande peut copier ou remplir (≈ 8 écrans 4K).
+const MAX_PIXELS_PER_COMMAND: u64 = 64 * 1024 * 1024;
+/// Octets de PDU en attente pendant le décodage d'une image H.264.
+const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DAMAGE_RECTS: usize = 64;
 
 impl Default for Gfx {
@@ -135,6 +148,9 @@ impl Gfx {
             queue: VecDeque::new(),
             pending_avc: None,
             frames_decoded: 0,
+            surface_bytes: 0,
+            cache_bytes: 0,
+            queued_bytes: 0,
         }
     }
 
@@ -155,6 +171,10 @@ impl Gfx {
             let len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
             if len < 8 || len > rest.len() {
                 return Err(Error::Invalid("longueur de PDU RDPGFX"));
+            }
+            self.queued_bytes += len;
+            if self.queued_bytes > MAX_QUEUED_BYTES {
+                return Err(Error::Invalid("trop de commandes en attente"));
             }
             self.queue.push_back(rest[..len].to_vec());
             rest = &rest[len..];
@@ -198,6 +218,7 @@ impl Gfx {
         let mut out = Vec::new();
         while self.pending_avc.is_none() {
             let Some(pdu) = self.queue.pop_front() else { break };
+            self.queued_bytes -= pdu.len();
             self.command(&pdu, &mut out)?;
         }
         Ok(out)

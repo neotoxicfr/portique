@@ -2,7 +2,10 @@
 
 use alloc::{format, vec, vec::Vec};
 
-use crate::{Cached, Error, Gfx, MAX_CACHE_SLOTS, MAX_SIDE, Out, PendingAvc, Rect, Surface};
+use crate::{
+    Cached, Error, Gfx, MAX_CACHE_BYTES, MAX_CACHE_SLOTS, MAX_PIXELS_PER_COMMAND, MAX_SIDE,
+    MAX_SURFACE_BYTES, MAX_SURFACES, Out, PendingAvc, Rect, Surface,
+};
 
 mod id {
     pub const WIRE_TO_SURFACE_1: u16 = 0x0001;
@@ -82,6 +85,19 @@ impl<'a> R<'a> {
     }
 }
 
+/// Pixels qu'une commande a encore le droit de toucher.
+struct Budget(u64);
+
+impl Budget {
+    fn new() -> Self {
+        Budget(MAX_PIXELS_PER_COMMAND)
+    }
+    fn spend(&mut self, w: u32, h: u32) -> Result<(), Error> {
+        self.0 = self.0.checked_sub(w as u64 * h as u64).ok_or(Error::Invalid("commande trop coûteuse"))?;
+        Ok(())
+    }
+}
+
 /// Copie une zone RGBA (stride `sw`) vers une autre (stride `dw`), bornée par l'appelant.
 #[allow(clippy::too_many_arguments)]
 fn blit(src: &[u8], sw: u32, sx: u32, sy: u32, dst: &mut [u8], dw: u32, dx: u32, dy: u32, w: u32, h: u32) {
@@ -128,14 +144,23 @@ impl Gfx {
                 if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
                     return Err(Error::Invalid("taille de surface invalide"));
                 }
-                let mut rgba = vec![0u8; (w * h * 4) as usize];
+                let bytes = (w * h * 4) as usize;
+                let replaced = self.surfaces.get(&sid).map_or(0, |s| s.rgba.len());
+                let total = self.surface_bytes - replaced + bytes;
+                if total > MAX_SURFACE_BYTES || (replaced == 0 && self.surfaces.len() >= MAX_SURFACES) {
+                    return Err(Error::Invalid("trop de surfaces ou de mémoire de surface"));
+                }
+                let mut rgba = vec![0u8; bytes];
                 for px in rgba.as_chunks_mut::<4>().0 {
                     px[3] = 0xFF;
                 }
+                self.surface_bytes = total;
                 self.surfaces.insert(sid, Surface { width: w, height: h, rgba, origin: None });
             }
             id::DELETE_SURFACE => {
-                self.surfaces.remove(&r.u16()?);
+                if let Some(s) = self.surfaces.remove(&r.u16()?) {
+                    self.surface_bytes -= s.rgba.len();
+                }
             }
             id::MAP_SURFACE_TO_OUTPUT => {
                 let sid = r.u16()?;
@@ -170,8 +195,10 @@ impl Gfx {
                 let s = self.surface_mut(sid)?;
                 let (sw, sh, origin) = (s.width, s.height, s.origin);
                 let mut touched = Vec::new();
+                let mut budget = Budget::new();
                 for _ in 0..n {
                     let Some(rect) = r.rect16()?.clip(sw, sh) else { continue };
+                    budget.spend(rect.w, rect.h)?;
                     let s = self.surface_mut(sid)?;
                     for row in rect.y..rect.y + rect.h {
                         let o = ((row * sw + rect.x) * 4) as usize;
@@ -192,8 +219,10 @@ impl Gfx {
                 let src = self.surfaces.get(&src_id).ok_or(Error::Invalid("surface source inconnue"))?;
                 let Some(src_rect) = src_rect.clip(src.width, src.height) else { return Ok(()) };
                 let pixels = extract(src, src_rect);
+                let mut budget = Budget::new();
                 for _ in 0..n {
                     let (x, y) = r.point16()?;
+                    budget.spend(src_rect.w, src_rect.h)?;
                     self.put(dst_id, x, y, src_rect.w, src_rect.h, &pixels)?;
                 }
             }
@@ -207,20 +236,31 @@ impl Gfx {
                 }
                 let s = self.surfaces.get(&sid).ok_or(Error::Invalid("surface inconnue"))?;
                 let Some(rect) = rect.clip(s.width, s.height) else { return Ok(()) };
+                let bytes = (rect.w * rect.h * 4) as usize;
+                let replaced = self.cache.get(&slot).map_or(0, |c| c.rgba.len());
+                let total = self.cache_bytes - replaced + bytes;
+                if total > MAX_CACHE_BYTES {
+                    return Err(Error::Invalid("cache EGFX plein (le serveur doit évincer)"));
+                }
                 let rgba = extract(s, rect);
+                self.cache_bytes = total;
                 self.cache.insert(slot, Cached { width: rect.w, height: rect.h, rgba });
             }
             id::CACHE_TO_SURFACE => {
                 let (slot, sid, n) = (r.u16()?, r.u16()?, r.u16()?);
                 let c = self.cache.get(&slot).ok_or(Error::Invalid("emplacement de cache vide"))?;
                 let (w, h, pixels) = (c.width, c.height, c.rgba.clone());
+                let mut budget = Budget::new();
                 for _ in 0..n {
                     let (x, y) = r.point16()?;
+                    budget.spend(w, h)?;
                     self.put(sid, x, y, w, h, &pixels)?;
                 }
             }
             id::EVICT_CACHE_ENTRY => {
-                self.cache.remove(&r.u16()?);
+                if let Some(c) = self.cache.remove(&r.u16()?) {
+                    self.cache_bytes -= c.rgba.len();
+                }
             }
             id::WIRE_TO_SURFACE_1 => self.wire_to_surface_1(&mut r, out)?,
             id::WIRE_TO_SURFACE_2 => out.push(Out::Ignored(format!(
@@ -406,6 +446,56 @@ mod tests {
         let out = g.submit_yuv420(&frame).unwrap();
         assert!(matches!(out.last(), Some(Out::Send(_))));
         assert_eq!(&g.output().0[..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn budgets_enforced() {
+        // Surfaces : la 65e est refusée.
+        let mut g = Gfx::new();
+        let mut pdus = Vec::new();
+        for sid in 0..65u16 {
+            pdus.push(pdu(
+                id::CREATE_SURFACE,
+                &le(&[&sid.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+            ));
+        }
+        assert!(g.process(&wrap(&pdus)).is_err());
+        // Cache : 16 Mo maximum, puis éviction et réutilisation possibles.
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &2048u16.to_le_bytes(), &2048u16.to_le_bytes(), &[0x20]]),
+        );
+        let to_cache = |slot: u16| {
+            pdu(
+                id::SURFACE_TO_CACHE,
+                &le(&[&0u16.to_le_bytes(), &[0; 8], &slot.to_le_bytes(), &[0, 0, 0, 0, 0, 8, 0, 4]]),
+            )
+        };
+        // 2048×1024×4 = 8 Mo : deux passent, la troisième dépasse.
+        assert!(g.process(&wrap(&[create, to_cache(1), to_cache(2)])).is_ok());
+        assert!(g.process(&wrap(&[to_cache(3)])).is_err());
+        let mut g2 = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &2048u16.to_le_bytes(), &2048u16.to_le_bytes(), &[0x20]]),
+        );
+        let evict = pdu(id::EVICT_CACHE_ENTRY, &1u16.to_le_bytes());
+        assert!(g2.process(&wrap(&[create, to_cache(1), to_cache(2), evict, to_cache(3)])).is_ok());
+        // Copies : 65 535 destinations d'une zone 1024×1024 refusées.
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &1024u16.to_le_bytes(), &1024u16.to_le_bytes(), &[0x20]]),
+        );
+        let mut body = le(&[
+            &0u16.to_le_bytes(),
+            &0u16.to_le_bytes(),
+            &[0, 0, 0, 0, 0, 4, 0, 4],
+            &u16::MAX.to_le_bytes(),
+        ]);
+        body.extend(core::iter::repeat_n(0u8, 4 * u16::MAX as usize));
+        assert!(g.process(&wrap(&[create, pdu(id::SURFACE_TO_SURFACE, &body)])).is_err());
     }
 
     #[test]

@@ -65,9 +65,22 @@ pub fn validate_command(template: &str) -> Result<(), &'static str> {
 /// Commande par défaut pour un routeur MikroTik (RouterOS).
 pub const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
 
+/// Clé d'hôte SSH jamais approuvée : la connexion s'est arrêtée avant l'authentification.
+#[derive(Debug)]
+pub struct UnapprovedHostKey(pub String);
+
+impl std::fmt::Display for UnapprovedHostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clé SSH de l'hôte à approuver : {}", self.0)
+    }
+}
+
+impl std::error::Error for UnapprovedHostKey {}
+
 /// Réveil « par commande » : SSH (mot de passe) vers `host`, puis `template` où `{mac}` est remplacé
-/// par l'adresse MAC. `pinned` : empreinte SHA-256 attendue de la clé d'hôte ; renvoie l'empreinte
-/// vue (à épingler si c'était le premier contact).
+/// par l'adresse MAC. `pinned` : empreinte SHA-256 approuvée de la clé d'hôte. Sans elle, la
+/// connexion s'arrête AVANT l'authentification (aucun mot de passe ne part) et renvoie
+/// `UnapprovedHostKey` avec la clé présentée, à faire approuver par un admin.
 pub async fn ssh_command(
     host: &str,
     user: &str,
@@ -75,7 +88,7 @@ pub async fn ssh_command(
     template: &str,
     mac: [u8; 6],
     pinned: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<()> {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
@@ -96,7 +109,7 @@ pub async fn ssh_command(
             // Clé d'hôte simple attendue (RouterOS, OpenSSH) ; un certificat SSH n'est pas géré.
             let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = key else { return Ok(false) };
             let fp = key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
-            let ok = self.pinned.as_deref().is_none_or(|p| p == fp);
+            let ok = self.pinned.as_deref() == Some(fp.as_str());
             *self.seen.lock().unwrap() = Some(fp);
             Ok(ok)
         }
@@ -113,12 +126,13 @@ pub async fn ssh_command(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             let fp = seen.lock().unwrap().clone();
-            if let (Some(expected), Some(got)) = (pinned, fp)
-                && expected != got
-            {
-                anyhow::bail!("la clé SSH de l'hôte a changé (attendue {expected}, reçue {got})");
+            match (pinned, fp) {
+                (None, Some(got)) => return Err(UnapprovedHostKey(got).into()),
+                (Some(expected), Some(got)) if expected != got => {
+                    anyhow::bail!("la clé SSH de l'hôte a changé (attendue {expected}, reçue {got})")
+                }
+                _ => return Err(e).context("connexion SSH"),
             }
-            return Err(e).context("connexion SSH");
         }
         Err(_) => anyhow::bail!("l'hôte SSH ne répond pas (délai dépassé)"),
     };
@@ -151,7 +165,7 @@ pub async fn ssh_command(
         .iter()
         .any(|m| text.contains(m));
     anyhow::ensure!(status.unwrap_or(0) == 0 && !failed, "la commande a échoué : {text}");
-    Ok(seen.lock().unwrap().clone().unwrap_or_default())
+    Ok(())
 }
 
 #[cfg(test)]

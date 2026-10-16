@@ -5,5 +5,7 @@ ALTER TABLE connections ADD COLUMN wol_ssh_host TEXT;
 ALTER TABLE connections ADD COLUMN wol_ssh_user TEXT;
 ALTER TABLE connections ADD COLUMN wol_ssh_password BLOB;
 ALTER TABLE connections ADD COLUMN wol_ssh_command TEXT;
--- Empreinte SHA-256 de la clé d'hôte SSH, épinglée au premier envoi réussi.
+-- Empreinte SHA-256 de la clé d'hôte SSH approuvée par un admin ; sans elle, aucun mot de passe
+-- n'est envoyé : la clé présentée est seulement notée « en attente » pour approbation.
 ALTER TABLE connections ADD COLUMN wol_ssh_hostkey TEXT;
+ALTER TABLE connections ADD COLUMN wol_ssh_hostkey_pending TEXT;

@@ -32,12 +32,13 @@ pub(crate) struct Row {
     pub(crate) wol_ssh_password: Option<Vec<u8>>,
     pub(crate) wol_ssh_command: Option<String>,
     pub(crate) wol_ssh_hostkey: Option<String>,
+    pub(crate) wol_ssh_hostkey_pending: Option<String>,
 }
 
 macro_rules! columns {
     () => {
         "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target, cert_sha256, \
-         wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey"
+         wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey, wol_ssh_hostkey_pending"
     };
 }
 
@@ -61,7 +62,7 @@ async fn save_wol_command(
     let Some(r) = cmd else {
         sqlx::query(
             "UPDATE connections SET wol_ssh_host = NULL, wol_ssh_user = NULL, wol_ssh_password = NULL,
-             wol_ssh_command = NULL, wol_ssh_hostkey = NULL WHERE id = ?",
+             wol_ssh_command = NULL, wol_ssh_hostkey = NULL, wol_ssh_hostkey_pending = NULL WHERE id = ?",
         )
         .bind(id)
         .execute(&state.db)
@@ -76,13 +77,29 @@ async fn save_wol_command(
         return Err(bad("réveil par commande : hôte et utilisateur requis"));
     }
     wol::validate_command(r.command.trim()).map_err(bad)?;
+    if let Some(fp) = r.approve_hostkey.as_deref().filter(|f| !f.is_empty()) {
+        // Approbation explicite : seulement la clé effectivement présentée par l'hôte.
+        let done = sqlx::query(
+            "UPDATE connections SET wol_ssh_hostkey = wol_ssh_hostkey_pending, wol_ssh_hostkey_pending = NULL
+             WHERE id = ? AND wol_ssh_hostkey_pending = ?",
+        )
+        .bind(id)
+        .bind(fp)
+        .execute(&state.db)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(bad("clé SSH à approuver introuvable (relance un réveil pour la faire apparaître)"));
+        }
+    }
     sqlx::query(
         "UPDATE connections SET wol_ssh_host = ?, wol_ssh_user = ?, wol_ssh_command = ?,
-         wol_ssh_hostkey = CASE WHEN wol_ssh_host IS ? THEN wol_ssh_hostkey ELSE NULL END WHERE id = ?",
+         wol_ssh_hostkey = CASE WHEN wol_ssh_host IS ? THEN wol_ssh_hostkey ELSE NULL END,
+         wol_ssh_hostkey_pending = CASE WHEN wol_ssh_host IS ? THEN wol_ssh_hostkey_pending ELSE NULL END WHERE id = ?",
     )
     .bind(host)
     .bind(r.user.trim())
     .bind(r.command.trim())
+    .bind(host)
     .bind(host)
     .bind(id)
     .execute(&state.db)
@@ -152,9 +169,9 @@ pub async fn wake(
                 String::from_utf8_lossy(&state.vault.open(&format!("wol-ssh:{}", row.id), sealed)?)
                     .into_owned()
             }
-            None => return Err(bad("mot de passe SSH de réveil absent")),
+            None => return Err(bad("réveil par commande pas encore configuré (mot de passe SSH absent)")),
         };
-        let fp = wol::ssh_command(
+        let result = wol::ssh_command(
             host,
             row.wol_ssh_user.as_deref().unwrap_or_default(),
             &password,
@@ -162,20 +179,40 @@ pub async fn wake(
             mac,
             row.wol_ssh_hostkey.as_deref(),
         )
-        .await
-        .map_err(|e| bad(format!("réveil par commande : {e:#}")))?;
-        if row.wol_ssh_hostkey.is_none() {
-            // Clé SSH épinglée au premier envoi réussi (hôte du réseau interne, via le tunnel chiffré).
-            sqlx::query(
-                "UPDATE connections SET wol_ssh_hostkey = ? WHERE id = ? AND wol_ssh_hostkey IS NULL",
-            )
-            .bind(&fp)
-            .bind(row.id)
-            .execute(&state.db)
-            .await?;
+        .await;
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    user = u.username,
+                    connection = row.name,
+                    ssh = host,
+                    "WoL envoyé par commande"
+                );
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(e) => {
+                if let Some(wol::UnapprovedHostKey(fp)) = e.downcast_ref::<wol::UnapprovedHostKey>() {
+                    // Rien n'a été envoyé : on note la clé présentée pour qu'un admin l'approuve.
+                    sqlx::query("UPDATE connections SET wol_ssh_hostkey_pending = ? WHERE id = ?")
+                        .bind(fp)
+                        .bind(row.id)
+                        .execute(&state.db)
+                        .await?;
+                }
+                tracing::warn!(
+                    user = u.username,
+                    connection = row.name,
+                    ssh = host,
+                    "échec du réveil : {e:#}"
+                );
+                // Détail (sortie de la commande, empreintes) réservé aux admins.
+                return Err(bad(if u.is_admin {
+                    format!("réveil par commande : {e:#}")
+                } else {
+                    "le réveil a échoué ; un admin trouvera le détail dans le journal".to_owned()
+                }));
+            }
         }
-        tracing::info!(user = u.username, connection = row.name, ssh = host, "WoL envoyé par commande");
-        return Ok(StatusCode::NO_CONTENT);
     }
     let target = wol::parse_target(row.wol_target.as_deref().unwrap_or(wol::DEFAULT_TARGET))
         .ok_or_else(|| bad("adresse WoL invalide"))?;
@@ -209,6 +246,7 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
             command: r.wol_ssh_command.clone().unwrap_or_default(),
             has_password: r.wol_ssh_password.is_some(),
             hostkey: r.wol_ssh_hostkey.clone(),
+            pending_hostkey: r.wol_ssh_hostkey_pending.clone(),
         }),
     })
 }

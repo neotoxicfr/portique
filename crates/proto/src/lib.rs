@@ -156,8 +156,11 @@ pub struct WolCommandAdmin {
     pub user: String,
     pub command: String,
     pub has_password: bool,
-    /// Empreinte de la clé d'hôte SSH épinglée.
+    /// Empreinte de la clé d'hôte SSH approuvée.
     pub hostkey: Option<String>,
+    /// Clé présentée par l'hôte lors d'un essai, en attente d'approbation (aucun mot de passe
+    /// n'est envoyé tant qu'elle n'est pas approuvée).
+    pub pending_hostkey: Option<String>,
 }
 
 /// `password: None` garde l'ancien.
@@ -168,6 +171,9 @@ pub struct WolCommandInput {
     pub command: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Approuve la clé en attente (doit être identique à `pending_hostkey`).
+    #[serde(default)]
+    pub approve_hostkey: Option<String>,
 }
 
 /// Création ou modification d'une connexion. `password: None` garde l'ancien,

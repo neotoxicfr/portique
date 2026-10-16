@@ -122,6 +122,38 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                     println!("✓ session active, bureau {width}×{height} ({} ms)", t0.elapsed().as_millis());
                     deadline = Some(tokio::time::Instant::now() + Duration::from_secs(seconds));
                 }
+                Event::DvcData { channel_id, data }
+                    if session.dvc_name(channel_id) == Some(rdp_session::DVC_DISPLAY_CONTROL) =>
+                {
+                    println!("  DisplayControl : capacités reçues ({} o)", data.len());
+                    if let Some(spec) = env("MONITORS") {
+                        // « 1920x1080,1280x1024 » : écrans côte à côte, le premier principal.
+                        let mons: Vec<(u32, u32)> = spec
+                            .split(',')
+                            .filter_map(|m| {
+                                m.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                            })
+                            .collect();
+                        let mut p = Vec::new();
+                        p.extend_from_slice(&2u32.to_le_bytes());
+                        p.extend_from_slice(&((16 + 40 * mons.len()) as u32).to_le_bytes());
+                        p.extend_from_slice(&40u32.to_le_bytes());
+                        p.extend_from_slice(&(mons.len() as u32).to_le_bytes());
+                        let mut left = 0i32;
+                        for (i, (w, h)) in mons.iter().enumerate() {
+                            for v in
+                                [if i == 0 { 1u32 } else { 0 }, left as u32, 0, *w, *h, 0, 0, 0, 100, 100]
+                            {
+                                p.extend_from_slice(&v.to_le_bytes());
+                            }
+                            left += *w as i32;
+                        }
+                        for f in session.dvc_send(channel_id, &p) {
+                            send(tls, &f).await?;
+                        }
+                        println!("  → disposition envoyée : {mons:?}");
+                    }
+                }
                 Event::DvcOpened { channel_id, name } => {
                     println!("  canal dynamique ouvert : {name} (#{channel_id})");
                     if name == rdp_session::DVC_GRAPHICS {
@@ -148,7 +180,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                             rdp_gfx::Out::Present { .. } => frames += 1,
-                            rdp_gfx::Out::Reset { width, height } => {
+                            rdp_gfx::Out::Reset { width, height, .. } => {
                                 println!("  EGFX : sortie {width}×{height}")
                             }
                             rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {

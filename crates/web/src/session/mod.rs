@@ -4,13 +4,14 @@ mod clip;
 mod engine;
 mod h264;
 mod keys;
+mod views;
 
 use std::rc::Rc;
 
 use engine::{Engine, Open, Status};
 use leptos::{ev, html::Canvas, prelude::*, task::spawn_local};
 use leptos_router::hooks::{use_navigate, use_params_map};
-use rdp_pdu::fastpath::{Input, ptr};
+use views::ScreenGeom;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{KeyboardEvent, PointerEvent, WheelEvent};
 
@@ -21,28 +22,6 @@ fn viewport() -> (u32, u32) {
     let w = window();
     let px = |v: Result<JsValue, JsValue>| v.ok().and_then(|v| v.as_f64()).unwrap_or(1024.0) as u32;
     (px(w.inner_width()), px(w.inner_height()))
-}
-
-/// Coordonnées bureau d'un événement pointeur (canevas affiché en `object-fit: contain`).
-fn desktop_point(canvas: &web_sys::HtmlCanvasElement, x: f64, y: f64) -> (u16, u16) {
-    let r = canvas.get_bounding_client_rect();
-    let (cw, ch) = (canvas.width() as f64, canvas.height() as f64);
-    let scale = (r.width() / cw).min(r.height() / ch).max(1e-6);
-    let (ox, oy) = ((r.width() - cw * scale) / 2.0, (r.height() - ch * scale) / 2.0);
-    let dx = ((x - r.left() - ox) / scale).clamp(0.0, cw - 1.0);
-    let dy = ((y - r.top() - oy) / scale).clamp(0.0, ch - 1.0);
-    (dx as u16, dy as u16)
-}
-
-fn button_flags(button: i16) -> Option<(u16, bool)> {
-    match button {
-        0 => Some((ptr::BUTTON1, false)),
-        1 => Some((ptr::BUTTON3, false)),
-        2 => Some((ptr::BUTTON2, false)),
-        3 => Some((ptr::X_BUTTON1, true)),
-        4 => Some((ptr::X_BUTTON2, true)),
-        _ => None,
-    }
 }
 
 fn sleep(seconds: u32) -> impl std::future::Future<Output = ()> {
@@ -130,35 +109,7 @@ pub fn SessionPage() -> impl IntoView {
     }
 
     // Clavier : positions physiques → scancodes ; à défaut (clavier virtuel), caractère Unicode.
-    let key_handler = move |e: KeyboardEvent, down: bool| {
-        with_engine(&|eng| {
-            if !eng.is_connected() {
-                return;
-            }
-            eng.user_gesture();
-            // Ctrl+V / Cmd+V : le presse-papier local part vers le PC avant la touche V.
-            if down && (e.ctrl_key() || e.meta_key()) && e.code() == "KeyV" {
-                eng.paste_guard();
-            }
-            if let Some((code, ext)) = keys::scancode(&e.code()) {
-                e.prevent_default();
-                eng.key(code, ext, down);
-            } else {
-                let key = e.key();
-                let mut chars = key.chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    e.prevent_default();
-                    let mut buf = [0u16; 2];
-                    let events: Vec<Input> = c
-                        .encode_utf16(&mut buf)
-                        .iter()
-                        .map(|u| Input::Unicode { code: *u, release: !down })
-                        .collect();
-                    eng.input(&events);
-                }
-            }
-        })
-    };
+    let key_handler = move |e: KeyboardEvent, down: bool| with_engine(&|eng| eng.key_input(&e, down));
     let kd = window_event_listener(ev::keydown, move |e| key_handler(e, true));
     let ku = window_event_listener(ev::keyup, move |e| key_handler(e, false));
     let blur = window_event_listener(ev::blur, move |_| with_engine(&|e| e.release_all()));
@@ -201,59 +152,9 @@ pub fn SessionPage() -> impl IntoView {
     });
 
     // Souris et tactile (événements pointeur sur le canevas).
-    let pointer = move |e: PointerEvent, kind: &'static str| {
-        let Some(canvas) = canvas_ref.get_untracked() else { return };
-        with_engine(&|eng| {
-            if !eng.is_connected() {
-                return;
-            }
-            e.prevent_default();
-            if kind == "down" {
-                eng.user_gesture();
-            }
-            let (x, y) = desktop_point(&canvas, e.client_x() as f64, e.client_y() as f64);
-            let event = match kind {
-                "move" => Input::Mouse { flags: ptr::MOVE, x, y },
-                _ => {
-                    let Some((flag, extended)) = button_flags(e.button()) else { return };
-                    let down = kind == "down";
-                    if down {
-                        let _ = canvas.set_pointer_capture(e.pointer_id());
-                    }
-                    match (extended, down) {
-                        (false, true) => Input::Mouse { flags: flag | ptr::DOWN, x, y },
-                        (false, false) => Input::Mouse { flags: flag, x, y },
-                        (true, true) => Input::MouseX { flags: flag | ptr::X_DOWN, x, y },
-                        (true, false) => Input::MouseX { flags: flag, x, y },
-                    }
-                }
-            };
-            eng.input(&[event]);
-        })
-    };
-    let wheel = move |e: WheelEvent| {
-        let Some(canvas) = canvas_ref.get_untracked() else { return };
-        with_engine(&|eng| {
-            if !eng.is_connected() {
-                return;
-            }
-            e.prevent_default();
-            let (x, y) = desktop_point(&canvas, e.client_x() as f64, e.client_y() as f64);
-            // Pixels → crans de 120 (une molette classique envoie ~100 px par cran).
-            let unit = match e.delta_mode() {
-                0 => 1.2,
-                1 => 40.0,
-                _ => 120.0,
-            };
-            let (dx, dy) = (e.delta_x() * unit, e.delta_y() * unit);
-            if dy.abs() >= 1.0 {
-                eng.input(&[Input::wheel((-dy).clamp(-255.0, 255.0) as i16, false, x, y)]);
-            }
-            if dx.abs() >= 1.0 {
-                eng.input(&[Input::wheel(dx.clamp(-255.0, 255.0) as i16, true, x, y)]);
-            }
-        })
-    };
+    let pointer =
+        move |e: PointerEvent, kind: &'static str| with_engine(&|eng| eng.pointer_input(0, &e, kind));
+    let wheel = move |e: WheelEvent| with_engine(&|eng| eng.wheel_input(0, &e));
 
     // Menu de session.
     let fullscreen = move |_| {
@@ -271,6 +172,42 @@ pub fn SessionPage() -> impl IntoView {
                 let _ = f.call0(&kb);
             }
         }
+        menu_open.set(false);
+    };
+    // Multi-écran : 1) détecter les écrans (demande la permission), 2) ouvrir les fenêtres dans
+    // un second clic (un navigateur bloque une fenêtre ouverte hors d'un geste utilisateur).
+    let screens = StoredValue::new_local(None::<(Vec<ScreenGeom>, usize)>);
+    let multi_label = RwSignal::new(None::<String>);
+    let multi_active = RwSignal::new(false);
+    let detect = move |_| {
+        spawn_local(async move {
+            match views::screens().await {
+                Ok((list, cur)) if list.len() > 1 => {
+                    multi_label.set(Some(format!("Étendre sur {} écrans", list.len())));
+                    screens.set_value(Some((list, cur)));
+                }
+                Ok(_) => multi_label.set(Some("Un seul écran détecté".into())),
+                Err(e) => multi_label.set(Some(format!("Multi-écran indisponible : {e}"))),
+            }
+        });
+    };
+    let extend = move |_| {
+        let Some((list, cur)) = screens.get_value() else { return };
+        with_engine(&|e| match e.enable_multi(&list, cur) {
+            Ok(n) => {
+                multi_active.set(true);
+                multi_label.set(Some(format!("{n} écrans")));
+            }
+            Err(err) => multi_label.set(Some(err)),
+        });
+        menu_open.set(false);
+    };
+    let single = move |_| {
+        let (w, h) = viewport();
+        with_engine(&|e| e.disable_multi(w, h));
+        multi_active.set(false);
+        multi_label.set(None);
+        screens.set_value(None);
         menu_open.set(false);
     };
     let cad = move |_| {
@@ -299,9 +236,9 @@ pub fn SessionPage() -> impl IntoView {
                 node_ref=canvas_ref
                 class="screen"
                 tabindex="0"
-                on:pointermove=move |e| pointer(e, "move")
-                on:pointerdown=move |e| pointer(e, "down")
-                on:pointerup=move |e| pointer(e, "up")
+                on:pointermove=move |e| pointer(e, "pointermove")
+                on:pointerdown=move |e| pointer(e, "pointerdown")
+                on:pointerup=move |e| pointer(e, "pointerup")
                 on:wheel=wheel
                 on:contextmenu=|e| e.prevent_default()
             ></canvas>
@@ -310,6 +247,15 @@ pub fn SessionPage() -> impl IntoView {
                 <Show when=move || menu_open.get()>
                     <div class="session-actions">
                         <button on:click=fullscreen>"Plein écran"</button>
+                        {move || if { multi_label.track(); multi_active.get() } {
+                            view! { <button on:click=single>"Un seul écran"</button> }.into_any()
+                        } else if screens.with_value(Option::is_some) {
+                            view! { <button on:click=extend>{multi_label.get().unwrap_or_default()}</button> }.into_any()
+                        } else {
+                            view! {
+                                <button on:click=detect title=move || multi_label.get().unwrap_or_default()>"Multi-écran"</button>
+                            }.into_any()
+                        }}
                         <button on:click=cad>"Ctrl+Alt+Suppr"</button>
                         <button class="secondary" on:click=quit.clone()>"Quitter"</button>
                     </div>

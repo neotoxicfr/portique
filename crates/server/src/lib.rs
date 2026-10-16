@@ -130,6 +130,32 @@ pub fn content_security_policy(index_html: &str) -> String {
     )
 }
 
+/// CSP recalculée quand index.html change (déploiement du front sans redémarrer le serveur).
+#[derive(Clone)]
+struct CspCache {
+    path: std::path::PathBuf,
+    cached: Arc<std::sync::Mutex<(Option<std::time::SystemTime>, HeaderValue)>>,
+}
+
+impl CspCache {
+    fn new(path: std::path::PathBuf) -> Self {
+        let empty = HeaderValue::from_str(&content_security_policy("")).expect("CSP ASCII");
+        Self { path, cached: Arc::new(std::sync::Mutex::new((None, empty))) }
+    }
+
+    fn current(&self) -> HeaderValue {
+        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mut c = self.cached.lock().unwrap();
+        if mtime.is_some() && c.0 != mtime {
+            let html = std::fs::read_to_string(&self.path).unwrap_or_default();
+            if let Ok(v) = HeaderValue::from_str(&content_security_policy(&html)) {
+                *c = (mtime, v);
+            }
+        }
+        c.1.clone()
+    }
+}
+
 pub fn app(state: AppState) -> Router {
     let static_dir = state.cfg.static_dir.clone();
     let spa = ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
@@ -143,13 +169,19 @@ pub fn app(state: AppState) -> Router {
         SetResponseHeaderLayer::overriding(HeaderName::from_static(name), HeaderValue::from_static(value))
     };
 
-    let index = std::fs::read_to_string(static_dir.join("index.html")).unwrap_or_default();
-    let csp = HeaderValue::from_str(&content_security_policy(&index)).expect("CSP ASCII");
+    let csp = CspCache::new(static_dir.join("index.html"));
 
     Router::new()
         .nest("/api", api)
         .fallback_service(spa)
-        .layer(SetResponseHeaderLayer::overriding(header::CONTENT_SECURITY_POLICY, csp))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let value = csp.current();
+            async move {
+                let mut res = next.run(req).await;
+                res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, value);
+                res
+            }
+        }))
         .layer(hdr("x-content-type-options", "nosniff"))
         .layer(hdr("x-frame-options", "DENY"))
         .layer(hdr("referrer-policy", "no-referrer"))

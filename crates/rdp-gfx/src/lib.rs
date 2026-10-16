@@ -67,8 +67,9 @@ impl Rect {
 pub enum Out {
     /// Message à envoyer sur le canal graphique (accusés d'image).
     Send(Vec<u8>),
-    /// Nouvelle taille de sortie : réallouer le canevas.
-    Reset { width: u32, height: u32 },
+    /// Nouvelle taille de sortie : réallouer le canevas. `monitors` : écrans du bureau en
+    /// coordonnées de sortie (origine = coin haut-gauche du rectangle englobant).
+    Reset { width: u32, height: u32, monitors: Vec<Rect> },
     /// Fin d'image : zones de la sortie à recopier vers l'écran.
     Present { damage: Vec<Rect> },
     /// Image H.264 à décoder puis à rendre par `submit_yuv420` (ou `skip_frame`).

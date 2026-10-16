@@ -161,6 +161,33 @@ impl Gfx {
                 if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
                     return Err(Error::Invalid("taille de sortie invalide"));
                 }
+                // TS_MONITOR_DEF (bords inclus, relatifs à l'écran principal, négatifs possibles).
+                let count = r.u32()?.min(16) as usize;
+                let mut defs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut i32_ = || -> Result<i32, Error> { Ok(r.u32()? as i32) };
+                    let (left, top, right, bottom) = (i32_()?, i32_()?, i32_()?, i32_()?);
+                    r.u32()?; // flags
+                    if right >= left && bottom >= top {
+                        defs.push((left, top, right, bottom));
+                    }
+                }
+                let (min_x, min_y) = (
+                    defs.iter().map(|d| d.0).min().unwrap_or(0),
+                    defs.iter().map(|d| d.1).min().unwrap_or(0),
+                );
+                let monitors: Vec<Rect> = defs
+                    .iter()
+                    .filter_map(|&(l, t, rr, b)| {
+                        Rect {
+                            x: (l - min_x) as u32,
+                            y: (t - min_y) as u32,
+                            w: (rr - l + 1) as u32,
+                            h: (b - t + 1) as u32,
+                        }
+                        .clip(w, h)
+                    })
+                    .collect();
                 self.width = w;
                 self.height = h;
                 self.output = vec![0u8; (w * h * 4) as usize];
@@ -171,7 +198,7 @@ impl Gfx {
                     s.origin = None;
                 }
                 self.damage.clear();
-                out.push(Out::Reset { width: w, height: h });
+                out.push(Out::Reset { width: w, height: h, monitors });
             }
             id::CREATE_SURFACE => {
                 let (sid, w, h) = (r.u16()?, r.u16()? as u32, r.u16()? as u32);
@@ -493,7 +520,7 @@ mod tests {
         );
         let end = pdu(id::END_FRAME, &7u32.to_le_bytes());
         let out = g.process(&wrap(&[reset, create, map, fill, to_cache, from_cache, end])).unwrap();
-        assert_eq!(out[0], Out::Reset { width: 8, height: 4 });
+        assert_eq!(out[0], Out::Reset { width: 8, height: 4, monitors: vec![] });
         let (fb, w, _) = g.output();
         let px = |x: u32, y: u32| &fb[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
         assert_eq!(px(1, 1), [0xFF, 0, 0, 0xFF]);

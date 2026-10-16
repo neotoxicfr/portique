@@ -3,7 +3,7 @@
 //!
 //! Variables : YAWRDP_PROBE_HOST, YAWRDP_PROBE_PORT (3389), YAWRDP_PROBE_USER,
 //! YAWRDP_PROBE_DOMAIN (vide), YAWRDP_PROBE_PASSWORD ou YAWRDP_PROBE_PASSWORD_FILE,
-//! YAWRDP_PROBE_SECONDS (8), YAWRDP_PROBE_PNG (chemin de capture). Le mot de passe n'est
+//! YAWRDP_PROBE_SECONDS (8), YAWRDP_PROBE_PNG (chemin de capture), YAWRDP_PROBE_PIN (empreinte). Le mot de passe n'est
 //! jamais affiché.
 
 use std::time::Duration;
@@ -50,7 +50,21 @@ async fn main() -> anyhow::Result<()> {
         credentials: Credentials { username: user.clone(), domain, password: password()? },
     };
     println!("→ connexion à {host}:{port}");
-    let mut c = rdp_connect::connect(&target, None).await?;
+    // YAWRDP_PROBE_PIN : empreinte SHA-256 attendue ; sans elle, la sonde s'arrête avant NLA et
+    // affiche l'empreinte à vérifier.
+    let pin = env("PIN")
+        .map(|h| {
+            (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+        })
+        .transpose()?
+        .map(|v| {
+            <[u8; 32]>::try_from(v).map_err(|_| anyhow::anyhow!("YAWRDP_PROBE_PIN : 64 caractères hexa"))
+        })
+        .transpose()?;
+    let mut c = rdp_connect::connect(&target, pin).await?;
     println!(
         "✓ NLA réussie pour {user} ({}, drapeaux 0x{:02x}), certificat SHA-256 {}",
         x224::protocol_name(c.selected_protocol),

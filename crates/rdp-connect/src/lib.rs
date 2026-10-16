@@ -58,6 +58,9 @@ pub enum ConnectError {
         "le certificat du PC a changé : empreinte attendue {expected}, reçue {got} (réinstallation, ou attaque ?)"
     )]
     CertificateMismatch { expected: String, got: String },
+    /// Certificat jamais vu : la connexion s'arrête avant CredSSP, l'empreinte doit être approuvée.
+    #[error("certificat du PC pas encore approuvé (empreinte {0})")]
+    UntrustedCertificate(String),
     #[error("authentification Windows : {0}")]
     Auth(String),
     #[error("protocole : {0}")]
@@ -153,8 +156,9 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Connecte et authentifie. `pinned` : empreinte SHA-256 attendue du certificat (None = premier
-/// usage, l'appelant mémorise `cert_sha256`).
+/// Connecte et authentifie. `pinned` : empreinte SHA-256 attendue du certificat. Sans empreinte,
+/// la connexion s'arrête après TLS (`UntrustedCertificate`) : aucune réponse NTLM ne part vers
+/// un serveur que personne n'a approuvé.
 pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connected, ConnectError> {
     let mut tcp = timeout(STEP_TIMEOUT, TcpStream::connect((target.host.as_str(), target.port)))
         .await
@@ -195,10 +199,15 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
         .ok_or_else(|| ConnectError::Tls("aucun certificat".into()))?
         .to_vec();
     let cert_sha256: [u8; 32] = Sha256::digest(&cert).into();
-    if let Some(expected) = pinned
-        && expected != cert_sha256
-    {
-        return Err(ConnectError::CertificateMismatch { expected: hex(&expected), got: hex(&cert_sha256) });
+    match pinned {
+        None => return Err(ConnectError::UntrustedCertificate(hex(&cert_sha256))),
+        Some(expected) if expected != cert_sha256 => {
+            return Err(ConnectError::CertificateMismatch {
+                expected: hex(&expected),
+                got: hex(&cert_sha256),
+            });
+        }
+        Some(_) => {}
     }
 
     let rand = Randomness {

@@ -40,6 +40,8 @@ echo      Pense aussi a activer Wake-on-LAN dans le BIOS/UEFI.
 
 gpupdate /force >nul
 echo [ok] Strategies appliquees (gpupdate).
+echo [..] Empreinte du certificat RDP a comparer dans yawrdp :
+powershell -NoProfile -Command "try { $ts = Get-CimInstance -Namespace root\cimv2\TerminalServices -ClassName Win32_TSGeneralSetting -Filter \"TerminalName='RDP-tcp'\"; $c = Get-Item ('Cert:\LocalMachine\Remote Desktop\' + $ts.SSLCertificateSHA1Hash); '     ' + ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData)) -replace '-','').ToLower() } catch { '     (certificat pas encore cree : relance ce fichier apres une premiere connexion)' }"
 echo.
 echo Termine. Relancer ce fichier est sans danger.
 pause

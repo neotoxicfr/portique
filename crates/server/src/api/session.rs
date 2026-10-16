@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, header},
@@ -29,11 +29,18 @@ fn same_origin(headers: &HeaderMap, public: &url::Url) -> bool {
     url::Url::parse(origin).is_ok_and(|o| o.origin() == public.origin())
 }
 
+#[derive(serde::Deserialize)]
+pub struct OpenQuery {
+    /// Empreinte approuvée par un admin pour un premier contact (hexa SHA-256).
+    trust: Option<String>,
+}
+
 pub async fn open(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     ClientIp(ip): ClientIp,
     Path(id): Path<i64>,
+    Query(q): Query<OpenQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
@@ -44,7 +51,19 @@ pub async fn open(
     if row.protocol != "rdp" {
         return Err(bad("seul le RDP est disponible pour l'instant"));
     }
-    Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| run(state, user, ip, row, socket)))
+    let trust = match q.trust.as_deref() {
+        Some(t) if user.is_admin => Some(
+            <[u8; 32]>::try_from(hex::decode(t).map_err(|_| bad("empreinte invalide"))?)
+                .map_err(|_| bad("empreinte invalide"))?,
+        ),
+        Some(_) => return Err(AppError::Forbidden),
+        None => None,
+    };
+    // Empreinte du cookie de session : la session RDP tombe si la session web est révoquée.
+    let token = axum_extra::extract::CookieJar::from_headers(&headers)
+        .get(crate::auth::SESSION_COOKIE)
+        .map(|c| crate::crypto::token_hash(c.value()));
+    Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| run(state, user, ip, row, trust, token, socket)))
 }
 
 async fn send_text(socket: &mut WebSocket, msg: &SessionMessage) {
@@ -58,7 +77,39 @@ async fn fail(mut socket: WebSocket, message: String) {
     let _ = socket.close().await;
 }
 
-async fn run(state: AppState, user: UserRow, ip: std::net::IpAddr, row: Row, mut socket: WebSocket) {
+/// La session web et l'accès à la connexion sont-ils toujours valides ?
+async fn still_allowed(state: &AppState, user_id: i64, connection_id: i64, token: Option<&[u8]>) -> bool {
+    let user = match crate::auth::user_by_id(&state.db, user_id).await {
+        Ok(Some(u)) => u,
+        _ => return false,
+    };
+    if state.cfg.auth_mode == yawrdp_proto::AuthMode::Builtin {
+        let Some(token) = token else { return false };
+        let alive: Result<Option<i64>, _> = sqlx::query_scalar(
+            "SELECT 1 FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at >= unixepoch()",
+        )
+        .bind(token)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await;
+        if !matches!(alive, Ok(Some(_))) {
+            return false;
+        }
+    }
+    find_allowed(&state.db, user.id, user.is_admin, connection_id).await.is_ok()
+}
+
+const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn run(
+    state: AppState,
+    user: UserRow,
+    ip: std::net::IpAddr,
+    row: Row,
+    trust: Option<[u8; 32]>,
+    token: Option<Vec<u8>>,
+    mut socket: WebSocket,
+) {
     let password = match &row.password {
         Some(sealed) => match state.vault.open(&format!("connection:{}", row.id), sealed) {
             Ok(p) => String::from_utf8_lossy(&p).into_owned(),
@@ -73,7 +124,8 @@ async fn run(state: AppState, user: UserRow, ip: std::net::IpAddr, row: Row, mut
         port: row.port as u16,
         credentials: Credentials { username: row.username.clone(), domain: row.domain.clone(), password },
     };
-    let pinned = row.cert_sha256.as_deref().and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let stored = row.cert_sha256.as_deref().and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let pinned = stored.or(trust);
     let started = Instant::now();
     tracing::info!(user = user.username, %ip, connection = row.name, "ouverture de session");
     let connected = match rdp_connect::connect(&target, pinned).await {
@@ -140,10 +192,22 @@ async fn run(state: AppState, user: UserRow, ip: std::net::IpAddr, row: Row, mut
         }
         let _ = ws_tx.close().await;
     };
-    // La première moitié qui se termine coupe l'autre.
+    let watchdog = async {
+        let mut tick = tokio::time::interval(REVALIDATE_EVERY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if !still_allowed(&state, user.id, row.id, token.as_deref()).await {
+                tracing::info!(user = user.username, connection = row.name, "session révoquée : coupure");
+                break;
+            }
+        }
+    };
+    // La première moitié qui se termine coupe les autres (fin RDP, fermeture, révocation).
     tokio::select! {
         _ = to_pc => {}
         _ = to_browser => {}
+        _ = watchdog => {}
     }
     tracing::info!(
         user = user.username,

@@ -131,8 +131,11 @@ async fn run(
     let connected = match rdp_connect::connect(&target, pinned).await {
         Ok(c) => c,
         Err(rdp_connect::ConnectError::UntrustedCertificate(fingerprint)) => {
-            send_text(&mut socket, &SessionMessage::UntrustedCertificate { fingerprint, can_approve: user.is_admin })
-                .await;
+            send_text(
+                &mut socket,
+                &SessionMessage::UntrustedCertificate { fingerprint, can_approve: user.is_admin },
+            )
+            .await;
             let _ = socket.close().await;
             return;
         }

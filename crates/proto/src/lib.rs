@@ -144,6 +144,30 @@ pub struct ConnectionAdmin {
     pub allowed_users: Vec<i64>,
     /// Empreinte SHA-256 (hexa) du certificat épinglé, si déjà vu.
     pub cert_fingerprint: Option<String>,
+    /// Réveil « par commande » (SSH) ; `None` = paquet UDP direct.
+    pub wol_command: Option<WolCommandAdmin>,
+}
+
+/// Réveil par commande : SSH vers `host` puis `command`, où `{mac}` est remplacé par l'adresse
+/// MAC (ex. routeur MikroTik : `/tool wol interface=ether1 mac={mac}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WolCommandAdmin {
+    pub host: String,
+    pub user: String,
+    pub command: String,
+    pub has_password: bool,
+    /// Empreinte de la clé d'hôte SSH épinglée.
+    pub hostkey: Option<String>,
+}
+
+/// `password: None` garde l'ancien.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WolCommandInput {
+    pub host: String,
+    pub user: String,
+    pub command: String,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Création ou modification d'une connexion. `password: None` garde l'ancien,
@@ -170,6 +194,9 @@ pub struct ConnectionInput {
     /// Oublie le certificat épinglé (PC réinstallé, certificat renouvelé).
     #[serde(default)]
     pub forget_certificate: bool,
+    /// Réveil par commande SSH ; `None` = paquet UDP direct.
+    #[serde(default)]
+    pub wol_command: Option<WolCommandInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,7 +229,10 @@ pub struct UserInput {
 pub enum SessionMessage {
     /// Premier contact : l'empreinte du certificat du PC doit être approuvée par un admin
     /// (à comparer avec celle qu'affiche le script de préparation sur le PC).
-    UntrustedCertificate { fingerprint: String, can_approve: bool },
+    UntrustedCertificate {
+        fingerprint: String,
+        can_approve: bool,
+    },
     /// Le serveur a fait TLS + NLA : le navigateur reprend à MCS Connect Initial.
     Ready {
         selected_protocol: u32,

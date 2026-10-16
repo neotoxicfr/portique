@@ -3,6 +3,9 @@ use yawrdp_proto::{ConnectionAdmin, ConnectionInput, Protocol, UserAdmin, UserIn
 
 use crate::{Session, api};
 
+/// Commande de réveil proposée pour un routeur MikroTik (RouterOS).
+const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
+
 #[component]
 pub fn Admin() -> impl IntoView {
     let session = Session::get();
@@ -164,6 +167,14 @@ struct Form {
     has_password: RwSignal<bool>,
     fingerprint: RwSignal<Option<String>>,
     forget_cert: RwSignal<bool>,
+    /// Mode de réveil : direct (UDP) ou par commande SSH.
+    wol_by_command: RwSignal<bool>,
+    cmd_host: RwSignal<String>,
+    cmd_user: RwSignal<String>,
+    cmd_password: RwSignal<String>,
+    cmd_command: RwSignal<String>,
+    cmd_has_password: RwSignal<bool>,
+    cmd_hostkey: RwSignal<Option<String>>,
 }
 
 impl Form {
@@ -189,6 +200,14 @@ impl Form {
         self.has_password.set(c.is_some_and(|c| c.has_password));
         self.fingerprint.set(c.and_then(|c| c.cert_fingerprint.clone()));
         self.forget_cert.set(false);
+        let w = c.and_then(|c| c.wol_command.as_ref());
+        self.wol_by_command.set(w.is_some());
+        self.cmd_host.set(s(w.map(|w| w.host.as_str())));
+        self.cmd_user.set(s(w.map(|w| w.user.as_str())));
+        self.cmd_command.set(w.map(|w| w.command.clone()).unwrap_or_else(|| MIKROTIK_COMMAND.into()));
+        self.cmd_password.set(String::new());
+        self.cmd_has_password.set(w.is_some_and(|w| w.has_password));
+        self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
     }
 
     fn input(&self) -> ConnectionInput {
@@ -210,6 +229,12 @@ impl Form {
             wol_target: opt(self.wol_target),
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
+            wol_command: self.wol_by_command.get_untracked().then(|| yawrdp_proto::WolCommandInput {
+                host: self.cmd_host.get_untracked(),
+                user: self.cmd_user.get_untracked(),
+                command: self.cmd_command.get_untracked(),
+                password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
+            }),
         }
     }
 }
@@ -315,7 +340,39 @@ fn Connections(
                                     prop:value=move || f.password.get() on:input=input(f.password)/>
                             </label>
                             <label>"MAC (WoL)"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
-                            <label>"Cible WoL"<input type="text" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
+                            <fieldset class="full">
+                                <legend>"Réveil (Wake-on-LAN) — MAC ci-dessus"</legend>
+                                <label class="check">
+                                    <input type="radio" name="wolmode" prop:checked=move || !f.wol_by_command.get()
+                                        on:change=move |_| f.wol_by_command.set(false)/>
+                                    "Direct : paquet magique UDP (même réseau, ou broadcast dirigé)"
+                                </label>
+                                <label class="check">
+                                    <input type="radio" name="wolmode" prop:checked=move || f.wol_by_command.get()
+                                        on:change=move |_| f.wol_by_command.set(true)/>
+                                    "Par commande SSH sur un hôte du réseau du PC (routeur MikroTik…), indispensable à travers un VPN"
+                                </label>
+                                <Show
+                                    when=move || f.wol_by_command.get()
+                                    fallback=move || view! {
+                                        <label class="full">"Cible UDP"<input type="text" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
+                                    }
+                                >
+                                    <div class="grid full">
+                                        <label>"Hôte SSH"<input type="text" placeholder="10.0.0.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
+                                        <label>"Utilisateur SSH"<input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
+                                        <label>"Mot de passe SSH"
+                                            <input type="password" autocomplete="new-password"
+                                                placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "" }
+                                                prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/>
+                                        </label>
+                                        <label class="full">"Commande ({mac} est remplacé)"
+                                            <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/>
+                                        </label>
+                                    </div>
+                                    {move || f.cmd_hostkey.get().map(|k| view! { <p class="muted mono">"Clé SSH épinglée : " {k}</p> })}
+                                </Show>
+                            </fieldset>
                             <Show when=move || f.fingerprint.with(Option::is_some)>
                                 <fieldset class="full">
                                     <legend>"Certificat du PC (épinglé)"</legend>

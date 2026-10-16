@@ -71,9 +71,123 @@ mod tests {
     }
 
     #[test]
+    fn command_template() {
+        assert!(validate_command(MIKROTIK_COMMAND).is_ok());
+        assert!(validate_command("/tool wol interface=ether1").is_err(), "{{mac}} obligatoire");
+        assert!(validate_command("a {mac}\n/system reboot").is_err(), "une seule ligne");
+        assert!(validate_command("").is_err());
+    }
+
+    #[test]
     fn target_default_port() {
         assert_eq!(parse_target("192.168.1.255").unwrap().port(), 9);
         assert_eq!(parse_target("192.168.1.255:7").unwrap().port(), 7);
         assert!(parse_target("pc.local").is_none());
     }
+}
+
+/// Valide un gabarit de commande de réveil : une ligne, `{mac}` présent, longueur raisonnable.
+pub fn validate_command(template: &str) -> Result<(), &'static str> {
+    if template.trim().is_empty() || template.len() > 500 {
+        return Err("commande de réveil vide ou trop longue");
+    }
+    if template.contains(['\n', '\r', '\0']) {
+        return Err("commande de réveil sur une seule ligne");
+    }
+    if !template.contains("{mac}") {
+        return Err("la commande de réveil doit contenir {mac}");
+    }
+    Ok(())
+}
+
+/// Commande par défaut pour un routeur MikroTik (RouterOS).
+pub const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
+
+/// Réveil « par commande » : SSH (mot de passe) vers `host`, puis `template` où `{mac}` est remplacé
+/// par l'adresse MAC. `pinned` : empreinte SHA-256 attendue de la clé d'hôte ; renvoie l'empreinte
+/// vue (à épingler si c'était le premier contact).
+pub async fn ssh_command(
+    host: &str,
+    user: &str,
+    password: &str,
+    template: &str,
+    mac: [u8; 6],
+    pinned: Option<&str>,
+) -> anyhow::Result<String> {
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Context;
+    use russh::{ChannelMsg, client};
+
+    validate_command(template).map_err(|e| anyhow::anyhow!(e))?;
+
+    struct Check {
+        pinned: Option<String>,
+        seen: Arc<Mutex<Option<String>>>,
+    }
+    impl client::Handler for Check {
+        type Error = russh::Error;
+        async fn check_server_key(
+            &mut self,
+            key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            // Clé d'hôte simple attendue (RouterOS, OpenSSH) ; un certificat SSH n'est pas géré.
+            let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = key else { return Ok(false) };
+            let fp = key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+            let ok = self.pinned.as_deref().is_none_or(|p| p == fp);
+            *self.seen.lock().unwrap() = Some(fp);
+            Ok(ok)
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(None));
+    let handler = Check { pinned: pinned.map(str::to_owned), seen: seen.clone() };
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
+    });
+    let connect = client::connect(config, (host, 22), handler);
+    let mut session = match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            let fp = seen.lock().unwrap().clone();
+            if let (Some(expected), Some(got)) = (pinned, fp)
+                && expected != got
+            {
+                anyhow::bail!("la clé SSH de l'hôte a changé (attendue {expected}, reçue {got})");
+            }
+            return Err(e).context("connexion SSH");
+        }
+        Err(_) => anyhow::bail!("l'hôte SSH ne répond pas (délai dépassé)"),
+    };
+    let auth = session.authenticate_password(user, password).await.context("authentification SSH")?;
+    anyhow::ensure!(auth.success(), "identifiants SSH refusés");
+    let mut channel = session.channel_open_session().await.context("canal SSH")?;
+    // La MAC est formatée par nous (hexadécimal et « : ») : rien d'injectable.
+    let cmd = template.replace("{mac}", &format_mac(mac));
+    channel.exec(true, cmd.as_bytes()).await.context("commande de réveil")?;
+    let mut output = Vec::new();
+    let mut status = None;
+    while let Some(msg) = tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait())
+        .await
+        .context("réponse de l'hôte")?
+    {
+        match msg {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                output.extend_from_slice(&data)
+            }
+            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            ChannelMsg::Eof | ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "fr").await;
+    let text = String::from_utf8_lossy(&output).trim().to_owned();
+    // Code de sortie non nul, ou erreur RouterOS écrite dans la sortie : RouterOS répond 0 même quand
+    // la commande échoue.
+    let failed = ["failure:", "bad command", "syntax error", "expected end of command"]
+        .iter()
+        .any(|m| text.contains(m));
+    anyhow::ensure!(status.unwrap_or(0) == 0 && !failed, "la commande a échoué : {text}");
+    Ok(seen.lock().unwrap().clone().unwrap_or_default())
 }

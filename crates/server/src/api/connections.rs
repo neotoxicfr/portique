@@ -27,11 +27,17 @@ pub(crate) struct Row {
     pub(crate) wol_mac: Option<String>,
     pub(crate) wol_target: Option<String>,
     pub(crate) cert_sha256: Option<Vec<u8>>,
+    pub(crate) wol_ssh_host: Option<String>,
+    pub(crate) wol_ssh_user: Option<String>,
+    pub(crate) wol_ssh_password: Option<Vec<u8>>,
+    pub(crate) wol_ssh_command: Option<String>,
+    pub(crate) wol_ssh_hostkey: Option<String>,
 }
 
 macro_rules! columns {
     () => {
-        "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target, cert_sha256"
+        "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target, cert_sha256, \
+         wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey"
     };
 }
 
@@ -47,6 +53,50 @@ fn protocol_str(p: Protocol) -> &'static str {
 }
 
 /// Connexion accessible à l'utilisateur ? Les admins voient tout.
+async fn save_wol_command(
+    state: &AppState,
+    id: i64,
+    cmd: &Option<yawrdp_proto::WolCommandInput>,
+) -> ApiResult<()> {
+    let Some(r) = cmd else {
+        sqlx::query(
+            "UPDATE connections SET wol_ssh_host = NULL, wol_ssh_user = NULL, wol_ssh_password = NULL,
+             wol_ssh_command = NULL, wol_ssh_hostkey = NULL WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+        return Ok(());
+    };
+    let host = r.host.trim();
+    let ok = |v: &str, extra: &str| {
+        !v.is_empty() && v.len() <= 253 && v.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    };
+    if !ok(host, ".-:") || r.user.trim().is_empty() {
+        return Err(bad("réveil par commande : hôte et utilisateur requis"));
+    }
+    wol::validate_command(r.command.trim()).map_err(bad)?;
+    sqlx::query(
+        "UPDATE connections SET wol_ssh_host = ?, wol_ssh_user = ?, wol_ssh_command = ?,
+         wol_ssh_hostkey = CASE WHEN wol_ssh_host IS ? THEN wol_ssh_hostkey ELSE NULL END WHERE id = ?",
+    )
+    .bind(host)
+    .bind(r.user.trim())
+    .bind(r.command.trim())
+    .bind(host)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    if let Some(pw) = r.password.as_deref().filter(|p| !p.is_empty()) {
+        sqlx::query("UPDATE connections SET wol_ssh_password = ? WHERE id = ?")
+            .bind(state.vault.seal(&format!("wol-ssh:{id}"), pw.as_bytes()))
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn find_allowed(db: &SqlitePool, user_id: i64, is_admin: bool, id: i64) -> ApiResult<Row> {
     sqlx::query_as(concat!(
         "SELECT ",
@@ -96,6 +146,37 @@ pub async fn wake(
 ) -> ApiResult<StatusCode> {
     let row = find_allowed(&state.db, u.id, u.is_admin, id).await?;
     let mac = row.wol_mac.as_deref().and_then(wol::parse_mac).ok_or_else(|| bad("WoL non configuré"))?;
+    if let Some(host) = &row.wol_ssh_host {
+        let password = match &row.wol_ssh_password {
+            Some(sealed) => {
+                String::from_utf8_lossy(&state.vault.open(&format!("wol-ssh:{}", row.id), sealed)?)
+                    .into_owned()
+            }
+            None => return Err(bad("mot de passe SSH de réveil absent")),
+        };
+        let fp = wol::ssh_command(
+            host,
+            row.wol_ssh_user.as_deref().unwrap_or_default(),
+            &password,
+            row.wol_ssh_command.as_deref().unwrap_or_default(),
+            mac,
+            row.wol_ssh_hostkey.as_deref(),
+        )
+        .await
+        .map_err(|e| bad(format!("réveil par commande : {e:#}")))?;
+        if row.wol_ssh_hostkey.is_none() {
+            // Clé SSH épinglée au premier envoi réussi (hôte du réseau interne, via le tunnel chiffré).
+            sqlx::query(
+                "UPDATE connections SET wol_ssh_hostkey = ? WHERE id = ? AND wol_ssh_hostkey IS NULL",
+            )
+            .bind(&fp)
+            .bind(row.id)
+            .execute(&state.db)
+            .await?;
+        }
+        tracing::info!(user = u.username, connection = row.name, ssh = host, "WoL envoyé par commande");
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let target = wol::parse_target(row.wol_target.as_deref().unwrap_or(wol::DEFAULT_TARGET))
         .ok_or_else(|| bad("adresse WoL invalide"))?;
     wol::send(mac, target).await.map_err(|e| anyhow::anyhow!("envoi WoL vers {target} : {e}"))?;
@@ -122,6 +203,13 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
         wol_target: r.wol_target,
         allowed_users,
         cert_fingerprint: r.cert_sha256.as_deref().map(hex::encode),
+        wol_command: r.wol_ssh_host.clone().map(|host| yawrdp_proto::WolCommandAdmin {
+            host,
+            user: r.wol_ssh_user.clone().unwrap_or_default(),
+            command: r.wol_ssh_command.clone().unwrap_or_default(),
+            has_password: r.wol_ssh_password.is_some(),
+            hostkey: r.wol_ssh_hostkey.clone(),
+        }),
     })
 }
 
@@ -228,6 +316,7 @@ pub async fn create(
     .await?;
     save_password(&state, id, &i.password).await?;
     save_access(&state.db, id, &i.allowed_users).await?;
+    save_wol_command(&state, id, &i.wol_command).await?;
     let row = find_allowed(&state.db, 0, true, id).await?;
     Ok((StatusCode::CREATED, Json(to_admin(&state.db, row).await?)))
 }
@@ -259,6 +348,7 @@ pub async fn update(
     }
     save_password(&state, id, &i.password).await?;
     save_access(&state.db, id, &i.allowed_users).await?;
+    save_wol_command(&state, id, &i.wol_command).await?;
     if i.forget_certificate {
         sqlx::query("UPDATE connections SET cert_sha256 = NULL WHERE id = ?")
             .bind(id)

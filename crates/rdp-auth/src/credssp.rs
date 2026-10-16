@@ -1,4 +1,4 @@
-//! Client CredSSP (MS-CSSP) au-dessus de NTLM, versions 2 à 6.
+//! Client CredSSP (MS-CSSP) au-dessus de NTLM, versions 5 et 6.
 //!
 //! Déroulé : NEGOTIATE → CHALLENGE → AUTHENTICATE + preuve de clé publique → preuve du
 //! serveur → identifiants chiffrés. La preuve lie l'authentification à la clé publique du
@@ -16,6 +16,8 @@ use crate::{
 
 /// Version annoncée (Windows 10 et suivants parlent la 6).
 pub const VERSION: i64 = 6;
+/// Plus ancienne version acceptée : la 5 introduit le nonce dans la preuve de clé publique.
+pub const MIN_VERSION: i64 = 5;
 
 const CLIENT_SERVER_MAGIC: &[u8] = b"CredSSP Client-To-Server Binding Hash\0";
 const SERVER_CLIENT_MAGIC: &[u8] = b"CredSSP Server-To-Client Binding Hash\0";
@@ -138,16 +140,22 @@ pub enum Step {
 }
 
 impl CredSspClient {
+    /// `server_cert_der` : certificat TLS présenté par le serveur. On en tire la clé publique
+    /// (preuve CredSSP) et la liaison de canal NTLM (EPA).
     pub fn new(
         creds: Credentials,
-        server_public_key: Vec<u8>,
+        server_cert_der: &[u8],
         target_host: &str,
         rand: Randomness,
         nonce: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let server_public_key = subject_public_key(server_cert_der)?;
+        let mut app = b"tls-server-end-point:".to_vec();
+        app.extend(tls_server_end_point(server_cert_der)?);
+        let cbt = crate::ntlm::channel_bindings_hash(&app);
         let spn = String::from("TERMSRV/") + target_host;
-        let ntlm = NtlmClient::new(creds.clone(), rand, spn);
-        Self { state: State::Start(ntlm), creds, server_public_key, nonce }
+        let ntlm = NtlmClient::new(creds.clone(), rand, spn, cbt);
+        Ok(Self { state: State::Start(ntlm), creds, server_public_key, nonce })
     }
 
     /// Premier message (NEGOTIATE NTLM).
@@ -168,20 +176,21 @@ impl CredSspClient {
         }
         match core::mem::replace(&mut self.state, State::Done) {
             State::WaitChallenge(ntlm) => {
-                let version = req.version.clamp(2, VERSION);
+                // Les versions 2 à 4 n'ont pas de nonce dans la preuve de clé (CVE-2018-0886) :
+                // refusées, tout Windows à jour parle la 6.
+                if req.version < MIN_VERSION {
+                    return Err(Error::Invalid("CredSSP trop ancien sur le serveur (version < 5)"));
+                }
+                let version = req.version.min(VERSION);
                 let challenge = req.nego_token.ok_or(Error::Invalid("CHALLENGE NTLM absent"))?;
                 let (auth, mut est) = ntlm.authenticate(&challenge)?;
-                let proof = if version >= 5 {
-                    binding_hash(CLIENT_SERVER_MAGIC, &self.nonce, &self.server_public_key)
-                } else {
-                    self.server_public_key.clone()
-                };
+                let proof = binding_hash(CLIENT_SERVER_MAGIC, &self.nonce, &self.server_public_key);
                 let (sig, data) = est.client.seal(&proof);
                 let out = TsRequest {
                     version,
                     nego_token: Some(auth),
                     pub_key_auth: Some([&sig[..], &data].concat()),
-                    client_nonce: (version >= 5).then_some(self.nonce),
+                    client_nonce: Some(self.nonce),
                     ..Default::default()
                 };
                 self.state = State::WaitPubKeyAuth(alloc::boxed::Box::new(est), version);
@@ -193,16 +202,7 @@ impl CredSspClient {
                     return Err(Error::Truncated("pubKeyAuth"));
                 }
                 let got = est.server.unseal(&sealed[..16], &sealed[16..])?;
-                let expected = if version >= 5 {
-                    binding_hash(SERVER_CLIENT_MAGIC, &self.nonce, &self.server_public_key)
-                } else {
-                    // Versions 2 à 4 : la clé publique avec son premier octet incrémenté.
-                    let mut k = self.server_public_key.clone();
-                    if let Some(b) = k.first_mut() {
-                        *b = b.wrapping_add(1);
-                    }
-                    k
-                };
+                let expected = binding_hash(SERVER_CLIENT_MAGIC, &self.nonce, &self.server_public_key);
                 if got != expected {
                     return Err(Error::Invalid("la clé publique TLS ne correspond pas (intermédiaire ?)"));
                 }
@@ -246,11 +246,73 @@ pub fn subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Hachage `tls-server-end-point` du certificat (RFC 5929 4.1) : l'algorithme de hachage de
+/// sa signature, SHA-256 pour MD5, SHA-1 et les cas non reconnus.
+pub fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
+    const SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+    const SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+    const SHA384_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+    const SHA512_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+    let (cert, _) = der::expect(cert_der, der::SEQUENCE)?;
+    let (_, after_tbs) = der::expect(cert, der::SEQUENCE)?;
+    let (alg, _) = der::expect(after_tbs, der::SEQUENCE)?;
+    let (oid, _) = der::expect(alg, 0x06)?;
+    Ok(match oid {
+        o if o == SHA384_RSA || o == SHA384_ECDSA => sha2::Sha384::digest(cert_der).to_vec(),
+        o if o == SHA512_RSA || o == SHA512_ECDSA => sha2::Sha512::digest(cert_der).to_vec(),
+        _ => Sha256::digest(cert_der).to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
     use super::*;
+
+    /// Certificat minimal : sha256WithRSAEncryption, clé publique 01 02 03.
+    fn fake_cert() -> Vec<u8> {
+        let empty = der::tlv(der::SEQUENCE, &[]);
+        let mut tbs = der::explicit(0, &der::integer(2));
+        tbs.extend(der::integer(1));
+        for _ in 0..4 {
+            tbs.extend(&empty);
+        }
+        let mut spki = empty.clone();
+        spki.extend(der::tlv(0x03, &[0, 1, 2, 3]));
+        tbs.extend(der::tlv(der::SEQUENCE, &spki));
+        let mut cert = der::tlv(der::SEQUENCE, &tbs);
+        let sha256_rsa = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+        cert.extend(der::tlv(der::SEQUENCE, &der::tlv(0x06, &sha256_rsa)));
+        cert.extend(der::tlv(0x03, &[0]));
+        der::tlv(der::SEQUENCE, &cert)
+    }
+
+    fn client() -> CredSspClient {
+        CredSspClient::new(
+            Credentials { username: "u".into(), domain: String::new(), password: "p".into() },
+            &fake_cert(),
+            "pc",
+            Randomness { client_challenge: [0; 8], exported_session_key: [0; 16], now_filetime: 0 },
+            [0; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn certificate_fields() {
+        let cert = fake_cert();
+        assert_eq!(subject_public_key(&cert).unwrap(), [1, 2, 3]);
+        assert_eq!(tls_server_end_point(&cert).unwrap(), Sha256::digest(&cert).to_vec());
+    }
+
+    #[test]
+    fn legacy_credssp_refused() {
+        let mut c = client();
+        c.start().unwrap();
+        let old = TsRequest { version: 3, nego_token: Some(vec![0; 8]), ..Default::default() }.encode();
+        assert!(matches!(c.step(&old), Err(Error::Invalid(_))));
+    }
 
     #[test]
     fn tsrequest_roundtrip() {
@@ -269,26 +331,14 @@ mod tests {
     #[test]
     fn error_code_reported() {
         let enc = TsRequest { version: 6, error_code: Some(0xC000_006D), ..Default::default() }.encode();
-        let mut c = CredSspClient::new(
-            Credentials { username: "u".into(), domain: String::new(), password: "p".into() },
-            vec![1, 2, 3],
-            "pc",
-            Randomness { client_challenge: [0; 8], exported_session_key: [0; 16], now_filetime: 0 },
-            [0; 32],
-        );
+        let mut c = client();
         c.start().unwrap();
         assert_eq!(c.step(&enc), Err(Error::Server(0xC000_006D)));
     }
 
     #[test]
     fn first_message_is_v6_negotiate() {
-        let mut c = CredSspClient::new(
-            Credentials { username: "u".into(), domain: String::new(), password: "p".into() },
-            vec![],
-            "pc",
-            Randomness { client_challenge: [0; 8], exported_session_key: [0; 16], now_filetime: 0 },
-            [0; 32],
-        );
+        let mut c = client();
         let req = TsRequest::decode(&c.start().unwrap()).unwrap();
         assert_eq!(req.version, 6);
         assert_eq!(&req.nego_token.unwrap()[..8], b"NTLMSSP\0");

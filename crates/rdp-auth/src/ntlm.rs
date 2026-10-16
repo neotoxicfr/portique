@@ -255,6 +255,12 @@ impl SealingHandle {
     }
 }
 
+/// Hachage de liaison de canal (EPA) : MD5 de la structure `gss_channel_bindings` sérialisée,
+/// adresses vides, données d'application `tls-server-end-point:<hachage du certificat>` (RFC 5929).
+pub fn channel_bindings_hash(application_data: &[u8]) -> [u8; 16] {
+    md5(&[&[0u8; 16], &(application_data.len() as u32).to_le_bytes(), application_data])
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -265,6 +271,8 @@ pub struct NtlmClient {
     rand: Randomness,
     /// SPN « TERMSRV/hôte » ajouté aux AV pairs (MsvAvTargetName).
     spn: String,
+    /// MsvAvChannelBindings : MD5 de la structure de liaison TLS (voir `channel_bindings_hash`).
+    channel_bindings: [u8; 16],
     negotiate: Vec<u8>,
 }
 
@@ -274,8 +282,8 @@ pub struct Established {
 }
 
 impl NtlmClient {
-    pub fn new(creds: Credentials, rand: Randomness, spn: String) -> Self {
-        Self { creds, rand, spn, negotiate: Vec::new() }
+    pub fn new(creds: Credentials, rand: Randomness, spn: String, channel_bindings: [u8; 16]) -> Self {
+        Self { creds, rand, spn, channel_bindings, negotiate: Vec::new() }
     }
 
     pub fn negotiate(&mut self) -> Vec<u8> {
@@ -307,8 +315,10 @@ impl NtlmClient {
 
         // AV pairs renvoyées : celles du serveur + MIC présent + liaison de canal vide + SPN.
         let mut ti = Vec::with_capacity(ch.target_info.len() + 64);
+        // Les paires propres au client (drapeaux, liaison de canal, SPN) ne sont jamais reprises
+        // du serveur : une valeur injectée ne doit ni remplacer ni doubler la nôtre.
         for (id, v) in &pairs {
-            if *id != av::FLAGS {
+            if ![av::FLAGS, av::CHANNEL_BINDINGS, av::TARGET_NAME].contains(id) {
                 push_av(&mut ti, *id, v);
             }
         }
@@ -318,7 +328,7 @@ impl NtlmClient {
             .map(|(_, v)| u32::from_le_bytes((*v).try_into().unwrap()))
             .unwrap_or(0);
         push_av(&mut ti, av::FLAGS, &(server_flags | av::FLAG_MIC_PRESENT).to_le_bytes());
-        push_av(&mut ti, av::CHANNEL_BINDINGS, &[0; 16]);
+        push_av(&mut ti, av::CHANNEL_BINDINGS, &self.channel_bindings);
         push_av(&mut ti, av::TARGET_NAME, &utf16le(&self.spn));
         push_av(&mut ti, av::EOL, &[]);
 
@@ -429,6 +439,55 @@ mod tests {
     }
 
     #[test]
+    fn channel_bindings_epa_vector() {
+        // Billet Microsoft « NTLM and Channel Binding Hash » (repris par les tests de Chromium).
+        let mut app = b"tls-server-end-point:".to_vec();
+        app.extend(h("ea05fefecc6b0bd571dbbc5baa3ed45386d0446835f7b74c85621b9983475f95"));
+        assert_eq!(channel_bindings_hash(&app).to_vec(), h("6586e99d81c2fc984e47172fd4dd0310"));
+    }
+
+    /// CHALLENGE au format de la spec (4.2.4.3) avec des AV pairs choisies.
+    fn challenge_with(target_info: &[u8]) -> Vec<u8> {
+        let name = utf16le("Server");
+        let mut m = SIGNATURE.to_vec();
+        m.extend(2u32.to_le_bytes());
+        m.extend((name.len() as u16).to_le_bytes());
+        m.extend((name.len() as u16).to_le_bytes());
+        m.extend(56u32.to_le_bytes());
+        m.extend(h("33828ae2 0123456789abcdef 0000000000000000"));
+        m.extend((target_info.len() as u16).to_le_bytes());
+        m.extend((target_info.len() as u16).to_le_bytes());
+        m.extend(((56 + name.len()) as u32).to_le_bytes());
+        m.extend(h("060070170000000f"));
+        assert_eq!(m.len(), 56);
+        m.extend(name);
+        m.extend_from_slice(target_info);
+        m
+    }
+
+    #[test]
+    fn server_cannot_inject_client_pairs() {
+        let mut ti = h("02000c0044006f006d00610069006e00 01000c00530065007200760065007200");
+        push_av(&mut ti, av::CHANNEL_BINDINGS, &[0xEE; 16]);
+        push_av(&mut ti, av::TARGET_NAME, &utf16le("TERMSRV/evil"));
+        push_av(&mut ti, av::EOL, &[]);
+        let mut c = NtlmClient::new(
+            spec_creds(),
+            Randomness { client_challenge: [0xaa; 8], exported_session_key: [0x55; 16], now_filetime: 0 },
+            "TERMSRV/pc".into(),
+            [0x11; 16],
+        );
+        c.negotiate();
+        let (auth, _) = c.authenticate(&challenge_with(&ti)).unwrap();
+        let nt = Reader(&auth).field(20).unwrap();
+        let pairs = av_pairs(&nt[16 + 28..]).unwrap();
+        let only =
+            |id: u16| -> Vec<&[u8]> { pairs.iter().filter(|(i, _)| *i == id).map(|(_, v)| *v).collect() };
+        assert_eq!(only(av::CHANNEL_BINDINGS), [&[0x11u8; 16][..]]);
+        assert_eq!(only(av::TARGET_NAME), [utf16le("TERMSRV/pc").as_slice()]);
+    }
+
+    #[test]
     fn seal_unseal_roundtrip_and_tamper() {
         let keys = SessionKeys::derive(&[7; 16]);
         let mut tx = SealingHandle::new(&keys.client_sealing, &keys.client_signing);
@@ -451,6 +510,7 @@ mod tests {
             spec_creds(),
             Randomness { client_challenge: [0xaa; 8], exported_session_key: [0x55; 16], now_filetime: 0 },
             "TERMSRV/server".into(),
+            [0x11; 16],
         );
         let neg = c.negotiate();
         assert_eq!(&neg[..8], SIGNATURE);

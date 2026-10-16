@@ -173,13 +173,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if cc.selected_protocol & (protocol::HYBRID | protocol::HYBRID_EX) != 0 {
-        let pubkey = credssp::subject_public_key(&cert)?;
         let rand = Randomness {
             client_challenge: random(),
             exported_session_key: random(),
             now_filetime: filetime_now(),
         };
-        let mut cssp = CredSspClient::new(creds, pubkey, &host, rand, random());
+        let mut cssp = CredSspClient::new(creds, &cert, &host, rand, random())?;
         send(&mut tls, &cssp.start()?).await?;
         let mut buf = Vec::new();
         loop {

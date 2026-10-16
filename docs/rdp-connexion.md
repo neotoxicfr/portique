@@ -18,7 +18,13 @@ IronRDP et FreeRDP ne servent que de référence légère.
 ## Choix
 
 - NTLM : drapeaux de mstsc (`0xE2088235`), MIC toujours présent (`MsvAvFlags`), SPN `TERMSRV/hôte`,
-  liaison de canal vide (16 zéros), réponse LM à zéro quand le serveur fournit un horodatage.
+  réponse LM à zéro quand le serveur fournit un horodatage.
+- Liaison de canal (EPA) : `MsvAvChannelBindings` = MD5 de `gss_channel_bindings` avec
+  `tls-server-end-point:` + hachage du certificat (RFC 5929 : algorithme de la signature, SHA-256
+  par défaut). Les paires propres au client (drapeaux, liaison, SPN) ne sont jamais reprises du
+  serveur.
+- CredSSP : versions 5 et 6 seulement ; les 2 à 4 n'ont pas de nonce dans la preuve de clé
+  (CVE-2018-0886).
 - Aucune crypto maison : MD4, MD5, HMAC, RC4, SHA-256 viennent de RustCrypto ; seuls les messages
   sont écrits ici. Le hasard et l'heure sont fournis par l'appelant, pour pouvoir tester.
 - Client annoncé en RDP 10.7, avec les drapeaux précoces qui ouvrent EGFX, 32 bpp, heartbeat et
@@ -29,7 +35,7 @@ IronRDP et FreeRDP ne servent que de référence légère.
 - Protocole retenu : HYBRID_EX ; drapeaux de négociation `0x2f` (EGFX supporté, restricted admin,
   redirected auth).
 - TLS 1.3.
-- NLA réussie avec un compte local (domaine vide).
+- NLA réussie avec un compte local (domaine vide), liaison de canal EPA comprise.
 - Serveur RDP 10.12 (`0x00080011`), capacités précoces `0x4` (edge actions v2), chiffrement RDP 0/0.
 - Canaux : E/S 1003, `cliprdr` 1004, `drdynvc` 1005.
 

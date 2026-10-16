@@ -117,7 +117,7 @@ pub fn content_security_policy(index_html: &str) -> String {
         let body_start = open_end + 1;
         let Some(close) = rest[body_start..].find("</script>") else { break };
         if !tag.contains("src=") {
-            let digest = sha2::Sha256::digest(rest[body_start..body_start + close].as_bytes());
+            let digest = sha2::Sha256::digest(&rest.as_bytes()[body_start..body_start + close]);
             hashes
                 .push_str(&format!(" 'sha256-{}'", base64::engine::general_purpose::STANDARD.encode(digest)));
         }

@@ -9,7 +9,7 @@ services:
       YAWRDP_LISTEN: 0.0.0.0:8090        # 8080-8083 déjà pris dans cet espace réseau
       YAWRDP_PUBLIC_URL: https://yawrdp.example.net
       YAWRDP_AUTH_MODE: proxy
-      YAWRDP_TRUSTED_PROXIES: traefik    # nom résolu toutes les 30 s (IP Docker non fixe)
+      YAWRDP_TRUSTED_PROXIES: traefik    # nom résolu toutes les 10 s (IP Docker non fixe), valable 60 s
       YAWRDP_PROXY_ADMIN_GROUP: admin
       YAWRDP_MASTER_KEY_FILE: /run/secrets/master_key
     secrets:

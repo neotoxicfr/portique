@@ -22,12 +22,12 @@ async fn main() -> anyhow::Result<()> {
     let mode = cfg.auth_mode;
     let state = build_state(cfg, db)?;
     bootstrap_admin(&state).await?;
-    // Proxys de confiance désignés par nom : résolus maintenant puis toutes les 30 s.
+    // Proxys de confiance désignés par nom : résolus maintenant puis régulièrement.
     state.cfg.proxy.refresh_trusted_hosts().await;
     let proxy = state.cfg.proxy.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(config::RESOLVE_EVERY).await;
             proxy.refresh_trusted_hosts().await;
         }
     });

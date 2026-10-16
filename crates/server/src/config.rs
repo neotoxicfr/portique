@@ -33,7 +33,8 @@ pub struct ProxyConfig {
     /// Proxys de confiance désignés par leur nom (ex. `traefik` sur un réseau Docker, dont
     /// l'adresse change à chaque redémarrage) ; résolus régulièrement (`refresh_trusted_hosts`).
     pub trusted_hosts: Vec<String>,
-    pub resolved: std::sync::Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
+    /// Dernière résolution réussie des noms : (instant, adresses).
+    pub resolved: std::sync::Arc<std::sync::RwLock<Option<(std::time::Instant, Vec<std::net::IpAddr>)>>>,
     pub user_header: String,
     pub groups_header: String,
     pub admin_group: Option<String>,
@@ -137,6 +138,10 @@ impl Config {
     }
 }
 
+/// Fréquence de résolution des proxys désignés par nom, et durée de validité d'un résultat.
+pub const RESOLVE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+pub const RESOLVED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn is_hostname(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
@@ -145,13 +150,22 @@ fn is_hostname(s: &str) -> bool {
 }
 
 impl ProxyConfig {
-    /// Adresse d'un proxy de confiance (CIDR configurés ou noms résolus) ?
+    /// Adresse d'un proxy de confiance (CIDR configurés ou noms résolus récemment) ?
     pub fn is_trusted(&self, ip: &std::net::IpAddr) -> bool {
-        self.trusted.iter().any(|n| n.contains(ip)) || self.resolved.read().unwrap().contains(ip)
+        if self.trusted.iter().any(|n| n.contains(ip)) {
+            return true;
+        }
+        // Une adresse résolue n'est fiable que peu de temps : un conteneur peut hériter de
+        // l'ancienne adresse du proxy après son redémarrage. Au-delà, on refuse (fail closed).
+        self.resolved
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(at, ips)| at.elapsed() < RESOLVED_TTL && ips.contains(ip))
     }
 
-    /// Résout les noms de proxys (au démarrage puis périodiquement). Une résolution ratée garde
-    /// les adresses connues : une panne DNS passagère ne coupe pas l'accès.
+    /// Résout les noms de proxys (au démarrage puis toutes les `RESOLVE_EVERY`). Une résolution
+    /// ratée laisse expirer les adresses connues au bout de `RESOLVED_TTL`.
     pub async fn refresh_trusted_hosts(&self) {
         if self.trusted_hosts.is_empty() {
             return;
@@ -167,10 +181,10 @@ impl ProxyConfig {
             ips.sort();
             ips.dedup();
             let mut cur = self.resolved.write().unwrap();
-            if *cur != ips {
+            if cur.as_ref().map(|(_, old)| old) != Some(&ips) {
                 tracing::info!(?ips, "proxys de confiance résolus");
-                *cur = ips;
             }
+            *cur = Some((std::time::Instant::now(), ips));
         }
     }
 }
@@ -239,6 +253,24 @@ mod tests {
         assert_eq!(c.proxy.trusted_hosts, ["traefik"]);
         assert_eq!(c.master_key[31], 31);
         assert!(c.secure_cookies);
+    }
+
+    #[test]
+    fn resolved_proxies_expire() {
+        let env = [
+            ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
+            ("YAWRDP_MASTER_KEY", KEY),
+            ("YAWRDP_AUTH_MODE", "proxy"),
+            ("YAWRDP_TRUSTED_PROXIES", "traefik"),
+        ];
+        let c = Config::from_env(&env).unwrap();
+        let ip: std::net::IpAddr = "172.20.0.45".parse().unwrap();
+        assert!(!c.proxy.is_trusted(&ip), "rien de résolu : refus");
+        *c.proxy.resolved.write().unwrap() = Some((std::time::Instant::now(), vec![ip]));
+        assert!(c.proxy.is_trusted(&ip));
+        let old = std::time::Instant::now() - RESOLVED_TTL - std::time::Duration::from_secs(1);
+        *c.proxy.resolved.write().unwrap() = Some((old, vec![ip]));
+        assert!(!c.proxy.is_trusted(&ip), "résolution périmée : refus");
     }
 
     #[test]

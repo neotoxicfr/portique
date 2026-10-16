@@ -62,8 +62,9 @@ pub fn caps_advertise(avc: bool) -> Vec<u8> {
     p
 }
 
-/// RFX_AVC420_BITMAP_STREAM : (régions, flux Annex B).
-fn avc420_stream(data: &[u8]) -> Result<(Vec<Rect>, Vec<u8>), Error> {
+/// RFX_AVC420_BITMAP_STREAM : (régions, flux Annex B). La surface totale des régions entre dans
+/// le budget de pixels d'une commande : chaque région coûte une conversion de couleur.
+fn avc420_stream(data: &[u8], budget: &mut Budget) -> Result<(Vec<Rect>, Vec<u8>), Error> {
     let mut m = R { b: data, p: 0 };
     let n = m.u32()? as usize;
     if n > 4096 {
@@ -71,7 +72,9 @@ fn avc420_stream(data: &[u8]) -> Result<(Vec<Rect>, Vec<u8>), Error> {
     }
     let mut rects = Vec::with_capacity(n);
     for _ in 0..n {
-        rects.push(m.rect16()?);
+        let r = m.rect16()?;
+        budget.spend(r.w, r.h)?;
+        rects.push(r);
     }
     m.bytes(n * 2)?; // quantQualityVals, informatifs
     Ok((rects, data[m.p..].to_vec()))
@@ -401,7 +404,7 @@ impl Gfx {
                 // Opacité seule ; le bureau est composé opaque, rien à afficher en plus.
             }
             codec::AVC420 => {
-                let (rects, stream) = avc420_stream(data)?;
+                let (rects, stream) = avc420_stream(data, &mut Budget::new())?;
                 self.pending_avc = Some(PendingAvc { surface: sid, rects, aux: None });
                 out.push(Out::Avc420 { data: stream });
             }
@@ -420,8 +423,9 @@ impl Gfx {
                     2 => (None, Some(body)),
                     _ => return Err(Error::Invalid("AVC444 : LC invalide")),
                 };
-                let main = main.map(avc420_stream).transpose()?;
-                let aux = aux.map(avc420_stream).transpose()?;
+                let mut budget = Budget::new();
+                let main = main.map(|d| avc420_stream(d, &mut budget)).transpose()?;
+                let aux = aux.map(|d| avc420_stream(d, &mut budget)).transpose()?;
                 let v2 = codec_id == codec::AVC444V2;
                 self.pending_avc = Some(PendingAvc {
                     surface: sid,
@@ -586,6 +590,33 @@ mod tests {
         ]);
         body.extend(core::iter::repeat_n(0u8, 4 * u16::MAX as usize));
         assert!(g.process(&wrap(&[create, pdu(id::SURFACE_TO_SURFACE, &body)])).is_err());
+    }
+
+    #[test]
+    fn avc_region_budget() {
+        // 4 096 régions de 8 192×8 192 : refusé dès l'analyse, aucune conversion lancée.
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &64u16.to_le_bytes(), &64u16.to_le_bytes(), &[0x20]]),
+        );
+        let mut meta = 4096u32.to_le_bytes().to_vec();
+        for _ in 0..4096 {
+            meta.extend_from_slice(&[0, 0, 0, 0, 0, 0x20, 0, 0x20]);
+        }
+        meta.extend(core::iter::repeat_n(0u8, 2 * 4096));
+        let avc = pdu(
+            id::WIRE_TO_SURFACE_1,
+            &le(&[
+                &0u16.to_le_bytes(),
+                &codec::AVC420.to_le_bytes(),
+                &[0x20],
+                &[0, 0, 0, 0, 64, 0, 64, 0],
+                &(meta.len() as u32).to_le_bytes(),
+                &meta,
+            ]),
+        );
+        assert!(g.process(&wrap(&[create, avc])).is_err());
     }
 
     #[test]

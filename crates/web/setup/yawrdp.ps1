@@ -36,19 +36,6 @@ if ($Annuler) {
   $nic = Get-ActiveNic
   if ($nic) { powercfg /devicedisablewake $nic.InterfaceDescription 2>$null | Out-Null }
   gpupdate /force | Out-Null
-# Empreinte du certificat RDP : yawrdp la montre a l'admin lors de la premiere connexion,
-# elle doit etre IDENTIQUE (sinon quelqu'un s'interpose). Certificat designe par
-# Win32_TSGeneralSetting.SSLCertificateSHA1Hash, empreinte = SHA-256 du certificat DER.
-try {
-  $ts = Get-CimInstance -Namespace root\cimv2\TerminalServices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'"
-  $cert = Get-Item ("Cert:\LocalMachine\Remote Desktop\" + $ts.SSLCertificateSHA1Hash)
-  $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
-  $fp = ([System.BitConverter]::ToString($sha) -replace '-', '').ToLower()
-  Write-Host "[ok] Empreinte du certificat RDP a comparer dans yawrdp :"
-  Write-Host "     $fp"
-} catch {
-  Write-Host '[!] Certificat RDP pas encore cree : relance ce script apres une premiere tentative de connexion.'
-}
   Write-Host 'Annule : Bureau a distance ferme, strategies retirees, pare-feu et reveil restaures.'
   return
 }
@@ -84,3 +71,17 @@ Write-Host '     Pense aussi a activer Wake-on-LAN dans le BIOS/UEFI.'
 
 gpupdate /force | Out-Null
 Write-Host '[ok] Strategies appliquees (gpupdate). Relancer ce script est sans danger.'
+
+# Empreinte du certificat RDP : yawrdp la montre a l'admin lors de la premiere connexion,
+# elle doit etre IDENTIQUE (sinon quelqu'un s'interpose). Certificat designe par
+# Win32_TSGeneralSetting.SSLCertificateSHA1Hash, empreinte = SHA-256 du certificat DER.
+try {
+  $tsg = Get-CimInstance -Namespace root\cimv2\TerminalServices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'"
+  $cert = Get-Item ("Cert:\LocalMachine\Remote Desktop\" + $tsg.SSLCertificateSHA1Hash)
+  $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+  $fp = ([System.BitConverter]::ToString($sha) -replace '-', '').ToLower()
+  Write-Host "[ok] Empreinte du certificat RDP a comparer dans yawrdp :"
+  Write-Host "     $fp"
+} catch {
+  Write-Host '[!] Certificat RDP pas encore cree : relance ce script apres une premiere tentative de connexion.'
+}

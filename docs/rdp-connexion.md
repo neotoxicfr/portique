@@ -52,3 +52,22 @@ docker run --rm --network container:wireguard \
   -e YAWRDP_PROBE_PASSWORD_FILE=/run/secrets/rdp_password \
   debian:bookworm-slim /rdp-probe
 ```
+
+## Session et EGFX : comportements de Windows mesurés (16/10/2026)
+
+- Capacités EGFX 8.1 : seules certaines combinaisons de drapeaux sont admises ; AVC420 seul (0x10) fait
+  fermer le canal graphique, il faut SMALL_CACHE | AVC420 (0x12).
+- `FRAME_ACKNOWLEDGE.totalFramesDecoded` est un compteur : y mettre l'identifiant d'image (qui saute des
+  valeurs) mène à `ERRINFO_GRAPHICSSUBSYSTEMFAILED` (0x112F) au bout de quelques secondes.
+- RemoteFX Progressive : l'état des tuiles appartient à la surface, pas au contexte de codec ; des tuiles
+  « différence » arrivent dans un contexte neuf. Effacer l'état à `DeleteEncodingContext` donne des tuiles
+  grises (127,127,128).
+- EGFX 10.x : sans `SCALEDMAP_DISABLE`, Windows emploie `MapSurfaceToScaledOutput` (0x0017).
+- Sans la stratégie « H.264 4:4:4 prioritaire », Windows (mode mixte) n'envoie pas de H.264 pour du
+  mouvement de fenêtres ; il en envoie lors d'un changement de disposition d'écrans.
+- Le canal DisplayControl s'ouvre quelques secondes après la session : une taille demandée avant doit être
+  rejouée à l'arrivée de ses capacités.
+- Presse-papier : un Ctrl+V transmis trop tôt colle l'ancien contenu ; attendre l'accusé (Format List
+  Response) de notre liste de formats, que Windows n'envoie qu'une fois notre contenu installé.
+- Le Wake-on-LAN en broadcast ne traverse pas un tunnel IP ; la commande `/tool wol` du routeur MikroTik
+  du réseau du PC, envoyée par SSH, fonctionne.

@@ -20,7 +20,7 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
 axum = { version = "0.8.9", features = ["ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 rdp-connect = { path = "../rdp-connect" }

@@ -15,5 +15,5 @@ rdp-clip = { path = "../rdp-clip" }
 rdp-pdu = { path = "../rdp-pdu" }
 rdp-session = { path = "../rdp-session" }
 anyhow = "1.0.104"
-tokio = { version = "1.53", features = ["macros", "rt", "net", "io-util", "time"] }
+tokio = { version = "1.54", features = ["macros", "rt", "net", "io-util", "time"] }
 png = "0.18.1"

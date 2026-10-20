@@ -163,6 +163,8 @@ La V1 (`v0.1.0`) couvre l'usage bureau quotidien. Pour la suite :
 ## Développement
 
 Prérequis : Rust stable (1.90 ou plus), cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev).
+`./scripts/ci.sh` lance toutes les vérifications ; `./scripts/release.sh X.Y.Z` publie une version
+(image, archive, release GitHub) depuis le poste, sans CI.
 
 ```sh
 cargo test --workspace --exclude yawrdp-web

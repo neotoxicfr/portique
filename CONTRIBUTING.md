@@ -16,6 +16,9 @@ cargo fmt --all --check
 (cd crates/web && trunk build --release --dist ../../dist)
 ```
 
+Ou tout d'un coup : `./scripts/ci.sh`. Il n'y a pas de CI GitHub : ce script fait foi et se lance avant
+chaque push.
+
 Tout ce qui est généré reste dans le dépôt et est ignoré par Git (`target/`, `dist/`, `data/`).
 
 ## Règles du projet

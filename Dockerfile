@@ -15,6 +15,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cd crates/web && trunk build --release --dist /web
 
 FROM debian:trixie-slim
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="yawrdp" \
+      org.opencontainers.image.description="Client RDP web auto-hébergé (Rust + wasm)" \
+      org.opencontainers.image.source="https://github.com/neotoxicfr/yawrdp" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data yawrdp \

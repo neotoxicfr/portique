@@ -18,8 +18,13 @@
 *.egfx
 *.dump
 
-# Scratch des sessions d'analyse
+# Scratch et consignes locales des sessions d'analyse
 /.audit/
+CLAUDE.md
+.claude/
+
+# Paquets de release construits par scripts/release.sh
+/release/
 
 # Éditeurs et systèmes
 .idea/

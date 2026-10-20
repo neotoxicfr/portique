@@ -8,6 +8,7 @@
 
 ## Liste de contrôle
 
+- [ ] `./scripts/ci.sh` passe (ou, à défaut, les étapes ci-dessous)
 - [ ] `cargo test --workspace --exclude yawrdp-web`
 - [ ] `cargo clippy` (hôte sans `yawrdp-web`, puis `yawrdp-web` en `--target wasm32-unknown-unknown`) et `cargo fmt --all --check`
 - [ ] `trunk build --release` si le front change

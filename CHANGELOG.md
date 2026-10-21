@@ -2,6 +2,16 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.1.3] - 2026-10-21
+
+### Corrigé
+
+- Écran noir quand le décodeur H.264 du navigateur garde les images en tampon (vu avec Firefox sous
+  Windows) : yawrdp attendait chaque image sans limite et l'affichage se figeait. Au-delà de 1,5 s sans
+  image (ou sans copie de l'image), le H.264 est désactivé pour ce navigateur et la session se rouvre
+  sans lui.
+- Le lien « Préparer un PC » du pied de page ne menait nulle part : le routeur du front l'interceptait.
+
 ## [v0.1.2] - 2026-10-21
 
 ### Modifié

@@ -109,7 +109,8 @@ fn Shell(children: Children) -> impl IntoView {
         <main>{children()}</main>
         <footer class="footer">
             // Lien volontairement discret vers les réglages Windows (étape 7).
-            <a href="/setup/" class="muted">"Préparer un PC"</a>
+            // rel="external" : page statique, le routeur ne doit pas intercepter le lien.
+            <a href="/setup/" rel="external" class="muted">"Préparer un PC"</a>
         </footer>
     }
 }

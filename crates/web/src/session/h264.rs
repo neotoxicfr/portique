@@ -235,17 +235,42 @@ impl H264 {
             self.codec = None;
             return Err(DecodeError::Transient(format!("décodage refusé : {e:?}")));
         }
-        let frame = match rx.await {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
+        // Un décodeur qui garde les images en tampon (attendant les suivantes) bloquerait tout le
+        // pipeline EGFX, qui attend chaque image : au-delà du délai, il est déclaré inexploitable.
+        let frame = match within(OUTPUT_TIMEOUT_MS, rx).await {
+            Some(Ok(Ok(f))) => f,
+            Some(Ok(Err(e))) => {
                 self.codec = None;
                 return Err(DecodeError::Unusable(e));
             }
-            Err(_) => return Err(DecodeError::Transient("image perdue".into())),
+            Some(Err(_)) => return Err(DecodeError::Transient("image perdue".into())),
+            None => {
+                return Err(DecodeError::Unusable(format!(
+                    "aucune image rendue par le décodeur en {OUTPUT_TIMEOUT_MS} ms (images gardées en tampon)"
+                )));
+            }
         };
-        let planes = copy_planes(&frame).await;
+        let planes = within(OUTPUT_TIMEOUT_MS, copy_planes(&frame)).await;
         frame.close();
-        planes.map_err(DecodeError::Unusable)
+        planes
+            .unwrap_or_else(|| Err(format!("copie de l'image bloquée plus de {OUTPUT_TIMEOUT_MS} ms")))
+            .map_err(DecodeError::Unusable)
+    }
+}
+
+/// Délai maximal entre l'envoi d'une image au décodeur et sa sortie (puis sa copie).
+const OUTPUT_TIMEOUT_MS: i32 = 1500;
+
+/// `fut`, ou `None` s'il n'aboutit pas en `ms` millisecondes.
+async fn within<F: std::future::Future>(ms: i32, fut: F) -> Option<F::Output> {
+    let timer = JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    }));
+    match futures::future::select(std::pin::pin!(fut), timer).await {
+        futures::future::Either::Left((v, _)) => Some(v),
+        futures::future::Either::Right(_) => None,
     }
 }
 

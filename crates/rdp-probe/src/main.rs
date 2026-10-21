@@ -157,7 +157,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                 Event::DvcOpened { channel_id, name } => {
                     println!("  canal dynamique ouvert : {name} (#{channel_id})");
                     if name == rdp_session::DVC_GRAPHICS {
-                        for f in session.dvc_send(channel_id, &rdp_gfx::caps_advertise(true)) {
+                        for f in session.dvc_send(channel_id, &rdp_gfx::caps_advertise(rdp_gfx::Avc::Full)) {
                             send(tls, &f).await?;
                         }
                     }

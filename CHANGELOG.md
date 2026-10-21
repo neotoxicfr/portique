@@ -2,6 +2,16 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.1.2] - 2026-10-21
+
+### Modifié
+
+- Firefox garde le H.264 (toujours encodé en NVENC par le PC). Son décodeur ne rend que du RGB : il
+  affiche la sous-image principale du flux 4:4:4, qui est une image 4:2:0 complète, tandis que Chrome et
+  Edge gardent le 4:4:4. L'espace BT.709 pleine plage est imposé au décodeur pour que le navigateur
+  convertisse les couleurs comme Windows les a encodées. Le repli sans H.264 de la v0.1.1 ne sert plus
+  qu'en cas d'échec réel du décodeur.
+
 ## [v0.1.1] - 2026-10-21
 
 ### Corrigé

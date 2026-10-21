@@ -51,7 +51,7 @@ pub fn SessionPage() -> impl IntoView {
         let Some(canvas) = canvas_ref.get_untracked() else { return };
         spawn_local(async move {
             // Relu à chaque ouverture : le navigateur a pu être noté inapte pendant la session.
-            let supported = h264::supported().await;
+            let avc = h264::support().await;
             if let Some(old) = engine.try_update_value(Option::take).flatten() {
                 old.close();
             }
@@ -59,7 +59,7 @@ pub fn SessionPage() -> impl IntoView {
             let on_status: Rc<dyn Fn(Status)> = Rc::new(move |s| status.set(s));
             match Engine::open(
                 canvas,
-                Open { connection_id: cid, width: w, height: h, trust, avc: supported },
+                Open { connection_id: cid, width: w, height: h, trust, avc },
                 on_status,
             ) {
                 Ok(e) => engine.set_value(Some(e)),

@@ -38,15 +38,26 @@ mod codec {
     pub const AVC444V2: u16 = 0x000F;
 }
 
+/// H.264 demandé au serveur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Avc {
+    /// Pas de H.264 : RemoteFX Progressive, ClearCodec, Planar.
+    Off,
+    /// AVC420 et AVC444 (v1/v2).
+    Full,
+}
+
 /// Annonce des capacités, le serveur choisit la plus haute qu'il connaît :
 /// - EGFX 10.7 : AVC420 et AVC444 (v1/v2), sauf AVC_DISABLED (0x20) sans décodeur H.264 ;
 ///   SCALEDMAP_DISABLE (0x80) : la sortie suit la taille des surfaces, le navigateur met à l'échelle ;
 /// - EGFX 8.1 en repli : AVC420 avec SMALL_CACHE (seules combinaisons admises par la spec).
-pub fn caps_advertise(avc: bool) -> Vec<u8> {
-    let sets: [(u32, u32); 2] = if avc {
-        [(0x000A_0701, 0x02 | 0x80), (0x0008_0105, 0x02 | 0x10)]
-    } else {
-        [(0x000A_0701, 0x02 | 0x20 | 0x80), (0x0008_0105, 0x02)]
+///
+/// Pas de mode « AVC420 seul » : la 10.x ne sait pas exclure l'AVC444 (AVC_THINCLIENT le préfère),
+/// et en 8.1 Windows ne réserve le H.264 qu'aux zones animées (mesuré le 21/10/2026).
+pub fn caps_advertise(avc: Avc) -> Vec<u8> {
+    let sets: &[(u32, u32)] = match avc {
+        Avc::Full => &[(0x000A_0701, 0x02 | 0x80), (0x0008_0105, 0x02 | 0x10)],
+        Avc::Off => &[(0x000A_0701, 0x02 | 0x20 | 0x80), (0x0008_0105, 0x02)],
     };
     let len = 8 + 2 + sets.len() * 12;
     let mut p = Vec::with_capacity(len);
@@ -54,7 +65,7 @@ pub fn caps_advertise(avc: bool) -> Vec<u8> {
     p.extend_from_slice(&0u16.to_le_bytes());
     p.extend_from_slice(&(len as u32).to_le_bytes());
     p.extend_from_slice(&(sets.len() as u16).to_le_bytes());
-    for (version, flags) in sets {
+    for &(version, flags) in sets {
         p.extend_from_slice(&version.to_le_bytes());
         p.extend_from_slice(&4u32.to_le_bytes());
         p.extend_from_slice(&flags.to_le_bytes());
@@ -469,6 +480,14 @@ impl Gfx {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn caps_off_disables_avc() {
+        let p = super::caps_advertise(super::Avc::Off);
+        assert_eq!(&p[10..14], &0x000A_0701u32.to_le_bytes());
+        assert_eq!(&p[18..22], &(0x02u32 | 0x20 | 0x80).to_le_bytes(), "AVC_DISABLED en 10.7");
+        assert_eq!(&p[30..34], &0x02u32.to_le_bytes(), "8.1 sans AVC420_ENABLED");
+    }
+
     use super::*;
 
     /// Emballe des PDU RDPGFX dans un segment ZGFX non compressé.

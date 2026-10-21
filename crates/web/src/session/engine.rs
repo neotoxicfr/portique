@@ -18,7 +18,7 @@ use yawrdp_proto::SessionMessage;
 
 use super::{
     clip,
-    h264::{self, DecodeError, H264},
+    h264::{self, DecodeError, Decoded, H264},
     views::{self, ScreenGeom, View},
 };
 
@@ -65,7 +65,7 @@ struct Inner {
     closing: bool,
     /// Fermeture volontaire suivie d'une réouverture (H.264 inexploitable par ce navigateur).
     restart: bool,
-    avc: bool,
+    avc: h264::Avc,
     clip: rdp_clip::Clipboard,
     /// Formats encore à demander au serveur pour son contenu courant.
     clip_wanted: Vec<rdp_clip::ClipFormat>,
@@ -96,7 +96,7 @@ pub struct Open {
     pub height: u32,
     /// Empreinte approuvée par l'admin pour un premier contact.
     pub trust: Option<String>,
-    pub avc: bool,
+    pub avc: h264::Avc,
 }
 
 fn ws_url(id: i64, trust: Option<&str>) -> String {
@@ -361,11 +361,11 @@ impl Engine {
         Ok(())
     }
 
-    /// H.264 inexploitable ici : on note le navigateur et on rouvre la session sans H.264.
-    fn h264_unusable(&self, reason: &str) -> Result<(), String> {
-        h264::mark_unusable(reason);
+    /// Décodeur H.264 en échec : on le désactive pour ce navigateur et on rouvre la session.
+    fn h264_disable(&self, reason: &str) -> Result<(), String> {
+        h264::disable(reason);
         self.inner.borrow_mut().restart = true;
-        Err("ce navigateur ne sait pas afficher le H.264 de Windows : reconnexion sans H.264…".into())
+        Err("le décodeur H.264 de ce navigateur a échoué : reconnexion sans H.264…".into())
     }
 
     async fn gfx_outputs(&self, channel: u32, outs: Vec<Out>, h264: &mut Option<H264>) -> Result<(), String> {
@@ -384,19 +384,13 @@ impl Engine {
                         None => Err(DecodeError::Unusable("décodeur H.264 indisponible".into())),
                     };
                     let more = match decoded {
-                        Ok(p) => {
-                            let frame = rdp_gfx::Yuv420 {
-                                width: p.width,
-                                height: p.height,
-                                y: &p.y,
-                                u: &p.u,
-                                v: &p.v,
-                                y_stride: p.y_stride,
-                                uv_stride: p.uv_stride,
-                            };
-                            self.inner.borrow_mut().gfx.submit_yuv420(&frame)
-                        }
-                        Err(DecodeError::Unusable(e)) => return self.h264_unusable(&e),
+                        Ok(Decoded::Yuv(p)) => self.inner.borrow_mut().gfx.submit_yuv420(&p.view()),
+                        Ok(Decoded::Rgba { width, height, data }) => self
+                            .inner
+                            .borrow_mut()
+                            .gfx
+                            .submit_rgba(&rdp_gfx::Rgba { width, height, data: &data, stride: width * 4 }),
+                        Err(DecodeError::Unusable(e)) => return self.h264_disable(&e),
                         Err(e) => {
                             web_sys::console::warn_1(&format!("H.264 : {e}").into());
                             self.inner.borrow_mut().gfx.skip_frame()
@@ -413,34 +407,49 @@ impl Engine {
                     let mut decoded = Vec::new();
                     let mut failed = None;
                     for part in [main, aux] {
-                        let planes = match (part, h264.as_mut()) {
+                        let frame = match (part, h264.as_mut()) {
                             (None, _) => None,
                             (Some(d), Some(dec)) => match dec.decode(&d).await {
-                                Ok(p) => Some(p),
-                                Err(DecodeError::Unusable(e)) => return self.h264_unusable(&e),
+                                Ok(f) => Some(f),
+                                Err(DecodeError::Unusable(e)) => return self.h264_disable(&e),
                                 Err(e) => {
                                     failed = Some(e);
                                     None
                                 }
                             },
-                            (Some(_), None) => return self.h264_unusable("décodeur H.264 indisponible"),
+                            (Some(_), None) => return self.h264_disable("décodeur H.264 indisponible"),
                         };
-                        decoded.push(planes);
+                        decoded.push(frame);
                     }
-                    let more = match failed {
-                        Some(e) => {
+                    let mut gfx = std::cell::RefMut::map(self.inner.borrow_mut(), |i| &mut i.gfx);
+                    let more = match (failed, &decoded[0], &decoded[1]) {
+                        (Some(e), ..) => {
                             web_sys::console::warn_1(&format!("H.264 (4:4:4) : {e}").into());
-                            self.inner.borrow_mut().gfx.skip_frame()
+                            gfx.skip_frame()
                         }
-                        None => {
-                            let (m, a) = (
-                                decoded[0].as_ref().map(|p| p.view()),
-                                decoded[1].as_ref().map(|p| p.view()),
-                            );
-                            self.inner.borrow_mut().gfx.submit_avc444(m.as_ref(), a.as_ref())
+                        // Navigateur qui ne rend que du RGB : la sous-image principale est une image
+                        // 4:2:0 complète ; l'auxiliaire (chroma) a seulement nourri le décodeur.
+                        (None, Some(Decoded::Rgba { width, height, data }), _) => {
+                            gfx.submit_rgba(&rdp_gfx::Rgba {
+                                width: *width,
+                                height: *height,
+                                data,
+                                stride: width * 4,
+                            })
+                        }
+                        (None, None, Some(Decoded::Rgba { .. })) => gfx.skip_frame(),
+                        (None, m, a) => {
+                            fn yuv(f: &Option<Decoded>) -> Option<rdp_gfx::Yuv420<'_>> {
+                                match f {
+                                    Some(Decoded::Yuv(p)) => Some(p.view()),
+                                    _ => None,
+                                }
+                            }
+                            gfx.submit_avc444(yuv(m).as_ref(), yuv(a).as_ref())
                         }
                     }
                     .map_err(|e| e.to_string())?;
+                    drop(gfx);
                     queue.extend(more);
                 }
                 Out::Ignored(t) => web_sys::console::debug_1(&t.into()),

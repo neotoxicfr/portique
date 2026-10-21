@@ -5,10 +5,12 @@
 //! `rdp-gfx` fasse la conversion BT.709 pleine plage elle-même (le navigateur supposerait la
 //! plage limitée et délaverait les couleurs).
 //!
-//! Certains navigateurs (Firefox) ne rendent que des images RGB : l'AVC444 y est impossible (il
-//! recombine des plans YUV) et la conversion faite par le navigateur fausserait la plage. Le
-//! navigateur est alors noté inapte (par user-agent, une mise à jour retente) et la session se
-//! rouvre sans H.264, en RemoteFX Progressive / ClearCodec.
+//! Certains navigateurs (Firefox) ne rendent que des images RGB, converties avec l'espace BT.709
+//! pleine plage imposé au décodeur. L'AVC420 s'affiche alors tel quel ; pour l'AVC444, la
+//! sous-image principale est elle-même une image 4:2:0 complète : on l'affiche, et la sous-image
+//! auxiliaire (détail de chroma) passe quand même par le décodeur pour garder ses références.
+//! Si le décodeur échoue franchement, le navigateur est noté (par user-agent, une mise à jour
+//! retente) et la session se rouvre sans H.264 (RemoteFX Progressive / ClearCodec).
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -18,8 +20,11 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration, PlaneLayout,
-    VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame, VideoPixelFormat,
+    VideoColorPrimaries, VideoColorSpaceInit, VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame,
+    VideoMatrixCoefficients, VideoPixelFormat, VideoTransferCharacteristics,
 };
+
+pub use rdp_gfx::Avc;
 
 /// Échec de décodage : passager (image clé attendue, image perdue) ou rédhibitoire pour ce
 /// navigateur (format d'image inexploitable, décodeur en erreur).
@@ -37,7 +42,10 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-const UNUSABLE_KEY: &str = "yawrdp.h264-unusable";
+/// User-agent du navigateur dont le décodeur H.264 a échoué (H.264 désactivé pour lui).
+const OFF_KEY: &str = "yawrdp.h264-off";
+/// Clé de la v0.1.1, posée pour les images RGB qu'on sait désormais afficher : effacée.
+const OLD_KEY: &str = "yawrdp.h264-unusable";
 
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
@@ -47,16 +55,24 @@ fn user_agent() -> String {
     web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default()
 }
 
-/// Note ce navigateur (cette version) comme inapte au H.264 de RDP.
-pub fn mark_unusable(reason: &str) {
+/// Désactive le H.264 pour ce navigateur (cette version).
+pub fn disable(reason: &str) {
     web_sys::console::warn_1(&format!("H.264 désactivé pour ce navigateur : {reason}").into());
     if let Some(s) = storage() {
-        let _ = s.set_item(UNUSABLE_KEY, &user_agent());
+        let _ = s.set_item(OFF_KEY, &user_agent());
     }
 }
 
-fn marked_unusable() -> bool {
-    storage().and_then(|s| s.get_item(UNUSABLE_KEY).ok().flatten()).is_some_and(|ua| ua == user_agent())
+fn disabled() -> bool {
+    let Some(s) = storage() else { return false };
+    let _ = s.remove_item(OLD_KEY);
+    s.get_item(OFF_KEY).ok().flatten().is_some_and(|ua| ua == user_agent())
+}
+
+/// Image décodée : plans YUV (conversion faite par `rdp-gfx`) ou RGBA déjà converti.
+pub enum Decoded {
+    Yuv(Planes),
+    Rgba { width: u32, height: u32, data: Vec<u8> },
 }
 
 /// Plans YUV420 copiés hors du GPU (u et v séparés, même pour une source NV12).
@@ -127,11 +143,15 @@ fn codec_string(data: &[u8]) -> Option<String> {
     Some(format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]))
 }
 
-/// Le navigateur sait-il décoder du H.264 ? (sinon on n'annonce pas AVC420 au serveur)
-pub async fn supported() -> bool {
-    if marked_unusable() {
-        return false;
+/// H.264 à annoncer au serveur : rien sans décodeur ni pour un navigateur dont le décodeur a échoué.
+pub async fn support() -> Avc {
+    if disabled() || !decoder_available().await {
+        return Avc::Off;
     }
+    Avc::Full
+}
+
+async fn decoder_available() -> bool {
     let Ok(ctor) = js_sys::Reflect::get(&js_sys::global(), &"VideoDecoder".into()) else { return false };
     if ctor.is_undefined() {
         return false;
@@ -178,13 +198,22 @@ impl H264 {
         let config = VideoDecoderConfig::new(codec);
         config.set_optimize_for_latency(true);
         config.set_hardware_acceleration(HardwareAcceleration::NoPreference);
+        // Windows encode en BT.709 pleine plage (MS-RDPEGFX 3.3.8.3.1) ; le flux ne le dit pas
+        // toujours. Sans effet sur les plans YUV copiés, mais juste pour une conversion RGB du
+        // navigateur.
+        let cs = VideoColorSpaceInit::new();
+        cs.set_full_range(Some(true));
+        cs.set_matrix(Some(VideoMatrixCoefficients::Bt709));
+        cs.set_primaries(Some(VideoColorPrimaries::Bt709));
+        cs.set_transfer(Some(VideoTransferCharacteristics::Bt709));
+        config.set_color_space(&cs);
         self.decoder.configure(&config).map_err(|e| format!("configuration H.264 : {e:?}"))?;
         self.codec = Some(codec.to_owned());
         Ok(())
     }
 
     /// Décode une image Annex B et renvoie ses plans.
-    pub async fn decode(&mut self, data: &[u8]) -> Result<Planes, DecodeError> {
+    pub async fn decode(&mut self, data: &[u8]) -> Result<Decoded, DecodeError> {
         let key = nal_units(data).iter().any(|(t, _)| *t == 5);
         if key
             && let Some(codec) = codec_string(data)
@@ -226,7 +255,7 @@ impl Drop for H264 {
     }
 }
 
-async fn copy_planes(frame: &VideoFrame) -> Result<Planes, String> {
+async fn copy_planes(frame: &VideoFrame) -> Result<Decoded, String> {
     let rect = frame.visible_rect().ok_or("image sans zone visible")?;
     let (width, height) = (rect.width() as u32, rect.height() as u32);
     let format = frame.format().ok_or("format d'image inconnu")?;
@@ -251,7 +280,7 @@ async fn copy_planes(frame: &VideoFrame) -> Result<Planes, String> {
             if us != vs {
                 return Err("plans U et V de pas différents".into());
             }
-            Ok(Planes {
+            Ok(Decoded::Yuv(Planes {
                 width,
                 height,
                 y: slice(yo, ys, height)?,
@@ -259,7 +288,7 @@ async fn copy_planes(frame: &VideoFrame) -> Result<Planes, String> {
                 v: slice(vo, vs, ch)?,
                 y_stride: ys,
                 uv_stride: us,
-            })
+            }))
         }
         VideoPixelFormat::Nv12 => {
             let ((yo, ys), (uvo, uvs)) = (plane(0), plane(1));
@@ -272,7 +301,28 @@ async fn copy_planes(frame: &VideoFrame) -> Result<Planes, String> {
                     v[row * cw as usize + col] = uv[s + 1];
                 }
             }
-            Ok(Planes { width, height, y: slice(yo, ys, height)?, u, v, y_stride: ys, uv_stride: cw })
+            Ok(Decoded::Yuv(Planes {
+                width,
+                height,
+                y: slice(yo, ys, height)?,
+                u,
+                v,
+                y_stride: ys,
+                uv_stride: cw,
+            }))
+        }
+        VideoPixelFormat::Rgba | VideoPixelFormat::Rgbx | VideoPixelFormat::Bgra | VideoPixelFormat::Bgrx => {
+            let bgr = matches!(format, VideoPixelFormat::Bgra | VideoPixelFormat::Bgrx);
+            let (o, stride) = plane(0);
+            let src = slice(o, stride, height)?;
+            let mut out = vec![0u8; (width * height * 4) as usize];
+            for (row, dst) in out.chunks_exact_mut((width * 4) as usize).enumerate() {
+                let line = &src[row * stride as usize..][..(width * 4) as usize];
+                for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(line.as_chunks::<4>().0) {
+                    *d = if bgr { [s[2], s[1], s[0], 0xFF] } else { [s[0], s[1], s[2], 0xFF] };
+                }
+            }
+            Ok(Decoded::Rgba { width, height, data: out })
         }
         other => Err(format!("format d'image non géré : {other:?}")),
     }

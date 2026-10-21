@@ -17,8 +17,16 @@ use alloc::{collections::BTreeMap, collections::VecDeque, string::String, vec, v
 
 use rdp_codecs::{clearcodec::ClearCodec, progressive::Progressive, zgfx::Zgfx};
 
-pub use cmd::caps_advertise;
+pub use cmd::{Avc, caps_advertise};
 pub use yuv::Yuv420;
+
+/// Image H.264 4:2:0 déjà convertie en RGBA par le navigateur (décodeurs qui ne rendent que du RGB).
+pub struct Rgba<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub data: &'a [u8],
+    pub stride: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -211,6 +219,38 @@ impl Gfx {
                         frame.to_rgba(r, &mut s.rgba, s.width)?;
                         done.push(r);
                     }
+                }
+            }
+            for r in done {
+                self.touch(p.surface, r, origin);
+            }
+        }
+        self.run()
+    }
+
+    /// Applique une image 4:2:0 (AVC420, ou sous-image principale d'un AVC444) que le navigateur a
+    /// déjà convertie en RGBA, puis reprend.
+    pub fn submit_rgba(&mut self, frame: &Rgba<'_>) -> Result<Vec<Out>, Error> {
+        if let Some(p) = self.pending_avc.take() {
+            let mut done = Vec::new();
+            let mut origin = None;
+            if let Some(s) = self.surfaces.get_mut(&p.surface) {
+                origin = s.origin;
+                for r in &p.rects {
+                    let Some(r) = r.clip(s.width, s.height) else { continue };
+                    if r.x + r.w > frame.width || r.y + r.h > frame.height {
+                        return Err(Error::Invalid("zone H.264 hors de l'image décodée"));
+                    }
+                    for row in r.y..r.y + r.h {
+                        let src = (row * frame.stride + r.x * 4) as usize;
+                        let src = frame
+                            .data
+                            .get(src..src + (r.w * 4) as usize)
+                            .ok_or(Error::Truncated("image RGBA"))?;
+                        let dst = ((row * s.width + r.x) * 4) as usize;
+                        s.rgba[dst..dst + (r.w * 4) as usize].copy_from_slice(src);
+                    }
+                    done.push(r);
                 }
             }
             for r in done {

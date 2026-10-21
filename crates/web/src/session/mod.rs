@@ -42,23 +42,16 @@ pub fn SessionPage() -> impl IntoView {
     let status = RwSignal::new(Status::Connecting("préparation…".into()));
     let attempt = RwSignal::new(0usize);
     let menu_open = RwSignal::new(false);
-    // Valeurs locales (non Send) gardées par Leptos : la poignée de session et le support H.264.
+    // Valeur locale (non Send) gardée par Leptos : la poignée de session.
     let engine = StoredValue::new_local(None::<Engine>);
-    let avc = StoredValue::new_local(None::<bool>);
 
     // Ouverture (et réouverture) de la session.
     let open = move |trust: Option<String>| {
         let Some(cid) = id() else { return };
         let Some(canvas) = canvas_ref.get_untracked() else { return };
         spawn_local(async move {
-            let supported = match avc.get_value() {
-                Some(v) => v,
-                None => {
-                    let v = h264::supported().await;
-                    avc.set_value(Some(v));
-                    v
-                }
-            };
+            // Relu à chaque ouverture : le navigateur a pu être noté inapte pendant la session.
+            let supported = h264::supported().await;
             if let Some(old) = engine.try_update_value(Option::take).flatten() {
                 old.close();
             }

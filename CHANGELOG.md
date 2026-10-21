@@ -2,6 +2,14 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.1.1] - 2026-10-21
+
+### Corrigé
+
+- Écran noir dans Firefox. Son décodeur WebCodecs ne rend que des images RGB, alors que le H.264 4:4:4
+  de RDP a besoin des plans YUV. À la première image inexploitable, le navigateur est noté inapte (par
+  version) et la session se rouvre seule sans H.264 (RemoteFX Progressive / ClearCodec).
+
 ## [v0.1.0] - 2026-10-20
 
 Première version.

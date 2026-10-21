@@ -4,6 +4,11 @@
 //! le décodeur, on attend l'image décodée, puis on copie ses plans (I420 ou NV12) pour que
 //! `rdp-gfx` fasse la conversion BT.709 pleine plage elle-même (le navigateur supposerait la
 //! plage limitée et délaverait les couleurs).
+//!
+//! Certains navigateurs (Firefox) ne rendent que des images RGB : l'AVC444 y est impossible (il
+//! recombine des plans YUV) et la conversion faite par le navigateur fausserait la plage. Le
+//! navigateur est alors noté inapte (par user-agent, une mise à jour retente) et la session se
+//! rouvre sans H.264, en RemoteFX Progressive / ClearCodec.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -15,6 +20,44 @@ use web_sys::{
     EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HardwareAcceleration, PlaneLayout,
     VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame, VideoPixelFormat,
 };
+
+/// Échec de décodage : passager (image clé attendue, image perdue) ou rédhibitoire pour ce
+/// navigateur (format d'image inexploitable, décodeur en erreur).
+#[derive(Debug)]
+pub enum DecodeError {
+    Transient(String),
+    Unusable(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(e) | Self::Unusable(e) => f.write_str(e),
+        }
+    }
+}
+
+const UNUSABLE_KEY: &str = "yawrdp.h264-unusable";
+
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+fn user_agent() -> String {
+    web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default()
+}
+
+/// Note ce navigateur (cette version) comme inapte au H.264 de RDP.
+pub fn mark_unusable(reason: &str) {
+    web_sys::console::warn_1(&format!("H.264 désactivé pour ce navigateur : {reason}").into());
+    if let Some(s) = storage() {
+        let _ = s.set_item(UNUSABLE_KEY, &user_agent());
+    }
+}
+
+fn marked_unusable() -> bool {
+    storage().and_then(|s| s.get_item(UNUSABLE_KEY).ok().flatten()).is_some_and(|ua| ua == user_agent())
+}
 
 /// Plans YUV420 copiés hors du GPU (u et v séparés, même pour une source NV12).
 pub struct Planes {
@@ -86,6 +129,9 @@ fn codec_string(data: &[u8]) -> Option<String> {
 
 /// Le navigateur sait-il décoder du H.264 ? (sinon on n'annonce pas AVC420 au serveur)
 pub async fn supported() -> bool {
+    if marked_unusable() {
+        return false;
+    }
     let Ok(ctor) = js_sys::Reflect::get(&js_sys::global(), &"VideoDecoder".into()) else { return false };
     if ctor.is_undefined() {
         return false;
@@ -138,16 +184,16 @@ impl H264 {
     }
 
     /// Décode une image Annex B et renvoie ses plans.
-    pub async fn decode(&mut self, data: &[u8]) -> Result<Planes, String> {
+    pub async fn decode(&mut self, data: &[u8]) -> Result<Planes, DecodeError> {
         let key = nal_units(data).iter().any(|(t, _)| *t == 5);
         if key
             && let Some(codec) = codec_string(data)
             && self.codec.as_deref() != Some(&codec)
         {
-            self.configure(&codec)?;
+            self.configure(&codec).map_err(DecodeError::Unusable)?;
         }
         if self.codec.is_none() || self.decoder.state() != web_sys::CodecState::Configured {
-            return Err("en attente d'une image clé".into());
+            return Err(DecodeError::Transient("en attente d'une image clé".into()));
         }
         let (tx, rx) = oneshot::channel();
         *self.slot.borrow_mut() = Some(tx);
@@ -155,22 +201,22 @@ impl H264 {
         let kind = if key { EncodedVideoChunkType::Key } else { EncodedVideoChunkType::Delta };
         self.timestamp = self.timestamp.wrapping_add(16_667);
         let init = EncodedVideoChunkInit::new(&bytes, self.timestamp, kind);
-        let chunk = EncodedVideoChunk::new(&init).map_err(|e| format!("{e:?}"))?;
+        let chunk = EncodedVideoChunk::new(&init).map_err(|e| DecodeError::Transient(format!("{e:?}")))?;
         if let Err(e) = self.decoder.decode(&chunk) {
             self.codec = None;
-            return Err(format!("décodage refusé : {e:?}"));
+            return Err(DecodeError::Transient(format!("décodage refusé : {e:?}")));
         }
         let frame = match rx.await {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
                 self.codec = None;
-                return Err(e);
+                return Err(DecodeError::Unusable(e));
             }
-            Err(_) => return Err("image perdue".into()),
+            Err(_) => return Err(DecodeError::Transient("image perdue".into())),
         };
         let planes = copy_planes(&frame).await;
         frame.close();
-        planes
+        planes.map_err(DecodeError::Unusable)
     }
 }
 

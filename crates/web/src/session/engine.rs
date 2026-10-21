@@ -18,7 +18,7 @@ use yawrdp_proto::SessionMessage;
 
 use super::{
     clip,
-    h264::H264,
+    h264::{self, DecodeError, H264},
     views::{self, ScreenGeom, View},
 };
 
@@ -63,6 +63,8 @@ struct Inner {
     pressed: HashSet<(u8, bool)>,
     connected: bool,
     closing: bool,
+    /// Fermeture volontaire suivie d'une réouverture (H.264 inexploitable par ce navigateur).
+    restart: bool,
     avc: bool,
     clip: rdp_clip::Clipboard,
     /// Formats encore à demander au serveur pour son contenu courant.
@@ -135,6 +137,7 @@ impl Engine {
             pressed: HashSet::new(),
             connected: false,
             closing: false,
+            restart: false,
             avc: opts.avc,
             clip: rdp_clip::Clipboard::new(),
             clip_wanted: Vec::new(),
@@ -213,7 +216,8 @@ impl Engine {
                 }
             };
             if let Err(e) = result {
-                (self.status)(Status::Closed { reason: e, retry: false });
+                let retry = self.inner.borrow().restart;
+                (self.status)(Status::Closed { reason: e, retry });
                 self.inner.borrow_mut().closing = true;
                 let _ = self.inner.borrow().ws.close();
                 break;
@@ -357,6 +361,13 @@ impl Engine {
         Ok(())
     }
 
+    /// H.264 inexploitable ici : on note le navigateur et on rouvre la session sans H.264.
+    fn h264_unusable(&self, reason: &str) -> Result<(), String> {
+        h264::mark_unusable(reason);
+        self.inner.borrow_mut().restart = true;
+        Err("ce navigateur ne sait pas afficher le H.264 de Windows : reconnexion sans H.264…".into())
+    }
+
     async fn gfx_outputs(&self, channel: u32, outs: Vec<Out>, h264: &mut Option<H264>) -> Result<(), String> {
         let mut queue: std::collections::VecDeque<Out> = outs.into();
         while let Some(o) = queue.pop_front() {
@@ -370,7 +381,7 @@ impl Engine {
                     }
                     let decoded = match h264.as_mut() {
                         Some(d) => d.decode(&data).await,
-                        None => Err("décodeur H.264 indisponible".into()),
+                        None => Err(DecodeError::Unusable("décodeur H.264 indisponible".into())),
                     };
                     let more = match decoded {
                         Ok(p) => {
@@ -385,6 +396,7 @@ impl Engine {
                             };
                             self.inner.borrow_mut().gfx.submit_yuv420(&frame)
                         }
+                        Err(DecodeError::Unusable(e)) => return self.h264_unusable(&e),
                         Err(e) => {
                             web_sys::console::warn_1(&format!("H.264 : {e}").into());
                             self.inner.borrow_mut().gfx.skip_frame()
@@ -405,15 +417,13 @@ impl Engine {
                             (None, _) => None,
                             (Some(d), Some(dec)) => match dec.decode(&d).await {
                                 Ok(p) => Some(p),
+                                Err(DecodeError::Unusable(e)) => return self.h264_unusable(&e),
                                 Err(e) => {
                                     failed = Some(e);
                                     None
                                 }
                             },
-                            (Some(_), None) => {
-                                failed = Some("décodeur H.264 indisponible".into());
-                                None
-                            }
+                            (Some(_), None) => return self.h264_unusable("décodeur H.264 indisponible"),
                         };
                         decoded.push(planes);
                     }

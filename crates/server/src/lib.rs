@@ -156,6 +156,22 @@ impl CspCache {
     }
 }
 
+/// Cache des fichiers du front : les noms empreintés par trunk (`nom-<16 hex>.ext`) ne changent
+/// jamais de contenu ; le reste (page, service worker, manifeste, scripts de préparation) est
+/// revalidé à chaque fois, sinon le navigateur garde une ancienne page qui charge un ancien front.
+fn static_cache_control(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    let fingerprinted = stem
+        .rsplit_once('-')
+        .map(|(_, h)| h.split('_').next().unwrap_or_default()) // `…-<hex>_bg.wasm`
+        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    Some(if fingerprinted { "public, max-age=31536000, immutable" } else { "no-cache" })
+}
+
 pub fn app(state: AppState) -> Router {
     let static_dir = state.cfg.static_dir.clone();
     let spa = ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
@@ -176,9 +192,13 @@ pub fn app(state: AppState) -> Router {
         .fallback_service(spa)
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let value = csp.current();
+            let cache = static_cache_control(req.uri().path());
             async move {
                 let mut res = next.run(req).await;
                 res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, value);
+                if let Some(c) = cache {
+                    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
+                }
                 res
             }
         }))
@@ -191,6 +211,18 @@ pub fn app(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn static_cache_control_by_name() {
+        use super::static_cache_control as c;
+        assert_eq!(c("/yawrdp-web-705c14e6e4113241_bg.wasm"), Some("public, max-age=31536000, immutable"));
+        assert_eq!(c("/style-d9330bfebee7e4ea.css"), Some("public, max-age=31536000, immutable"));
+        assert_eq!(c("/"), Some("no-cache"));
+        assert_eq!(c("/session/1"), Some("no-cache"));
+        assert_eq!(c("/sw.js"), Some("no-cache"));
+        assert_eq!(c("/setup/yawrdp.ps1"), Some("no-cache"));
+        assert_eq!(c("/api/me"), None);
+    }
+
     #[test]
     fn csp_hashes_inline_scripts_only() {
         let html = r#"<script type="module">init()</script><script src="/x.js"></script>"#;

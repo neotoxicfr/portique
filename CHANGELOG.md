@@ -2,6 +2,16 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.1.4] - 2026-10-21
+
+### Corrigé
+
+- Le navigateur pouvait garder indéfiniment une ancienne version de la page, et donc de l'appli :
+  aucun en-tête de cache n'était envoyé. La page, le service worker, le manifeste et les scripts de
+  préparation sont désormais revalidés à chaque chargement (`no-cache`). Les fichiers empreintés par
+  trunk sont mis en cache un an (`immutable`). Le service worker change de cache, ce qui purge l'ancienne
+  coquille.
+
 ## [v0.1.3] - 2026-10-21
 
 ### Corrigé

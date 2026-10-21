@@ -2793,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-auth"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "hmac",
  "md-5",
@@ -2804,15 +2804,15 @@ dependencies = [
 
 [[package]]
 name = "rdp-clip"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "rdp-codecs"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "rdp-connect"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rand 0.10.3",
  "rdp-auth",
@@ -2826,18 +2826,18 @@ dependencies = [
 
 [[package]]
 name = "rdp-gfx"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rdp-codecs",
 ]
 
 [[package]]
 name = "rdp-pdu"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "rdp-probe"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "png",
@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-session"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rdp-pdu",
 ]
@@ -4877,7 +4877,7 @@ checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yawrdp-proto"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "uuid",
@@ -4885,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "yawrdp-server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4923,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "yawrdp-web"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "console_error_panic_hook",
  "futures",

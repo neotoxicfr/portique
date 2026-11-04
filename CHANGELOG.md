@@ -9,6 +9,9 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 - `tokio` 1.54.1 (RUSTSEC-2026-0384, condition de course dans `time::Interval`), `rustls-webpki` 0.103.16
   (RUSTSEC-2026-0382, intermédiaires retirés de la confiance), `crypto-bigint` 0.7.10 (RUSTSEC-2026-0387)
   et `ctutils` 0.4.8 (RUSTSEC-2026-0385), deux correctifs de temps constant.
+- `russh` 0.65.1 (Wake-on-LAN par SSH) : allocations sans limite via EXT_INFO d'un serveur malveillant
+  (GHSA-4p9f-7p9m-5vfg), canal bloqué par une taille de paquet nulle (GHSA-fw5c-8223-6h42), `kex_done`
+  appelé avant la vérification de la clé d'hôte (GHSA-9264-jvgf-6w2f).
 - `cargo audit` fait partie de `scripts/ci.sh` ; seule exception : `rsa` (RUSTSEC-2023-0071, sans
   correctif), non atteignable, justifiée dans `.cargo/audit.toml`.
 

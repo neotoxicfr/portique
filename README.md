@@ -7,7 +7,7 @@
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.1.4-green)
+![Version](https://img.shields.io/badge/version-v0.1.5-green)
 
 </div>
 

@@ -1,0 +1,8 @@
+# cargo audit (lancé par scripts/ci.sh). Chaque exception dit pourquoi elle n'est pas atteignable.
+[advisories]
+ignore = [
+    # rsa 0.10 (Marvin, timing sur le déchiffrement/la signature RSA), aucun correctif publié.
+    # Seul russh l'utilise, côté client SSH du Wake-on-LAN : vérification de la clé publique de
+    # l'hôte, aucune clé privée RSA chez nous (authentification par mot de passe). 04/11/2026.
+    "RUSTSEC-2023-0071",
+]

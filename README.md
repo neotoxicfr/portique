@@ -164,7 +164,8 @@ La V1 (`v0.1.0`) couvre l'usage bureau quotidien. Pour la suite :
 
 Prérequis : Rust stable (1.90 ou plus), cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev).
 `./scripts/ci.sh` lance toutes les vérifications ; `./scripts/release.sh X.Y.Z` publie une version
-(image, archive, release GitHub) depuis le poste, sans CI.
+(image, archive, release GitHub) depuis le poste, sans CI ; `./scripts/publish-dev.sh` republie l'image
+de branche `ghcr.io/neotoxicfr/yawrdp:dev` après chaque livraison sur `dev`.
 
 ```sh
 cargo test --workspace --exclude yawrdp-web

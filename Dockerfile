@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # yawrdp : serveur (Rust) + front wasm (Leptos, trunk) dans une image Debian minimale.
 
-FROM rust:1.99.1-slim-trixie AS build
+FROM rust:1.100.0-slim-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends perl make pkg-config \
  && rm -rf /var/lib/apt/lists/* \
  && rustup target add wasm32-unknown-unknown \

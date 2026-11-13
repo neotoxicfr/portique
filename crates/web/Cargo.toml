@@ -17,7 +17,7 @@ rdp-pdu = { path = "../rdp-pdu" }
 rdp-session = { path = "../rdp-session" }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
-leptos = { version = "0.8.22", features = ["csr"] }
+leptos = { version = "0.8.23", features = ["csr"] }
 leptos_router = "0.8.17"
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
 wasm-bindgen = "0.2.129"

@@ -1,0 +1,18 @@
+# Dépôt privé : pas de CI GitHub. Dependabot propose les montées sur dev (qui reçoit tout) ;
+# chaque PR passe par la routine locale (changelog lu, scripts/ci.sh) avant fusion.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 0
+  - package-ecosystem: docker
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 0

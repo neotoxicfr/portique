@@ -1,5 +1,5 @@
 # Dépôt privé : pas de CI GitHub. Dependabot propose les montées sur dev (qui reçoit tout) ;
-# chaque PR passe par la routine locale (changelog lu, scripts/ci.sh) avant fusion.
+# Aucun délai (cooldown) : exclude "*" y soustrait toutes les dépendances. Chaque PR passe par la routine locale (changelog lu, scripts/ci.sh) avant fusion.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -8,11 +8,11 @@ updates:
     schedule:
       interval: daily
     cooldown:
-      default-days: 0
+      exclude: ["*"]
   - package-ecosystem: docker
     directory: /
     target-branch: dev
     schedule:
       interval: daily
     cooldown:
-      default-days: 0
+      exclude: ["*"]

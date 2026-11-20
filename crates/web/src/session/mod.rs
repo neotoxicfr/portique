@@ -39,7 +39,7 @@ pub fn SessionPage() -> impl IntoView {
     let params = use_params_map();
     let id = move || params.with(|p| p.get("id").and_then(|s| s.parse::<i64>().ok()));
     let canvas_ref = NodeRef::<Canvas>::new();
-    let status = RwSignal::new(Status::Connecting("préparation…".into()));
+    let status = RwSignal::new(Status::Connecting("Préparation…".into()));
     let attempt = RwSignal::new(0usize);
     let menu_open = RwSignal::new(false);
     // Valeur locale (non Send) gardée par Leptos : la poignée de session.
@@ -88,7 +88,7 @@ pub fn SessionPage() -> impl IntoView {
                 let n = attempt.get_untracked();
                 if n < RETRY_DELAYS.len() {
                     let delay = RETRY_DELAYS[n];
-                    status.set(Status::Connecting(format!("connexion perdue, nouvel essai dans {delay} s…")));
+                    status.set(Status::Connecting(format!("Connexion perdue, nouvel essai dans {delay} s…")));
                     spawn_local(async move {
                         sleep(delay).await;
                         attempt.update(|a| *a += 1);
@@ -260,10 +260,16 @@ pub fn SessionPage() -> impl IntoView {
             {move || {
                 match status.get() {
                     Status::Connected => None,
-                    Status::Connecting(t) => Some(view! { <div class="session-overlay"><p>{t}</p></div> }.into_any()),
+                    Status::Connecting(t) => Some(view! {
+                        <div class="session-overlay">
+                            <div class="spinner" aria-hidden="true"></div>
+                            <p role="status">{t}</p>
+                            <a href="/" class="button secondary">"Retour"</a>
+                        </div>
+                    }.into_any()),
                     Status::Closed { reason, .. } => Some(view! {
                         <div class="session-overlay">
-                            <p class="error">{reason}</p>
+                            <p class="error" role="alert">{crate::sentence(&reason)}</p>
                             <div class="row">
                                 <button on:click=retry>"Réessayer"</button>
                                 <a href="/" class="button secondary">"Retour"</a>

@@ -47,11 +47,32 @@ pub async fn open(
     if !same_origin(&headers, &state.cfg.public_url) {
         return Err(AppError::Forbidden);
     }
+    // Empreinte du cookie de session : la session RDP tombe si la session web est révoquée.
+    let token = axum_extra::extract::CookieJar::from_headers(&headers)
+        .get(crate::auth::SESSION_COOKIE)
+        .map(|c| crate::crypto::token_hash(c.value()));
+    // Refus transmis par le WebSocket : le navigateur ne montre pas le corps d'un refus HTTP à l'ouverture.
+    let prepared = prepare(&state, &user, id, q.trust.as_deref()).await;
+    Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| async move {
+        match prepared {
+            Ok((row, trust)) => run(state, user, ip, row, trust, token, socket).await,
+            Err(e) => fail(socket, crate::state::user_message(e)).await,
+        }
+    }))
+}
+
+/// Contrôles d'accès d'une ouverture de bureau : hôte autorisé et en RDP, approbation réservée aux admins.
+async fn prepare(
+    state: &AppState,
+    user: &UserRow,
+    id: i64,
+    trust: Option<&str>,
+) -> ApiResult<(Row, Option<[u8; 32]>)> {
     let row = find_allowed(&state.db, user.id, user.is_admin, id).await?;
     if !row.rdp_enabled {
         return Err(bad("pas de RDP sur cet hôte"));
     }
-    let trust = match q.trust.as_deref() {
+    let trust = match trust {
         Some(t) if user.is_admin => Some(
             <[u8; 32]>::try_from(hex::decode(t).map_err(|_| bad("empreinte invalide"))?)
                 .map_err(|_| bad("empreinte invalide"))?,
@@ -59,11 +80,7 @@ pub async fn open(
         Some(_) => return Err(AppError::Forbidden),
         None => None,
     };
-    // Empreinte du cookie de session : la session RDP tombe si la session web est révoquée.
-    let token = axum_extra::extract::CookieJar::from_headers(&headers)
-        .get(crate::auth::SESSION_COOKIE)
-        .map(|c| crate::crypto::token_hash(c.value()));
-    Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| run(state, user, ip, row, trust, token, socket)))
+    Ok((row, trust))
 }
 
 async fn send_text(socket: &mut WebSocket, msg: &SessionMessage) {

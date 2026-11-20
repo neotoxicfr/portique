@@ -79,6 +79,20 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
+/// Message à montrer à l'utilisateur pour un refus transmis autrement qu'en HTTP (WebSocket) ; une
+/// erreur interne est journalisée et reste générique.
+pub fn user_message(e: AppError) -> String {
+    match e {
+        AppError::NotFound => "connexion introuvable, ou plus autorisée pour ce compte".into(),
+        AppError::Forbidden => "action réservée aux admins".into(),
+        AppError::Internal(e) => {
+            tracing::error!("{e:#}");
+            "erreur interne du serveur (détail dans son journal)".into()
+        }
+        other => other.to_string(),
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {

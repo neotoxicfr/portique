@@ -217,7 +217,7 @@ pub fn SshPage() -> impl IntoView {
     let params = use_params_map();
     let id = move || params.with_untracked(|p| p.get("id").and_then(|s| s.parse::<i64>().ok()));
     let term_ref = NodeRef::<Div>::new();
-    let status = RwSignal::new(Status::Loading("chargement du terminal…".into()));
+    let status = RwSignal::new(Status::Loading("Chargement du terminal…".into()));
     let combos = RwSignal::new(Vec::<String>::new());
     let ctrl = RwSignal::new(false);
     let alt = RwSignal::new(false);
@@ -231,7 +231,7 @@ pub fn SshPage() -> impl IntoView {
         let Some(id) = id() else { return };
         let Some(l) = live.get_value() else { return };
         l.close();
-        status.set(Status::Loading("connexion…".into()));
+        status.set(Status::Loading("Connexion…".into()));
         let size = (l.term.cols(), l.term.rows());
         *l.size.borrow_mut() = size;
         let Ok(ws) = WebSocket::new(&ws_url(id, size, trust.as_ref())) else {
@@ -266,7 +266,7 @@ pub fn SshPage() -> impl IntoView {
         let onclose = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |_| {
             status.update(|s| {
                 if matches!(s, Status::Connected | Status::Loading(_)) {
-                    *s = Status::Closed("session terminée".into());
+                    *s = Status::Closed("Session terminée.".into());
                 }
             });
         });
@@ -372,8 +372,8 @@ pub fn SshPage() -> impl IntoView {
             style:height=move || frame.get().map(|(h, _)| format!("{h}px"))
             style:top=move || frame.get().map(|(_, t)| format!("{t}px"))>
             <div class="ssh-top">
-                <a href="/" class="ssh-back" title="Retour aux connexions">"←"</a>
-                <button class="ssh-toggle" title="Barre de touches" on:click=move |_| {
+                <a href="/" class="ssh-back" title="Retour aux connexions" aria-label="Retour aux connexions">"←"</a>
+                <button class="ssh-toggle" title="Afficher ou masquer la barre de touches" aria-label="Barre de touches" on:click=move |_| {
                     show_bar.update(|s| *s = !*s);
                     let cb = Closure::once_into_js(move || if let Some(l) = live.get_value() { l.refit() });
                     let _ = window().request_animation_frame(cb.unchecked_ref());
@@ -400,10 +400,16 @@ pub fn SshPage() -> impl IntoView {
             </Show>
             {move || match status.get() {
                 Status::Connected => None,
-                Status::Loading(t) => Some(view! { <div class="session-overlay"><p>{t}</p></div> }.into_any()),
+                Status::Loading(t) => Some(view! {
+                    <div class="session-overlay">
+                        <div class="spinner" aria-hidden="true"></div>
+                        <p role="status">{t}</p>
+                        <a href="/" class="button secondary">"Retour"</a>
+                    </div>
+                }.into_any()),
                 Status::Closed(reason) => Some(view! {
                     <div class="session-overlay">
-                        <p class="error">{reason}</p>
+                        <p class="error" role="alert">{crate::sentence(&reason)}</p>
                         <div class="row">
                             <button on:click=move |_| connect(None)>"Reconnecter"</button>
                             <a href="/" class="button secondary">"Retour"</a>

@@ -36,6 +36,17 @@ impl Session {
     }
 }
 
+/// Message serveur affiché comme une phrase : majuscule initiale et point final.
+pub fn sentence(s: &str) -> String {
+    let mut c = s.trim().chars();
+    let Some(first) = c.next() else { return String::new() };
+    let mut out: String = first.to_uppercase().chain(c).collect();
+    if !out.ends_with(['.', '!', '?', '…', ':']) {
+        out.push('.');
+    }
+    out
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     // PWA : appli installable (le service worker ne met jamais l'API ni la session en cache).

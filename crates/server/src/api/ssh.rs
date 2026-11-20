@@ -68,33 +68,58 @@ pub async fn open(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
+    // Contrôle d'origine : refus net, c'est lui qui protège le WebSocket des pages tierces.
     if !same_origin(&headers, &state.cfg.public_url) {
         return Err(AppError::Forbidden);
-    }
-    let row = find_allowed(&state.db, user.id, user.is_admin, id).await?;
-    if !row.ssh_enabled {
-        return Err(bad("pas de SSH sur cet hôte"));
     }
     let token = axum_extra::extract::CookieJar::from_headers(&headers)
         .get(crate::auth::SESSION_COOKIE)
         .map(|c| crate::crypto::token_hash(c.value()));
-    if !session_has_mfa(&state, &user, token.as_deref()).await? {
+    let size = (q.cols.unwrap_or(80).clamp(10, 500), q.rows.unwrap_or(24).clamp(5, 300));
+    // Les autres refus passent par le WebSocket : le navigateur ne montre pas le corps d'un refus HTTP
+    // à l'ouverture, l'utilisateur ne verrait que « session terminée » sans la raison.
+    let prepared = prepare(&state, &user, id, q.trust.zip(q.trust_for), token.as_deref()).await;
+    Ok(ws.max_message_size(1 << 20).on_upgrade(move |mut socket| async move {
+        match prepared {
+            Ok((hops, host_theme, trust)) => {
+                run(state, user, ip, hops, host_theme, trust, size, token, socket).await
+            }
+            Err(e) => {
+                send(&mut socket, &SshMessage::Error { message: crate::state::user_message(e) }).await;
+                let _ = socket.close().await;
+            }
+        }
+    }))
+}
+
+type Prepared = (Vec<Hop>, Option<String>, Option<(i64, String)>);
+
+/// Contrôles d'accès d'une ouverture de terminal : hôte autorisé et en SSH, session à double
+/// authentification, approbation de clé réservée aux admins.
+async fn prepare(
+    state: &AppState,
+    user: &UserRow,
+    id: i64,
+    trust: Option<(String, i64)>,
+    token: Option<&[u8]>,
+) -> ApiResult<Prepared> {
+    let row = find_allowed(&state.db, user.id, user.is_admin, id).await?;
+    if !row.ssh_enabled {
+        return Err(bad("pas de SSH sur cet hôte"));
+    }
+    if !session_has_mfa(state, user, token).await? {
         return Err(bad(
             "le SSH exige une session ouverte avec la double authentification : active un TOTP ou une passkey, \
              puis reconnecte-toi avec",
         ));
     }
-    let trust = match (q.trust, q.trust_for) {
-        (Some(fp), Some(host)) if user.is_admin => Some((host, fp)),
-        (None, _) => None,
-        _ => return Err(AppError::Forbidden),
+    let trust = match trust {
+        Some((fp, host)) if user.is_admin => Some((host, fp)),
+        Some(_) => return Err(AppError::Forbidden),
+        None => None,
     };
     let host_theme = row.ssh_theme.clone();
-    let hops = chain(&state, row).await?;
-    let size = (q.cols.unwrap_or(80).clamp(10, 500), q.rows.unwrap_or(24).clamp(5, 300));
-    Ok(ws
-        .max_message_size(1 << 20)
-        .on_upgrade(move |socket| run(state, user, ip, hops, host_theme, trust, size, token, socket)))
+    Ok((chain(state, row).await?, host_theme, trust))
 }
 
 /// Chaîne des sauts, premier rebond d'abord, cible en dernier. Les rebonds n'ont pas à être

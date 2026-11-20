@@ -50,6 +50,7 @@ pub fn Login() -> impl IntoView {
     view! {
         <main class="center">
             <form class="card login" on:submit=submit>
+                <img class="login-icon" src="/icon.svg" alt=""/>
                 <h1>"Portique"</h1>
                 <label>"Identifiant"
                     <input type="text" autocomplete="username webauthn" required

@@ -151,10 +151,11 @@ a.button.secondary { background: transparent; color: var(--accent); }
 .ssh { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; display: flex; flex-direction: column; background: #111317; }
 .ssh-top { position: absolute; top: 4px; right: 8px; z-index: 2; display: flex; gap: 6px; }
 .ssh-top a, .ssh-top button {
-  min-height: 0; padding: 2px 10px; border-radius: 8px; border: none; text-decoration: none;
-  background: rgba(30, 32, 38, 0.75); color: #fff; opacity: 0.55; font-size: 0.95rem; line-height: 1.4;
+  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px;
+  padding: 0 10px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.18); text-decoration: none;
+  background: rgba(30, 32, 38, 0.85); color: #fff; opacity: 0.8; font-size: 1.05rem;
 }
-.ssh-top a:hover, .ssh-top button:hover { opacity: 1; }
+.ssh-top a:hover, .ssh-top button:hover, .ssh-top a:focus-visible, .ssh-top button:focus-visible { opacity: 1; }
 .ssh-term { flex: 1; min-height: 0; padding: 4px 0 0 4px; }
 .keybar {
   display: flex; gap: 6px; padding: 6px; overflow-x: auto; flex-shrink: 0;
@@ -167,3 +168,31 @@ a.button.secondary { background: transparent; color: var(--accent); }
 }
 .keybar .key.on { background: #3d5afe; border-color: #3d5afe; color: #fff; }
 .keybar .key.combo { font-family: ui-monospace, monospace; font-size: 0.8rem; }
+
+/* Indicateur d'attente des sessions (RDP, SSH). */
+.spinner {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 3px solid rgba(231, 233, 237, 0.2); border-top-color: #e7e9ed;
+  animation: tourne 0.9s linear infinite;
+}
+@keyframes tourne { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+/* Clé du service : la ligne entière, lisible et sélectionnable. */
+.card textarea.key { width: 100%; resize: vertical; white-space: pre-wrap; word-break: break-all; }
+
+/* Téléphone : les tableaux de l'admin deviennent des cartes, actions comprises. */
+@media (max-width: 640px) {
+  .table-wrap table, .table-wrap tbody, .table-wrap tr, .table-wrap td { display: block; width: 100%; }
+  .table-wrap thead { display: none; }
+  .table-wrap tr { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; }
+  .table-wrap td { border: none; padding: 3px 0; white-space: normal; }
+  .table-wrap td:first-child { font-weight: 600; }
+  .table-wrap td:empty { display: none; }
+  td.cell-actions { text-align: left; display: flex; gap: 20px; padding-top: 8px; }
+  td.cell-actions button { min-height: 40px; }
+}
+
+.login-icon { display: block; width: 56px; height: 56px; margin: 0 auto 8px; }
+
+fieldset.column { flex-direction: column; align-items: stretch; }

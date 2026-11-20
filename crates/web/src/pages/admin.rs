@@ -423,9 +423,9 @@ fn Connections(
                                     })}
                                 </fieldset>
                             </Show>
-                            <label>"MAC (WoL)"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
-                            <fieldset class="full">
-                                <legend>"Réveil (Wake-on-LAN) — MAC ci-dessus"</legend>
+                            <fieldset class="full column">
+                                <legend>"Réveil (Wake-on-LAN, facultatif)"</legend>
+                                <label>"Adresse MAC de la machine"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
                                 <label class="check">
                                     <input type="radio" name="wolmode" prop:checked=move || !f.wol_by_command.get()
                                         on:change=move |_| f.wol_by_command.set(false)/>
@@ -558,7 +558,7 @@ fn ServiceKeyPanel() -> impl IntoView {
                     <input type="text" class="mono" placeholder="192.0.2.10,198.51.100.0/24" prop:value=move || from.get() on:input=input(from)/>
                 </label>
             </Show>
-            <textarea class="mono" readonly rows="3" prop:value=move || line().unwrap_or_else(|| "chargement…".into())></textarea>
+            <textarea class="mono key" readonly rows="3" prop:value=move || line().unwrap_or_else(|| "chargement…".into())></textarea>
             <div class="row">
                 <button type="button" on:click=copy>"Copier"</button>
                 {move || copied.get().then_some(view! { <span class="muted">"Copiée."</span> })}

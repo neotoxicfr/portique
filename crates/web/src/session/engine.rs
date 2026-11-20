@@ -149,7 +149,7 @@ impl Engine {
             clip_ack: None,
         }));
         let engine = Engine { inner, status };
-        (engine.status)(Status::Connecting("connexion au PC…".into()));
+        (engine.status)(Status::Connecting("Connexion au PC…".into()));
 
         let (tx, rx) = mpsc::unbounded::<Incoming>();
         let t = tx.clone();
@@ -244,7 +244,7 @@ impl Engine {
                 i.ws.send_with_u8_array(&first).map_err(|e| format!("{e:?}"))?;
                 i.session = Some(session);
                 drop(i);
-                (self.status)(Status::Connecting("ouverture de la session Windows…".into()));
+                (self.status)(Status::Connecting("Ouverture de la session Windows…".into()));
             }
             SessionMessage::Error { message } => {
                 self.inner.borrow_mut().closing = true;

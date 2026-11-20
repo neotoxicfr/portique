@@ -35,6 +35,8 @@ pub mod perf {
 /// Client Info PDU (2.2.1.11), sécurité de base comprise. Le mot de passe reste vide : avec NLA,
 /// le serveur a déjà les identifiants (CredSSP).
 pub fn client_info(domain: &str, username: &str, flags: u32, performance_flags: u32) -> Vec<u8> {
+    // Les chaînes sont écrites en UTF-16LE : INFO_UNICODE doit l'annoncer (2.2.1.11.1.1).
+    let flags = flags | info_flags::UNICODE;
     let (dom, user, empty) = (utf16z(domain), utf16z(username), utf16z(""));
     let mut p = Vec::with_capacity(512);
     p.extend_from_slice(&SEC_INFO_PKT.to_le_bytes());
@@ -78,6 +80,10 @@ pub fn license_is_valid_client(payload: &[u8]) -> Result<bool, Error> {
     }
     let error_code = r.u32_le("licence")?;
     let state = r.u32_le("licence")?;
+    // bbErrorInfo (LICENSE_BINARY_BLOB) termine le message, même vide (2.2.1.12.1.3).
+    r.skip(2, "licence")?;
+    let blob_len = r.u16_le("licence")? as usize;
+    r.skip(blob_len, "licence")?;
     Ok(error_code == 0x0000_0007 && state == 0x0000_0002) // STATUS_VALID_CLIENT, ST_NO_TRANSITION
 }
 
@@ -125,7 +131,8 @@ pub fn read_share_control(payload: &[u8]) -> Result<ShareControl<'_>, Error> {
     let pdu_type = r.u16_le("Share Control")? & 0x0F;
     let source = if r.remaining() >= 2 { r.u16_le("Share Control")? } else { 0 };
     let body_len = total.checked_sub(6).ok_or(Error::Invalid("Share Control trop court"))?;
-    Ok(ShareControl { pdu_type, source, body: r.bytes(body_len.min(r.remaining()), "Share Control")? })
+    // Exactement la longueur déclarée : une PDU tronquée est refusée.
+    Ok(ShareControl { pdu_type, source, body: r.bytes(body_len, "Share Control")? })
 }
 
 fn share_control(pdu_type: u16, source: u16, body: &[u8]) -> Vec<u8> {
@@ -176,8 +183,10 @@ impl DemandActive {
         let mut r = Reader::new(body);
         let share_id = r.u32_le("Demand Active")?;
         let len_source = r.u16_le("Demand Active")? as usize;
-        r.skip(2, "Demand Active")?;
+        let len_caps = r.u16_le("Demand Active")? as usize;
         r.skip(len_source, "Demand Active")?;
+        // Compteur et capacités bornés à lengthCombinedCapabilities (2.2.1.13.1.1).
+        let mut r = Reader::new(r.bytes(len_caps, "Demand Active")?);
         let count = r.u16_le("Demand Active")?;
         r.skip(2, "Demand Active")?;
         let mut capabilities = Vec::with_capacity(count as usize);
@@ -251,7 +260,7 @@ fn le32(v: &mut Vec<u8>, x: u32) {
 }
 
 /// Confirm Active PDU (2.2.1.13.2). Aucun ordre de dessin ni cache bitmap : l'affichage passe
-/// par EGFX, les mises à jour bitmap restent possibles en secours.
+/// par EGFX seulement, les mises à jour bitmap ne sont pas rendues (pas de mode de secours).
 pub fn confirm_active(share_id: u32, user: u16, c: &ClientCaps) -> (Vec<u8>, u16) {
     let mut caps = Vec::with_capacity(512);
     let mut n = 0u16;
@@ -448,6 +457,11 @@ mod tests {
             0x04, 0x00, 0x00, 0x00,
         ];
         assert!(license_is_valid_client(&pdu).unwrap());
+        // Coupée après dwStateTransition, ou BLOB annoncé plus long que présent : refusée.
+        assert_eq!(license_is_valid_client(&pdu[..16]), Err(Error::Truncated("licence")));
+        let mut longer = pdu;
+        longer[18] = 1;
+        assert_eq!(license_is_valid_client(&longer), Err(Error::Truncated("licence")));
     }
 
     #[test]
@@ -463,6 +477,18 @@ mod tests {
         let parsed = DemandActive::parse(&demand_like).unwrap();
         assert_eq!(parsed.capabilities.len(), n as usize);
         assert_eq!(parsed.desktop_size(), Some((1920, 1080)));
+        // lengthCombinedCapabilities réduit au compteur : les capacités, présentes après la
+        // limite, ne sont plus lues.
+        let mut short = demand_like.clone();
+        short[6..8].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(DemandActive::parse(&short), Err(Error::Truncated("capacité")));
+    }
+
+    #[test]
+    fn share_control_length_enforced() {
+        let pdu = share_control(pdu_type::DEACTIVATE_ALL, 1002, &[1, 2, 3, 4]);
+        assert_eq!(read_share_control(&pdu).unwrap().body, [1, 2, 3, 4]);
+        assert_eq!(read_share_control(&pdu[..pdu.len() - 1]), Err(Error::Truncated("Share Control")));
     }
 
     #[test]
@@ -470,5 +496,7 @@ mod tests {
         let p = client_info("", "alice", info_flags::UNICODE, 0);
         assert_eq!(u16::from_le_bytes([p[0], p[1]]), SEC_INFO_PKT);
         assert_eq!(u16::from_le_bytes([p[14], p[15]]), 10, "cbUserName (UTF-16) sans le zéro final");
+        let p = client_info("", "alice", 0, 0);
+        assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), info_flags::UNICODE);
     }
 }

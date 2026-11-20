@@ -17,6 +17,8 @@ pub fn chunks(data: &[u8], show_protocol: bool) -> Vec<Vec<u8>> {
     let pieces: Vec<&[u8]> =
         if data.is_empty() { alloc::vec![&[][..]] } else { data.chunks(CHUNK_SIZE).collect() };
     let last = pieces.len() - 1;
+    // Un message découpé porte SHOW_PROTOCOL sur chaque morceau (MS-RDPBCGR 3.1.5.2.1).
+    let show_protocol = show_protocol || last > 0;
     for (i, piece) in pieces.into_iter().enumerate() {
         let mut flags = if show_protocol { CHANNEL_FLAG_SHOW_PROTOCOL } else { 0 };
         if i == 0 {
@@ -38,7 +40,8 @@ pub fn chunks(data: &[u8], show_protocol: bool) -> Vec<Vec<u8>> {
 #[derive(Default)]
 pub struct ChannelReassembler {
     buf: Vec<u8>,
-    expected: usize,
+    /// Longueur annoncée du message en cours ; `None` hors réassemblage.
+    expected: Option<usize>,
 }
 
 /// Plafond d'un message de canal statique (le presse-papier peut porter une image).
@@ -57,13 +60,20 @@ impl ChannelReassembler {
         }
         if flags & CHANNEL_FLAG_FIRST != 0 {
             self.buf.clear();
-            self.expected = total;
+            self.expected = Some(total);
         }
-        self.buf.extend_from_slice(r.rest());
-        if self.buf.len() > self.expected {
+        let expected = self.expected.ok_or(Error::Invalid("morceau de canal sans FIRST"))?;
+        let piece = r.rest();
+        if self.buf.len() + piece.len() > expected {
+            self.expected = None;
             return Err(Error::Invalid("message de canal plus long qu'annoncé"));
         }
+        self.buf.extend_from_slice(piece);
         if flags & CHANNEL_FLAG_LAST != 0 {
+            self.expected = None;
+            if self.buf.len() != expected {
+                return Err(Error::Invalid("message de canal plus court qu'annoncé"));
+            }
             return Ok(Some(core::mem::take(&mut self.buf)));
         }
         Ok(None)
@@ -100,7 +110,9 @@ fn read_var(r: &mut Reader, size: u8, what: &'static str) -> Result<u32, Error> 
     Ok(match size {
         0 => r.u8(what)? as u32,
         1 => r.u16_le(what)? as u32,
-        _ => r.u32_le(what)?,
+        2 => r.u32_le(what)?,
+        // 3 : valeur invalide pour cbId comme pour Len (MS-RDPEDYC 2.2, 2.2.3.1).
+        _ => return Err(Error::Invalid("largeur de champ DVC réservée")),
     })
 }
 
@@ -212,6 +224,10 @@ impl DvcReassembler {
         if total as usize > MAX_CHANNEL_MESSAGE {
             return Err(Error::Invalid("message DVC trop grand"));
         }
+        // Longueur nulle : `data` prendrait ce fragment pour un message Data autonome.
+        if total == 0 && !data.is_empty() {
+            return Err(Error::Invalid("message DVC plus long qu'annoncé"));
+        }
         self.buf.clear();
         self.expected = total as usize;
         self.data(data)
@@ -246,6 +262,39 @@ mod tests {
         assert_eq!(r.feed(&parts[0]).unwrap(), None);
         assert_eq!(r.feed(&parts[1]).unwrap(), None);
         assert_eq!(r.feed(&parts[2]).unwrap(), Some(data));
+        // Découpé : SHOW_PROTOCOL sur chaque morceau, même si l'appelant ne le demande pas.
+        let flags = |p: &[u8]| u32::from_le_bytes(p[4..8].try_into().unwrap());
+        assert!(chunks(&[0; 1601], false).iter().all(|p| flags(p) & CHANNEL_FLAG_SHOW_PROTOCOL != 0));
+        assert_eq!(flags(&chunks(&[0; 1600], false)[0]), CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+    }
+
+    #[test]
+    fn static_reassembly_requires_exact_message() {
+        let header = |total: u32, flags: u32, data: &[u8]| {
+            let mut v = total.to_le_bytes().to_vec();
+            v.extend(flags.to_le_bytes());
+            v.extend_from_slice(data);
+            v
+        };
+        let mut r = ChannelReassembler::default();
+        // LAST avant la longueur annoncée.
+        assert_eq!(r.feed(&header(4, CHANNEL_FLAG_FIRST, &[1])).unwrap(), None);
+        assert!(r.feed(&header(4, CHANNEL_FLAG_LAST, &[2])).is_err());
+        // LAST isolé après un message complet : rien à livrer.
+        let whole = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
+        assert_eq!(r.feed(&header(2, whole, &[1, 2])).unwrap(), Some(alloc::vec![1, 2]));
+        assert!(r.feed(&header(2, CHANNEL_FLAG_LAST, &[3, 4])).is_err());
+        // Message vide en un morceau.
+        assert_eq!(r.feed(&header(0, whole, &[])).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn dvc_reserved_width_and_empty_first() {
+        // cbId = 3 sur un Create Request.
+        assert!(read_dvc(&[0x13, 0, 0, 0, 3, b'x', 0]).is_err());
+        let mut r = DvcReassembler::default();
+        assert!(r.first(0, &[1, 2]).is_err());
+        assert_eq!(r.data(&[1, 2]).unwrap(), Some(alloc::vec![1, 2]), "Data autonome inchangé");
     }
 
     #[test]

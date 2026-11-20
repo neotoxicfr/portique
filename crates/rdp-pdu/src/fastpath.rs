@@ -56,6 +56,10 @@ impl Reassembler {
             let data = r.bytes(size, "mise à jour")?;
             match frag {
                 0 => out.push((code, data.to_vec())),
+                // Un FIRST avant le LAST du précédent perdrait la mise à jour en cours.
+                2 if self.pending.is_some() => {
+                    return Err(Error::Invalid("fragment fast-path FIRST en double"));
+                }
                 2 => self.pending = Some((code, data.to_vec())),
                 3 | 1 => {
                     let (c, buf) =
@@ -180,7 +184,7 @@ fn decode_masks(width: usize, height: usize, bpp: usize, xor: &[u8], and: &[u8])
     Ok(rgba)
 }
 
-fn color_pointer(r: &mut Reader, bpp: usize, large: bool) -> Result<(u16, Pointer), Error> {
+fn color_pointer(r: &mut Reader, bpp: usize, large: bool) -> Result<Option<PointerUpdate>, Error> {
     let cache_index = r.u16_le("curseur")?;
     let hot_x = r.u16_le("curseur")?;
     let hot_y = r.u16_le("curseur")?;
@@ -196,8 +200,13 @@ fn color_pointer(r: &mut Reader, bpp: usize, large: bool) -> Result<(u16, Pointe
     };
     let xor = r.bytes(xor_len, "masque XOR")?;
     let and = r.bytes(and_len, "masque AND")?;
+    if matches!(bpp, 4 | 8) {
+        // Indices dans la palette de la session (2.2.9.1.1.4.4), que Portique ne suit pas :
+        // curseur ignoré, la PDU ayant été lue en entier.
+        return Ok(None);
+    }
     let rgba = decode_masks(width as usize, height as usize, bpp, xor, and)?;
-    Ok((cache_index, Pointer { width, height, hot_x, hot_y, rgba }))
+    Ok(Some(PointerUpdate::New { cache_index, pointer: Pointer { width, height, hot_x, hot_y, rgba } }))
 }
 
 /// Décode une mise à jour de curseur fast-path ; `None` si `code` n'en est pas une.
@@ -210,14 +219,10 @@ pub fn pointer_update(code: u8, data: &[u8]) -> Result<Option<PointerUpdate>, Er
             PointerUpdate::Position { x: r.u16_le("position")?, y: r.u16_le("position")? }
         }
         update_code::CACHED => PointerUpdate::Cached { cache_index: r.u16_le("curseur en cache")? },
-        update_code::COLOR => {
-            let (cache_index, pointer) = color_pointer(&mut r, 24, false)?;
-            PointerUpdate::New { cache_index, pointer }
-        }
+        update_code::COLOR => return color_pointer(&mut r, 24, false),
         update_code::POINTER | update_code::LARGE_POINTER => {
             let bpp = r.u16_le("curseur")? as usize;
-            let (cache_index, pointer) = color_pointer(&mut r, bpp, code == update_code::LARGE_POINTER)?;
-            PointerUpdate::New { cache_index, pointer }
+            return color_pointer(&mut r, bpp, code == update_code::LARGE_POINTER);
         }
         _ => return Ok(None),
     }))
@@ -287,8 +292,12 @@ impl Input {
     }
 }
 
-/// Encode une trame d'entrées fast-path (au plus 255 événements).
+/// Encode une trame d'entrées fast-path (au plus 255 événements) ; rien pour un lot vide
+/// (numEvents à 0 dans l'en-tête annoncerait un compteur à suivre, 2.2.8.1.2).
 pub fn input_frame(events: &[Input]) -> Vec<u8> {
+    if events.is_empty() {
+        return Vec::new();
+    }
     let mut body = Vec::with_capacity(events.len() * 7 + 1);
     let n = events.len().min(255);
     if n >= 16 {
@@ -337,6 +346,7 @@ mod tests {
         assert_eq!(f[0], 0);
         assert_eq!(crate::x224::frame_len(&f), Some(f.len()));
         assert_eq!(f[3], 20, "numEvents dans le corps au-delà de 15");
+        assert!(input_frame(&[]).is_empty());
     }
 
     #[test]
@@ -360,6 +370,24 @@ mod tests {
         assert!(r.feed(&frame(3, &[3])).unwrap().is_empty());
         assert_eq!(r.feed(&frame(1, &[4])).unwrap(), [(update_code::BITMAP, alloc::vec![1, 2, 3, 4])]);
         assert!(r.feed(&frame(1, &[5])).is_err());
+        // FIRST puis FIRST : la première mise à jour serait perdue sans le dire.
+        assert!(r.feed(&frame(2, &[1])).unwrap().is_empty());
+        assert!(r.feed(&frame(2, &[2])).is_err());
+    }
+
+    #[test]
+    fn palette_pointer_ignored_but_checked() {
+        // Curseur 2×2 à 8 bpp : XOR 2 lignes de 2 octets, AND 2 lignes de 2 octets.
+        let mut p = 8u16.to_le_bytes().to_vec();
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 2, 0, 2, 0]);
+        p.extend_from_slice(&4u16.to_le_bytes());
+        p.extend_from_slice(&4u16.to_le_bytes());
+        p.extend_from_slice(&[0; 8]);
+        assert_eq!(pointer_update(update_code::POINTER, &p), Ok(None));
+        assert_eq!(
+            pointer_update(update_code::POINTER, &p[..p.len() - 1]),
+            Err(Error::Truncated("masque AND"))
+        );
     }
 
     #[test]

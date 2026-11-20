@@ -4,7 +4,7 @@
 //! aléatoire et l'heure (FILETIME), ce qui rend chaque étape testable contre les vecteurs
 //! de la spec (section 4.2.4).
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
 use hmac::{Hmac, KeyInit, Mac};
 use md4::Md4;
@@ -127,7 +127,9 @@ impl<'a> Reader<'a> {
     fn field(&self, at: usize) -> Result<&'a [u8], Error> {
         let len = self.u16(at)? as usize;
         let off = self.u32(at + 4)? as usize;
-        self.0.get(off..off + len).ok_or(Error::Truncated("champ NTLM"))
+        // `off + len` peut déborder sur une cible 32 bits.
+        let end = off.checked_add(len).ok_or(Error::Truncated("champ NTLM"))?;
+        self.0.get(off..end).ok_or(Error::Truncated("champ NTLM"))
     }
 }
 
@@ -304,8 +306,14 @@ impl NtlmClient {
     /// Répond au CHALLENGE ; renvoie le message AUTHENTICATE et les poignées de scellement.
     pub fn authenticate(self, challenge_msg: &[u8]) -> Result<(Vec<u8>, Established), Error> {
         let ch = Challenge::parse(challenge_msg)?;
-        if ch.flags & flags::EXTENDED_SESSIONSECURITY == 0 || ch.flags & flags::KEY_EXCH == 0 {
-            return Err(Error::Invalid("le serveur refuse NTLMv2 avec échange de clé"));
+        // Seul mode implémenté : clés de 128 bits (SEALKEY, MS-NLMP 3.4.5.3), signature et
+        // scellement. Un serveur conforme renvoie ces drapeaux demandés (2.2.2.5).
+        const REQUIRED: u32 =
+            flags::EXTENDED_SESSIONSECURITY | flags::KEY_EXCH | flags::N128 | flags::SIGN | flags::SEAL;
+        if ch.flags & REQUIRED != REQUIRED {
+            return Err(Error::Invalid(
+                "le serveur refuse NTLMv2 avec échange de clé et scellement 128 bits",
+            ));
         }
         let pairs = ch.av_pairs()?;
         let server_ts = pairs
@@ -338,8 +346,16 @@ impl NtlmClient {
         let proof = hmac_md5(&key_nt, &[&ch.server_challenge, &temp]);
         let mut nt_response = proof.to_vec();
         nt_response.extend_from_slice(&temp);
-        // Avec horodatage serveur, la réponse LM est remplacée par 24 zéros (3.1.5.1.2).
-        let lm_response = [0u8; 24];
+        // Avec horodatage serveur, la réponse LM est remplacée par 24 zéros (3.1.5.1.2) ; sinon
+        // LMv2 (3.3.2), ResponseKeyLM étant égale à ResponseKeyNT en NTLMv2.
+        let lm_response = match server_ts {
+            Some(_) => vec![0u8; 24],
+            None => {
+                let mut lm = hmac_md5(&key_nt, &[&ch.server_challenge, &self.rand.client_challenge]).to_vec();
+                lm.extend_from_slice(&self.rand.client_challenge);
+                lm
+            }
+        };
 
         let session_base_key = hmac_md5(&key_nt, &[&proof]);
         let mut encrypted_key = self.rand.exported_session_key;
@@ -351,22 +367,26 @@ impl NtlmClient {
 
         const HEADER: usize = 88;
         let mut payload = Vec::new();
-        let mut field = |data: &[u8], header: &mut Vec<u8>| {
+        let mut field = |data: &[u8], header: &mut Vec<u8>| -> Result<(), Error> {
+            // Longueur sur 16 bits : un champ plus long rendrait le message incohérent avec son MIC.
+            let len =
+                u16::try_from(data.len()).map_err(|_| Error::Invalid("champ AUTHENTICATE trop long"))?;
             let off = HEADER + payload.len();
-            header.extend_from_slice(&(data.len() as u16).to_le_bytes());
-            header.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            header.extend_from_slice(&len.to_le_bytes());
+            header.extend_from_slice(&len.to_le_bytes());
             header.extend_from_slice(&(off as u32).to_le_bytes());
             payload.extend_from_slice(data);
+            Ok(())
         };
         let mut m = Vec::with_capacity(HEADER + 512);
         m.extend_from_slice(SIGNATURE);
         m.extend_from_slice(&3u32.to_le_bytes());
-        field(&lm_response, &mut m);
-        field(&nt_response, &mut m);
-        field(&domain, &mut m);
-        field(&user, &mut m);
-        field(&workstation, &mut m);
-        field(&encrypted_key, &mut m);
+        field(&lm_response, &mut m)?;
+        field(&nt_response, &mut m)?;
+        field(&domain, &mut m)?;
+        field(&user, &mut m)?;
+        field(&workstation, &mut m)?;
+        field(&encrypted_key, &mut m)?;
         m.extend_from_slice(&(CLIENT_FLAGS & ch.flags | flags::KEY_EXCH).to_le_bytes());
         m.extend_from_slice(&VERSION);
         let mic_at = m.len();
@@ -526,5 +546,51 @@ mod tests {
         assert!(pairs.iter().any(|(id, v)| *id == av::FLAGS && *v == av::FLAG_MIC_PRESENT.to_le_bytes()));
         assert!(pairs.iter().any(|(id, v)| *id == av::TARGET_NAME && *v == utf16le("TERMSRV/server")));
         assert_ne!(&auth[72..88], &[0u8; 16], "MIC rempli");
+        // Pas de MsvAvTimestamp dans ce CHALLENGE : réponse LMv2 de la spec (4.2.4.2.1).
+        assert_eq!(r.field(12).unwrap(), h("86c35097ac9cec102554764a57cccc19aaaaaaaaaaaaaaaa"));
+    }
+
+    fn spec_client() -> NtlmClient {
+        let mut c = NtlmClient::new(
+            spec_creds(),
+            Randomness { client_challenge: [0xaa; 8], exported_session_key: [0x55; 16], now_filetime: 0 },
+            "TERMSRV/pc".into(),
+            [0x11; 16],
+        );
+        c.negotiate();
+        c
+    }
+
+    #[test]
+    fn lm_response_zero_with_server_timestamp() {
+        let mut ti = h(SPEC_TARGET_INFO);
+        ti.truncate(ti.len() - 4);
+        push_av(&mut ti, av::TIMESTAMP, &[1; 8]);
+        push_av(&mut ti, av::EOL, &[]);
+        let (auth, _) = spec_client().authenticate(&challenge_with(&ti)).unwrap();
+        assert_eq!(Reader(&auth).field(12).unwrap(), [0u8; 24]);
+    }
+
+    #[test]
+    fn challenge_without_128_bit_sealing_refused() {
+        let ok = challenge_with(&h(SPEC_TARGET_INFO));
+        for missing in
+            [flags::N128, flags::SIGN, flags::SEAL, flags::KEY_EXCH, flags::EXTENDED_SESSIONSECURITY]
+        {
+            let mut m = ok.clone();
+            let f = u32::from_le_bytes(m[20..24].try_into().unwrap()) & !missing;
+            m[20..24].copy_from_slice(&f.to_le_bytes());
+            assert!(spec_client().authenticate(&m).is_err(), "drapeau {missing:#x} absent");
+        }
+        assert!(spec_client().authenticate(&ok).is_ok());
+    }
+
+    #[test]
+    fn oversized_nt_response_refused() {
+        // TargetInfo proche de 65 535 octets : la réponse NT, CBT et SPN compris, dépasse u16.
+        let mut ti = Vec::new();
+        push_av(&mut ti, 0x0100, &[0; 65_500]);
+        push_av(&mut ti, av::EOL, &[]);
+        assert!(matches!(spec_client().authenticate(&challenge_with(&ti)), Err(Error::Invalid(_))));
     }
 }

@@ -44,8 +44,10 @@ fn domain_params(p: [u32; 8]) -> Vec<u8> {
     out
 }
 
-/// Longueur PER (X.691 10.9) sur 1 ou 2 octets.
+/// Longueur PER (X.691 10.9) sur 1 ou 2 octets : 16 383 au plus, au-delà il faudrait la
+/// forme fragmentée. Les appelants découpent avant (morceaux de canal de 1 600 octets).
 fn per_len(out: &mut Vec<u8>, len: usize) {
+    assert!(len < 0x4000, "longueur PER {len} : au-delà de 16 383, à découper avant l'encodage");
     if len < 0x80 {
         out.push(len as u8);
     } else {
@@ -178,7 +180,10 @@ pub fn attach_user_confirm(frame: &[u8]) -> Result<u16, Error> {
     if r.u8("Attach User Confirm")? != 0 {
         return Err(Error::McsRefused(1));
     }
-    Ok(r.u16_be("Attach User Confirm")? + USER_BASE)
+    // L'identifiant relatif vient du serveur : USER_BASE ajouté sans déborder.
+    r.u16_be("Attach User Confirm")?
+        .checked_add(USER_BASE)
+        .ok_or(Error::Invalid("identifiant MCS hors plage"))
 }
 
 pub fn channel_join_request(user: u16, channel: u16) -> Vec<u8> {
@@ -242,7 +247,8 @@ pub fn read_domain_pdu(frame: &[u8]) -> Result<DomainPdu<'_>, Error> {
             Ok(DomainPdu::SendDataIndication { channel, data: r.bytes(len, "Send Data Indication")? })
         }
         8 => {
-            let second = r.u8("Disconnect Provider Ultimatum").unwrap_or(0);
+            // Choix (6 bits) + raison (3 bits) : 2 octets, le bit faible de la raison dans le second.
+            let second = r.u8("Disconnect Provider Ultimatum")?;
             Ok(DomainPdu::Disconnect { reason: ((first & 0x03) << 1) | (second >> 7) })
         }
         other => Ok(DomainPdu::Other(other)),
@@ -285,7 +291,8 @@ mod tests {
     fn connect_response_parsing() {
         let blocks = [
             0x01, 0x0c, 0x0c, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x00, 0x00, //
-            0x03, 0x0c, 0x0c, 0x00, 0xeb, 0x03, 0x02, 0x00, 0xec, 0x03, 0xed, 0x03,
+            0x03, 0x0c, 0x0c, 0x00, 0xeb, 0x03, 0x02, 0x00, 0xec, 0x03, 0xed, 0x03, //
+            0x02, 0x0c, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let d = connect_response(&response(0, &blocks)).unwrap();
         assert_eq!(d.version, 0x0008_000C);
@@ -319,6 +326,25 @@ mod tests {
         }
         let dpum = crate::x224::data(&[0x21, 0x80]);
         assert_eq!(read_domain_pdu(&dpum).unwrap(), DomainPdu::Disconnect { reason: 3 });
+        assert_eq!(
+            read_domain_pdu(&crate::x224::data(&[0x21])),
+            Err(Error::Truncated("Disconnect Provider Ultimatum"))
+        );
+        let hostile = crate::x224::data(&[0x2e, 0x00, 0xff, 0xff]);
+        assert_eq!(attach_user_confirm(&hostile), Err(Error::Invalid("identifiant MCS hors plage")));
+    }
+
+    #[test]
+    fn per_length_limit() {
+        let mut v = Vec::new();
+        per_len(&mut v, 0x3FFF);
+        assert_eq!(v, [0xBF, 0xFF]);
+    }
+
+    #[test]
+    #[should_panic(expected = "16 383")]
+    fn per_length_beyond_two_bytes_refused() {
+        send_data_request(1007, 1003, &[0; 0x4000]);
     }
 
     #[test]

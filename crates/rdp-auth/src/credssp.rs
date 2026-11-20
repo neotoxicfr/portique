@@ -253,15 +253,30 @@ pub fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
     const SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
     const SHA384_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
     const SHA512_ECDSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+    const RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+    const SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+    const SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
     let (cert, _) = der::expect(cert_der, der::SEQUENCE)?;
     let (_, after_tbs) = der::expect(cert, der::SEQUENCE)?;
     let (alg, _) = der::expect(after_tbs, der::SEQUENCE)?;
-    let (oid, _) = der::expect(alg, 0x06)?;
+    let (oid, params) = der::expect(alg, 0x06)?;
+    let oid = if oid == RSA_PSS { pss_hash(params)? } else { oid };
     Ok(match oid {
-        o if o == SHA384_RSA || o == SHA384_ECDSA => sha2::Sha384::digest(cert_der).to_vec(),
-        o if o == SHA512_RSA || o == SHA512_ECDSA => sha2::Sha512::digest(cert_der).to_vec(),
+        o if [SHA384_RSA, SHA384_ECDSA, SHA384].contains(&o) => sha2::Sha384::digest(cert_der).to_vec(),
+        o if [SHA512_RSA, SHA512_ECDSA, SHA512].contains(&o) => sha2::Sha512::digest(cert_der).to_vec(),
         _ => Sha256::digest(cert_der).to_vec(),
     })
+}
+
+/// RSASSA-PSS (RFC 4055 3.1) : le hachage est le `hashAlgorithm` [0] des paramètres ; absent,
+/// c'est SHA-1 (vide renvoyé, donc SHA-256 pour la liaison).
+fn pss_hash(params: &[u8]) -> Result<&[u8], Error> {
+    let (seq, _) = der::expect(params, der::SEQUENCE)?;
+    if seq.first() != Some(&der::ctx(0)) {
+        return Ok(&[]);
+    }
+    let (hash_alg, _) = der::expect(der::expect(seq, der::ctx(0))?.0, der::SEQUENCE)?;
+    Ok(der::expect(hash_alg, 0x06)?.0)
 }
 
 #[cfg(test)]
@@ -272,6 +287,11 @@ mod tests {
 
     /// Certificat minimal : sha256WithRSAEncryption, clé publique 01 02 03.
     fn fake_cert() -> Vec<u8> {
+        cert_signed_with(&der::tlv(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]))
+    }
+
+    /// Certificat minimal dont `alg` est le contenu de l'AlgorithmIdentifier de signature.
+    fn cert_signed_with(alg: &[u8]) -> Vec<u8> {
         let empty = der::tlv(der::SEQUENCE, &[]);
         let mut tbs = der::explicit(0, &der::integer(2));
         tbs.extend(der::integer(1));
@@ -282,8 +302,7 @@ mod tests {
         spki.extend(der::tlv(0x03, &[0, 1, 2, 3]));
         tbs.extend(der::tlv(der::SEQUENCE, &spki));
         let mut cert = der::tlv(der::SEQUENCE, &tbs);
-        let sha256_rsa = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-        cert.extend(der::tlv(der::SEQUENCE, &der::tlv(0x06, &sha256_rsa)));
+        cert.extend(der::tlv(der::SEQUENCE, alg));
         cert.extend(der::tlv(0x03, &[0]));
         der::tlv(der::SEQUENCE, &cert)
     }
@@ -303,6 +322,31 @@ mod tests {
     fn certificate_fields() {
         let cert = fake_cert();
         assert_eq!(subject_public_key(&cert).unwrap(), [1, 2, 3]);
+        assert_eq!(tls_server_end_point(&cert).unwrap(), Sha256::digest(&cert).to_vec());
+    }
+
+    #[test]
+    fn rsa_pss_uses_its_hash_algorithm() {
+        let oid = |o: &[u8]| der::tlv(0x06, o);
+        let sha384 = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+        let mut sha384_alg = oid(&sha384);
+        sha384_alg.extend(der::tlv(0x05, &[]));
+        let sha384_alg = der::tlv(der::SEQUENCE, &sha384_alg);
+        // RSASSA-PSS-params : SHA-384, MGF1 avec SHA-384, sel de 48 octets.
+        let mut mgf = oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08]);
+        mgf.extend(&sha384_alg);
+        let mut params = der::explicit(0, &sha384_alg);
+        params.extend(der::explicit(1, &der::tlv(der::SEQUENCE, &mgf)));
+        params.extend(der::explicit(2, &der::integer(48)));
+        let pss = oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a]);
+        let mut alg = pss.clone();
+        alg.extend(der::tlv(der::SEQUENCE, &params));
+        let cert = cert_signed_with(&alg);
+        assert_eq!(tls_server_end_point(&cert).unwrap(), sha2::Sha384::digest(&cert).to_vec());
+        // Paramètres par défaut : SHA-1, donc SHA-256.
+        let mut alg = pss;
+        alg.extend(der::tlv(der::SEQUENCE, &[]));
+        let cert = cert_signed_with(&alg);
         assert_eq!(tls_server_end_point(&cert).unwrap(), Sha256::digest(&cert).to_vec());
     }
 

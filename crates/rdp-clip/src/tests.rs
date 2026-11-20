@@ -10,6 +10,12 @@ fn unhex(s: &str) -> Vec<u8> {
 const SERVER_CAPS: &str = "07 00 00 00 10 00 00 00 01 00 00 00 01 00 0c 00 02 00 00 00 0e 00 00 00";
 /// 4.1.2 : Monitor Ready.
 const MONITOR_READY: &str = "01 00 00 00 00 00 00 00";
+/// Format List Response refusée (2.2.3.2, CB_RESPONSE_FAIL).
+const LIST_FAIL: &str = "03 00 02 00 00 00 00 00";
+/// PNG 1×1 RGBA valide (signature, IHDR, IDAT, IEND).
+const PNG_1X1: &str = "89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52 00 00 00 01 00 00 00 01 08 06 00 00 00 \
+    1f 15 c4 89 00 00 00 0d 49 44 41 54 78 9c 63 60 64 62 66 01 00 00 19 00 0b e7 5a 46 a4 00 00 00 00 \
+    49 45 4e 44 ae 42 60 82";
 
 fn sends(ev: &[ClipEvent]) -> Vec<&[u8]> {
     ev.iter().filter_map(|e| if let ClipEvent::Send(b) = e { Some(b.as_slice()) } else { None }).collect()
@@ -131,8 +137,13 @@ fn full_sequence_with_local_content() {
 
     let ev = c.request(&[ClipFormat::Dib, ClipFormat::Png]);
     assert_eq!(sends(&ev)[0], unhex("04 00 00 00 04 00 00 00 bb c0 00 00"));
+    let png = unhex(PNG_1X1);
+    let ev = c.receive(&pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, &png)).unwrap();
+    assert_eq!(ev, [ClipEvent::RemoteData(Some(LocalData::Png(png)))]);
+    // Sans signature PNG : illisible, l'appelant peut demander le DIB.
+    c.request(&[ClipFormat::Png]);
     let ev = c.receive(&pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, b"\x89PNG")).unwrap();
-    assert_eq!(ev, [ClipEvent::RemoteData(Some(LocalData::Png(b"\x89PNG".to_vec())))]);
+    assert_eq!(ev, [ClipEvent::RemoteData(None)]);
 
     // Refus du serveur : RemoteData(None), et une nouvelle demande redevient possible.
     c.request(&[ClipFormat::Html]);
@@ -165,7 +176,10 @@ fn short_names_without_server_caps() {
     body[36..40].copy_from_slice(&8u32.to_le_bytes());
     let ev = c.receive(&pdu(msg::FORMAT_LIST, ASCII_NAMES, &body)).unwrap();
     assert_eq!(ev[1], ClipEvent::RemoteChanged(vec![ClipFormat::Html, ClipFormat::Dib]));
-    assert!(c.receive(&pdu(msg::FORMAT_LIST, 0, &[0; 35])).is_err());
+    // Liste inexploitable : refusée (CB_RESPONSE_FAIL), la précédente reste.
+    let ev = c.receive(&pdu(msg::FORMAT_LIST, 0, &[0; 35])).unwrap();
+    assert_eq!(ev, [ClipEvent::Send(unhex(LIST_FAIL))]);
+    assert_eq!(c.remote_formats(), [ClipFormat::Html, ClipFormat::Dib]);
 }
 
 #[test]
@@ -185,8 +199,9 @@ fn hostile_messages() {
     assert!(c.receive(&unhex("04 00 00 00 00 00 00 00")).is_err());
     assert!(c.receive(&unhex("07 00 00 00 08 00 00 00 05 00 00 00 01 00 00 00")).is_err());
     assert!(c.receive(&unhex("07 00 00 00 04 00 00 00 02 00 00 00")).is_err());
-    // Format List longue tronquée en plein identifiant ; nom sans terminateur toléré.
-    assert!(c.receive(&unhex("02 00 00 00 02 00 00 00 0d 00")).is_err());
+    // Format List longue tronquée en plein identifiant : refusée ; nom sans terminateur toléré.
+    let ev = c.receive(&unhex("02 00 00 00 02 00 00 00 0d 00")).unwrap();
+    assert_eq!(ev, [ClipEvent::Send(unhex(LIST_FAIL))]);
     assert!(c.receive(&unhex("02 00 00 00 06 00 00 00 0d 00 00 00 41 00")).is_ok());
     // Type inconnu, remplissage après dataLen : sans effet.
     assert!(c.receive(&unhex("63 00 00 00 00 00 00 00")).unwrap().is_empty());
@@ -199,8 +214,73 @@ fn hostile_messages() {
     // File Contents Request : refus avec le streamId.
     let ev = c.receive(&pdu(msg::FILECONTENTS_REQUEST, 0, &[7, 0, 0, 0, 0, 0, 0, 0])).unwrap();
     assert_eq!(sends(&ev)[0], unhex("09 00 02 00 04 00 00 00 07 00 00 00"));
-    // Annulation d'une demande restée sans réponse.
-    c.request(&[ClipFormat::Dib]);
-    c.cancel_request();
+}
+
+#[test]
+fn truncated_response_ends_the_request() {
+    let mut c = ready();
+    c.remote = vec![(13, String::new())];
+    // dataLen plus grand que le message, puis que le plafond : la demande se termine quand même.
+    for resp in ["05 00 01 00 10 00 00 00 61 00", "05 00 01 00 ff ff ff ff"] {
+        assert_eq!(c.request(&[ClipFormat::Text]).len(), 1);
+        assert_eq!(c.receive(&unhex(resp)).unwrap(), [ClipEvent::RemoteData(None)]);
+    }
+    assert_eq!(c.request(&[ClipFormat::Text]).len(), 1, "nouvelle demande possible");
+}
+
+#[test]
+fn response_to_a_replaced_list_is_discarded() {
+    let mut c = ready();
+    let list = |id: u32| {
+        let mut l = id.to_le_bytes().to_vec();
+        l.extend_from_slice(&[0, 0]);
+        pdu(msg::FORMAT_LIST, 0, &l)
+    };
+    c.receive(&list(13)).unwrap();
+    assert_eq!(c.request(&[ClipFormat::Text]).len(), 1);
+    // Le PC copie une image avant de répondre pour le texte.
+    let ev = c.receive(&list(8)).unwrap();
+    assert_eq!(ev[1], ClipEvent::RemoteChanged(vec![ClipFormat::Dib]));
+    assert!(c.request(&[ClipFormat::Dib]).is_empty(), "une seule demande en vol");
+    // La réponse pour le texte arrive : écartée, la demande du DIB peut partir.
+    let text = pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, &string_to_utf16("ancien"));
+    assert_eq!(c.receive(&text).unwrap(), [ClipEvent::RemoteData(None)]);
     assert_eq!(c.request(&[ClipFormat::Dib]).len(), 1);
+    let dib = rgba_to_dib(1, 1, &[1, 2, 3, 4]).unwrap();
+    let ev = c.receive(&pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, &dib)).unwrap();
+    assert_eq!(
+        ev,
+        [ClipEvent::RemoteData(Some(LocalData::Rgba { width: 1, height: 1, rgba: vec![1, 2, 3, 4] }))]
+    );
+}
+
+#[test]
+fn caps_validated_before_use() {
+    // Premier jeu général valide (noms longs), second tronqué : rien n'est retenu.
+    let mut c = Clipboard::new();
+    let caps = "07 00 00 00 14 00 00 00 02 00 00 00 01 00 0c 00 02 00 00 00 02 00 00 00 01 00 0c 00";
+    assert!(c.receive(&unhex(caps)).is_err());
+    assert!(!c.server_caps && !c.long_names);
+    // Jeu général de 8 octets suivi d'octets : les indicateurs hors du jeu ne sont pas lus.
+    let caps = "07 00 00 00 10 00 00 00 01 00 00 00 01 00 08 00 02 00 00 00 02 00 00 00";
+    assert!(c.receive(&unhex(caps)).is_err());
+    assert!(!c.long_names);
+}
+
+#[test]
+fn format_list_entries_capped() {
+    let mut c = ready();
+    // 1025 entrées sans nom : refusée sans tout allouer.
+    let body: Vec<u8> =
+        (0..=MAX_FORMATS as u32).flat_map(|i| [i.to_le_bytes().as_slice(), &[0, 0]].concat()).collect();
+    assert_eq!(c.receive(&pdu(msg::FORMAT_LIST, 0, &body)).unwrap(), [ClipEvent::Send(unhex(LIST_FAIL))]);
+    let body = vec![0u8; 36 * (MAX_FORMATS + 1)];
+    c.long_names = false;
+    assert_eq!(c.receive(&pdu(msg::FORMAT_LIST, 0, &body)).unwrap(), [ClipEvent::Send(unhex(LIST_FAIL))]);
+    // Au plafond : acceptée.
+    let body = vec![0u8; 36 * MAX_FORMATS];
+    assert_eq!(
+        c.receive(&pdu(msg::FORMAT_LIST, 0, &body)).unwrap()[0],
+        ClipEvent::Send(unhex("03 00 01 00 00 00 00 00"))
+    );
 }

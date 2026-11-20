@@ -22,6 +22,9 @@ pub use html::{cf_html_fragment, html_to_cf_html};
 pub const MAX_DATA: usize = 32 << 20;
 /// Plafond de largeur et de hauteur d'une image.
 pub const MAX_DIM: usize = 16384;
+/// Plafond d'entrées d'une Format List : un vrai presse-papier en propose quelques dizaines,
+/// sans plafond 32 Mio d'entrées vides coûteraient des centaines de Mio.
+const MAX_FORMATS: usize = 1024;
 
 /// Types de message (2.2.1).
 mod msg {
@@ -50,6 +53,7 @@ const CF_DIBV5: u32 = 17;
 const LOCAL_HTML: u32 = 0xC0F0;
 const LOCAL_PNG: u32 = 0xC0F1;
 const HTML_NAME: &str = "HTML Format";
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const PNG_NAME: &str = "PNG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +154,8 @@ pub enum ClipEvent {
     Send(Vec<u8>),
     /// Le serveur a du contenu dans ces formats : l'appelant le demande via `request`.
     RemoteChanged(Vec<ClipFormat>),
-    /// Réponse à `request` ; `None` si le serveur a refusé ou si les données sont illisibles.
+    /// Réponse à `request` ; `None` si le serveur a refusé, si les données sont illisibles ou
+    /// si une Format List plus récente les a rendues caduques.
     RemoteData(Option<LocalData>),
 }
 
@@ -187,6 +192,8 @@ pub struct Clipboard {
     local: Vec<LocalData>,
     /// Format demandé au serveur, réponse attendue (une seule à la fois : pas d'identifiant).
     pending: Option<ClipFormat>,
+    /// Une Format List est arrivée depuis la demande en vol : sa réponse sera écartée.
+    stale: bool,
 }
 
 impl Clipboard {
@@ -200,12 +207,23 @@ impl Clipboard {
             return Err(Error::Truncated("en-tête cliprdr"));
         };
         let len = len as usize;
+        // Octets au-delà de dataLen (remplissage de certains serveurs) ignorés.
+        let body = if len > MAX_DATA { None } else { msg.get(8..8 + len) };
+        let mut ev = Vec::new();
+        if msg_type == msg::FORMAT_DATA_RESPONSE {
+            // Réponse non sollicitée : ignorée. Tronquée, elle termine quand même la demande en
+            // vol (une seule à la fois), sinon plus aucune demande ne partirait.
+            if let Some(format) = self.pending.take() {
+                let fresh = !core::mem::take(&mut self.stale);
+                let data = body.filter(|_| fresh && flags & RESPONSE_OK != 0).and_then(|b| decode(format, b));
+                ev.push(ClipEvent::RemoteData(data));
+            }
+            return Ok(ev);
+        }
         if len > MAX_DATA {
             return Err(Error::Invalid("message cliprdr trop grand"));
         }
-        // Octets au-delà de dataLen (remplissage de certains serveurs) ignorés.
-        let body = msg.get(8..8 + len).ok_or(Error::Truncated("message cliprdr"))?;
-        let mut ev = Vec::new();
+        let body = body.ok_or(Error::Truncated("message cliprdr"))?;
         match msg_type {
             msg::CLIP_CAPS => self.caps(body)?,
             msg::MONITOR_READY => {
@@ -216,9 +234,15 @@ impl Clipboard {
                 ev.push(ClipEvent::Send(self.format_list()));
             }
             msg::FORMAT_LIST => {
-                self.remote = self.parse_format_list(body, flags & ASCII_NAMES != 0)?;
+                // Liste inexploitable : CB_RESPONSE_FAIL (2.2.3.2), l'état précédent reste.
+                let Ok(remote) = self.parse_format_list(body, flags & ASCII_NAMES != 0) else {
+                    ev.push(ClipEvent::Send(pdu(msg::FORMAT_LIST_RESPONSE, RESPONSE_FAIL, &[])));
+                    return Ok(ev);
+                };
+                self.remote = remote;
                 // Le serveur possède désormais le presse-papier : notre contenu ne sera plus demandé.
                 self.local.clear();
+                self.stale = self.pending.is_some();
                 ev.push(ClipEvent::Send(pdu(msg::FORMAT_LIST_RESPONSE, RESPONSE_OK, &[])));
                 ev.push(ClipEvent::RemoteChanged(self.remote_formats()));
             }
@@ -230,13 +254,6 @@ impl Clipboard {
                     Some(d) => pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, &d),
                     None => pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_FAIL, &[]),
                 }));
-            }
-            msg::FORMAT_DATA_RESPONSE => {
-                // Réponse non sollicitée : ignorée.
-                if let Some(format) = self.pending.take() {
-                    let data = (flags & RESPONSE_OK != 0).then(|| decode(format, body)).flatten();
-                    ev.push(ClipEvent::RemoteData(data));
-                }
             }
             msg::FILECONTENTS_REQUEST => {
                 // Jamais annoncé ; on refuse proprement (streamId repris, 2.2.5.4).
@@ -268,7 +285,8 @@ impl Clipboard {
     }
 
     /// Demande au serveur le premier format de `preferred` qu'il propose. Rien si aucun ne
-    /// convient ou si une demande attend déjà sa réponse.
+    /// convient ou si une demande attend déjà sa réponse (la réponse ne porte pas d'identifiant :
+    /// pas d'annulation possible, une réponse tardive serait prise pour la suivante).
     pub fn request(&mut self, preferred: &[ClipFormat]) -> Vec<ClipEvent> {
         if self.pending.is_some() {
             return Vec::new();
@@ -278,11 +296,6 @@ impl Clipboard {
         };
         self.pending = Some(format);
         alloc::vec![ClipEvent::Send(pdu(msg::FORMAT_DATA_REQUEST, 0, &id.to_le_bytes()))]
-    }
-
-    /// Abandonne la demande en cours (délai dépassé côté appelant).
-    pub fn cancel_request(&mut self) {
-        self.pending = None;
     }
 
     /// Formats actuellement proposés par le serveur.
@@ -305,23 +318,29 @@ impl Clipboard {
         }
     }
 
+    /// CLIPRDR_CAPS (2.2.2.1) : l'état ne change que si toute la PDU est valide.
     fn caps(&mut self, body: &[u8]) -> Result<(), Error> {
         let count = le16(body, 0).ok_or(Error::Truncated("CB_CLIP_CAPS"))?;
-        self.server_caps = true;
+        let mut long_names = self.long_names;
         let mut at = 4;
         for _ in 0..count {
             let (Some(kind), Some(len)) = (le16(body, at), le16(body, at + 2)) else {
                 return Err(Error::Truncated("jeu de capacités cliprdr"));
             };
+            let len = usize::from(len);
             if len < 4 {
                 return Err(Error::Invalid("longueur de capacité cliprdr"));
             }
+            let set = body.get(at..at + len).ok_or(Error::Truncated("jeu de capacités cliprdr"))?;
             if kind == CAPSTYPE_GENERAL {
-                let flags = le32(body, at + 8).ok_or(Error::Truncated("capacité générale cliprdr"))?;
-                self.long_names = flags & USE_LONG_FORMAT_NAMES != 0;
+                // CLIPRDR_GENERAL_CAPABILITY (2.2.2.1.1) : indicateurs dans les 12 octets du jeu.
+                let flags = le32(set, 8).ok_or(Error::Truncated("capacité générale cliprdr"))?;
+                long_names = flags & USE_LONG_FORMAT_NAMES != 0;
             }
-            at += usize::from(len);
+            at += len;
         }
+        self.server_caps = true;
+        self.long_names = long_names;
         Ok(())
     }
 
@@ -366,12 +385,18 @@ impl Clipboard {
                 let name = &rest[4..];
                 let units =
                     name.as_chunks::<2>().0.iter().position(|c| c == &[0, 0]).unwrap_or(name.len() / 2);
+                if out.len() == MAX_FORMATS {
+                    return Err(Error::Invalid("Format List trop longue"));
+                }
                 out.push((id, utf16_to_string(&name[..units * 2])));
                 rest = name.get(units * 2 + 2..).unwrap_or_default();
             }
         } else {
             if !body.len().is_multiple_of(36) {
                 return Err(Error::Invalid("Format List (noms courts) mal alignée"));
+            }
+            if body.len() / 36 > MAX_FORMATS {
+                return Err(Error::Invalid("Format List trop longue"));
             }
             for entry in body.as_chunks::<36>().0 {
                 let id = le32(entry, 0).unwrap_or(0);
@@ -394,7 +419,8 @@ fn decode(format: ClipFormat, data: &[u8]) -> Option<LocalData> {
     Some(match format {
         ClipFormat::Text => LocalData::Text(utf16_to_string(data)),
         ClipFormat::Html => LocalData::Html(cf_html_fragment(data)),
-        ClipFormat::Png => LocalData::Png(data.to_vec()),
+        // Sans la signature PNG, l'image est illisible : l'appelant peut se rabattre sur le DIB.
+        ClipFormat::Png => LocalData::Png(data.starts_with(PNG_SIGNATURE).then(|| data.to_vec())?),
         ClipFormat::Dib => {
             let (width, height, rgba) = dib_to_rgba(data).ok()?;
             LocalData::Rgba { width, height, rgba }

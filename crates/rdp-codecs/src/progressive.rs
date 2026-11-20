@@ -4,8 +4,9 @@
 //! Tuiles 64 × 64 en YCbCr, DWT à trois niveaux (souvent « reduce-extrapolate »), RLGR1. Une
 //! tuile arrive entière (TILE_SIMPLE) ou en passes : TILE_FIRST quantifiée grossièrement, puis
 //! des TILE_UPGRADE qui ajoutent des bits (SRL pour les coefficients encore nuls, bits bruts pour
-//! les autres). L'état par tuile (coefficients courants, signes) vit dans le contexte
-//! `codecContextId` jusqu'à RDPGFX_DELETE_ENCODING_CONTEXT_PDU.
+//! les autres). L'état par tuile (coefficients courants, signes) vit dans un contexte dont
+//! l'appelant choisit la clé : rdp-gfx en tient un par SURFACE (pas par `codecContextId`),
+//! oublié à la création et à la suppression de la surface.
 //!
 //! Déquantification : décalage de `q + BitPos - 1` (quantification de la région + quantification
 //! progressive de la passe, virgule fixe 11.5 comme le reste de RemoteFX).
@@ -29,6 +30,14 @@ const RFX_DWT_REDUCE_EXTRAPOLATE: u8 = 0x01;
 const RFX_TILE_DIFFERENCE: u8 = 0x01;
 /// progressiveQuality : table « pleine qualité » (tous les BitPos à zéro).
 const FULL_QUALITY: u8 = 0xFF;
+/// Tuiles gardées, tous contextes confondus (36 Kio chacune au plus) : de quoi couvrir une
+/// surface de 8192 × 8192, la plus grande que rdp-gfx accepte.
+const MAX_TILES: usize = 16384;
+/// Aire cumulée des rectangles d'un appel à `decode` (chaque pixel peint et recopié en coûte
+/// un), comme le budget par commande de rdp-gfx.
+const MAX_PIXELS: usize = 64 << 20;
+/// Rectangles d'une trame.
+const MAX_FRAME_RECTS: usize = 65536;
 
 /// Valeur par bande, ordre linéaire (HL1 … HH3, LL3).
 type Quant = [u8; 10];
@@ -54,11 +63,13 @@ struct Context {
     tiles: BTreeMap<u32, Tile>,
 }
 
-/// Décodeur avec état, un contexte par `codecContextId`.
+/// Décodeur avec état, un contexte par clé `context_id` de l'appelant.
 pub struct Progressive {
     contexts: BTreeMap<u32, Context>,
     /// Tampons de travail : sortie RLGR, trois plans pour la DWT inverse, tampon de la DWT.
     work: Vec<[i16; COEFFS]>,
+    /// Tuiles de tous les contextes (plafond `MAX_TILES`).
+    tiles: usize,
 }
 
 impl Default for Progressive {
@@ -83,7 +94,7 @@ struct Surface<'a> {
 
 impl Progressive {
     pub fn new() -> Self {
-        Self { contexts: BTreeMap::new(), work: vec![[0; COEFFS]; 5] }
+        Self { contexts: BTreeMap::new(), work: vec![[0; COEFFS]; 5], tiles: 0 }
     }
 
     /// Décode un flux progressif sur une surface RGBA (stride = surface_width*4). Renvoie les
@@ -102,8 +113,9 @@ impl Progressive {
             return Err(Error::Invalid("progressif : surface plus petite que ses dimensions"));
         }
         let mut surf = Surface { px: surface, w, h };
-        let Self { contexts, work } = self;
+        let Self { contexts, work, tiles } = self;
         let ctx = contexts.entry(context_id).or_default();
+        let mut pixels = MAX_PIXELS;
         let mut frame: Option<Frame> = None;
         let mut updated = Vec::new();
         let mut rest = src;
@@ -134,7 +146,7 @@ impl Progressive {
                 // Une région hors FRAME_BEGIN … FRAME_END est ignorée (2.2.4.2.1.5).
                 WBT_REGION => {
                     if let Some(f) = frame.as_mut() {
-                        region(ctx, work, body, f, &surf)?;
+                        region(ctx, work, body, f, &surf, tiles, &mut pixels)?;
                     }
                 }
                 // SYNC (facultatif), tuiles hors région, types inconnus : ignorés.
@@ -149,7 +161,9 @@ impl Progressive {
 
     /// Oublie un contexte (RDPGFX_DELETE_ENCODING_CONTEXT_PDU).
     pub fn delete_context(&mut self, context_id: u32) {
-        self.contexts.remove(&context_id);
+        if let Some(c) = self.contexts.remove(&context_id) {
+            self.tiles -= c.tiles.len();
+        }
     }
 }
 
@@ -188,13 +202,16 @@ fn shifts(quant: &Quant, bitpos: &Quant) -> Quant {
     core::array::from_fn(|b| (quant[b] + bitpos[b]).saturating_sub(1))
 }
 
-/// RFX_PROGRESSIVE_REGION : rectangles, tables de quantification, puis tuiles.
+/// RFX_PROGRESSIVE_REGION : rectangles, tables de quantification, puis tuiles. `tile_count` :
+/// tuiles de tous les contextes ; `pixels` : aire de rectangles encore permise.
 fn region(
     ctx: &mut Context,
     work: &mut [[i16; COEFFS]],
     body: &[u8],
     frame: &mut Frame,
     surf: &Surface,
+    tile_count: &mut usize,
+    pixels: &mut usize,
 ) -> Result<(), Error> {
     let h = body.get(..12).ok_or(Error::Truncated("RFX_PROGRESSIVE_REGION"))?;
     if h[0] as usize != TILE {
@@ -226,16 +243,22 @@ fn region(
         let (x, y) = (u16_at(r, 0) as usize, u16_at(r, 2) as usize);
         let (x2, y2) = ((x + u16_at(r, 4) as usize).min(surf.w), (y + u16_at(r, 6) as usize).min(surf.h));
         if x < x2 && y < y2 {
+            let area = (x2 - x) * (y2 - y);
+            if frame.rects.len() == MAX_FRAME_RECTS || area > *pixels {
+                return Err(Error::Invalid("progressif : trame trop coûteuse"));
+            }
+            *pixels -= area;
             frame.rects.push((x, y, x2 - x, y2 - y));
         }
     }
 
-    for _ in 0..num_tiles {
-        if tiles.is_empty() {
-            break;
-        }
+    // Toutes les tuiles du champ, en nombre `numTiles` (2.2.4.2.1.4) ; comme FreeRDP, moins de
+    // 6 octets restants ne font pas un bloc.
+    let mut count = 0usize;
+    while tiles.len() >= 6 {
         let (kind, tb, next) = block(tiles)?;
         tiles = next;
+        count += 1;
         if !matches!(kind, WBT_TILE_SIMPLE | WBT_TILE_FIRST | WBT_TILE_UPGRADE) {
             continue;
         }
@@ -276,10 +299,19 @@ fn region(
         };
         let parts = split(data, &lens, "tuile progressive")?;
         if let Some(key) = tile_key(x_idx, y_idx, surf) {
+            if !ctx.tiles.contains_key(&key) {
+                if *tile_count == MAX_TILES {
+                    return Err(Error::Invalid("progressif : trop de tuiles"));
+                }
+                *tile_count += 1;
+            }
             let diff = flags & RFX_TILE_DIFFERENCE != 0;
             first(ctx, &mut work[0], key, &quant, &prog, diff, extrapolate, [parts[0], parts[1], parts[2]]);
             frame.tiles.push(key);
         }
+    }
+    if count != usize::from(num_tiles) {
+        return Err(Error::Invalid("progressif : numTiles ne correspond pas aux tuiles"));
     }
     Ok(())
 }
@@ -479,7 +511,9 @@ impl<'a> Srl<'a> {
     }
 }
 
-/// Peint les tuiles de la trame, découpées par ses rectangles.
+/// Peint les tuiles de la trame, découpées par ses rectangles. Chaque rectangle ne visite que
+/// les tuiles qu'il couvre : le travail suit l'aire des rectangles (bornée par `region`), pas
+/// le produit tuiles × rectangles.
 fn paint(
     ctx: &Context,
     work: &mut [[i16; COEFFS]],
@@ -491,24 +525,36 @@ fn paint(
     frame.tiles.dedup();
     let [planes @ .., tmp] = work else { return };
     let Some(planes) = planes.get_mut(1..4) else { return };
-    for key in &frame.tiles {
-        let Some(tile) = ctx.tiles.get(key) else { continue };
-        let (tx, ty) = ((key & 0xFFFF) as usize * TILE, (key >> 16) as usize * TILE);
-        let clip = |&(x, y, w, h): &(usize, usize, usize, usize)| {
-            let (x0, y0) = (x.max(tx), y.max(ty));
-            let (x1, y1) = ((x + w).min(tx + TILE), (y + h).min(ty + TILE));
-            (x0 < x1 && y0 < y1).then_some((x0, y0, x1 - x0, y1 - y0))
-        };
-        if !frame.rects.iter().any(|r| clip(r).is_some()) {
-            continue;
+    // (tuile reçue, rectangle qui la couvre), groupés par tuile dans l'ordre des clés.
+    let mut pairs = Vec::new();
+    for (i, &(x, y, w, h)) in frame.rects.iter().enumerate() {
+        // Index de tuile sur 16 bits : au-delà, aucune tuile n'existe.
+        for ty in y / TILE..=((y + h - 1) / TILE).min(0xFFFF) {
+            for tx in x / TILE..=((x + w - 1) / TILE).min(0xFFFF) {
+                let key = ((ty as u32) << 16) | tx as u32;
+                if frame.tiles.binary_search(&key).is_ok() {
+                    pairs.push((key, i));
+                }
+            }
         }
+    }
+    pairs.sort_unstable();
+    for group in pairs.chunk_by(|a, b| a.0 == b.0) {
+        let key = group[0].0;
+        let Some(tile) = ctx.tiles.get(&key) else { continue };
+        let (tx, ty) = ((key & 0xFFFF) as usize * TILE, (key >> 16) as usize * TILE);
         for (p, c) in planes.iter_mut().zip(&tile.coeffs) {
             *p = *c;
             rfx::idwt(p, tmp, tile.extrapolate);
         }
-        for (x, y, w, h) in frame.rects.iter().filter_map(clip) {
-            let dst = &mut surf.px[(y * surf.w + x) * 4..];
-            rfx::ycbcr_to_rgba(&planes[0], &planes[1], &planes[2], (x - tx, y - ty, w, h), dst, surf.w * 4);
+        for &(_, i) in group {
+            // Intersection non vide : le rectangle couvre la tuile par construction.
+            let (x, y, w, h) = frame.rects[i];
+            let (x0, y0) = (x.max(tx), y.max(ty));
+            let (x1, y1) = ((x + w).min(tx + TILE), (y + h).min(ty + TILE));
+            let dst = &mut surf.px[(y0 * surf.w + x0) * 4..];
+            let zone = (x0 - tx, y0 - ty, x1 - x0, y1 - y0);
+            rfx::ycbcr_to_rgba(&planes[0], &planes[1], &planes[2], zone, dst, surf.w * 4);
         }
     }
     updated.extend(frame.rects.iter().map(|&(x, y, w, h)| (x as u32, y as u32, w as u32, h as u32)));
@@ -574,15 +620,18 @@ mod tests {
     }
 
     /// Région 64×64 extrapolée, quant 6 partout, une table progressive à BitPos 2 partout.
-    fn region_blk(rect: (u16, u16, u16, u16), tiles: &[Vec<u8>]) -> Vec<u8> {
+    fn region_blk(rects: &[(u16, u16, u16, u16)], tiles: &[Vec<u8>]) -> Vec<u8> {
+        let num_tiles = tiles.len() as u16;
         let tiles: Vec<u8> = tiles.concat();
         let mut b = vec![64];
-        b.extend_from_slice(&1u16.to_le_bytes()); // numRects
+        b.extend_from_slice(&(rects.len() as u16).to_le_bytes());
         b.extend_from_slice(&[1, 1, RFX_DWT_REDUCE_EXTRAPOLATE]);
-        b.extend_from_slice(&1u16.to_le_bytes()); // numTiles (une ou plusieurs, borné par la taille)
+        b.extend_from_slice(&num_tiles.to_le_bytes());
         b.extend_from_slice(&(tiles.len() as u32).to_le_bytes());
-        for v in [rect.0, rect.1, rect.2, rect.3] {
-            b.extend_from_slice(&v.to_le_bytes());
+        for r in rects {
+            for v in [r.0, r.1, r.2, r.3] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
         }
         b.extend_from_slice(&[0x66; 5]);
         b.push(50);
@@ -631,7 +680,7 @@ mod tests {
         let mut surf = vec![0u8; w * h * 4];
         let mut p = Progressive::new();
         // DC 10 avec q = 6 (décalage 5) → Y = 10 + 128 partout dans la tuile (1, 0).
-        let s = frame(&[region_blk((70, 10, 40, 20), &[tile(WBT_TILE_SIMPLE, 1, 0, 10)])]);
+        let s = frame(&[region_blk(&[(70, 10, 40, 20)], &[tile(WBT_TILE_SIMPLE, 1, 0, 10)])]);
         let rects = p.decode(7, &s, &mut surf, w as u32, h as u32).unwrap();
         assert_eq!(rects, [(70, 10, 30, 20)]);
         assert_eq!(px(&surf, w, 70, 10), [138, 138, 138, 255]);
@@ -647,7 +696,7 @@ mod tests {
         let mut surf = vec![0u8; w * h * 4];
         let mut p = Progressive::new();
         // Passe 1 : BitPos 2 → décalage 6 + 2 − 1 = 7, DC 10 → Y = 40 + 128.
-        let s = frame(&[region_blk((0, 0, 64, 64), &[tile(WBT_TILE_FIRST, 0, 0, 10)])]);
+        let s = frame(&[region_blk(&[(0, 0, 64, 64)], &[tile(WBT_TILE_FIRST, 0, 0, 10)])]);
         p.decode(1, &s, &mut surf, 64, 64).unwrap();
         assert_eq!(px(&surf, w, 33, 17), [168, 168, 168, 255]);
         assert_eq!(p.contexts[&1].tiles[&0].sign.len(), 3);
@@ -661,7 +710,7 @@ mod tests {
             b.extend_from_slice(&l.to_le_bytes());
         }
         b.extend_from_slice(&raw);
-        let s = frame(&[region_blk((0, 0, 64, 64), &[blk(WBT_TILE_UPGRADE, &b)])]);
+        let s = frame(&[region_blk(&[(0, 0, 64, 64)], &[blk(WBT_TILE_UPGRADE, &b)])]);
         p.decode(1, &s, &mut surf, 64, 64).unwrap();
         assert_eq!(px(&surf, w, 0, 0), [169, 169, 169, 255]);
         assert_eq!(px(&surf, w, 63, 63), [169, 169, 169, 255]);
@@ -670,7 +719,7 @@ mod tests {
 
         // Une passe qui recule est refusée ; après suppression du contexte, l'état disparaît.
         let s = frame(&[region_blk(
-            (0, 0, 64, 64),
+            &[(0, 0, 64, 64)],
             &[blk(WBT_TILE_UPGRADE, &{
                 let mut b = vec![0, 0, 0, 0, 0, 0, 0, 0];
                 b.extend_from_slice(&[0; 12]);
@@ -686,13 +735,13 @@ mod tests {
     fn tiles_outside_surface_and_bad_indexes() {
         let mut surf = vec![0u8; 64 * 64 * 4];
         let mut p = Progressive::new();
-        let s = frame(&[region_blk((0, 0, 64, 64), &[tile(WBT_TILE_SIMPLE, 5, 9, 3)])]);
+        let s = frame(&[region_blk(&[(0, 0, 64, 64)], &[tile(WBT_TILE_SIMPLE, 5, 9, 3)])]);
         assert!(p.decode(0, &s, &mut surf, 64, 64).is_ok());
         assert!(p.contexts[&0].tiles.is_empty());
         // Index de quantification 1 alors qu'il n'y a qu'une table.
         let mut t = tile(WBT_TILE_SIMPLE, 0, 0, 3);
         t[6] = 1;
-        let s = frame(&[region_blk((0, 0, 64, 64), &[t])]);
+        let s = frame(&[region_blk(&[(0, 0, 64, 64)], &[t])]);
         assert!(p.decode(0, &s, &mut surf, 64, 64).is_err());
         // Surface trop petite pour ses dimensions annoncées.
         assert!(p.decode(0, &s, &mut surf, 65, 64).is_err());
@@ -702,11 +751,14 @@ mod tests {
     fn truncated_and_garbage_never_panic() {
         let mut surf = vec![0u8; 128 * 64 * 4];
         let s = frame(&[region_blk(
-            (0, 0, 128, 64),
+            &[(0, 0, 128, 64)],
             &[tile(WBT_TILE_FIRST, 0, 0, 7), tile(WBT_TILE_SIMPLE, 1, 0, -4)],
         )]);
         let mut p = Progressive::new();
         assert!(p.decode(0, &s, &mut surf, 128, 64).is_ok());
+        // Les deux tuiles sont peintes : FIRST (décalage 7, Y = 28 + 128), SIMPLE (Y = −4 + 128).
+        assert_eq!(px(&surf, 128, 10, 10), [156, 156, 156, 255]);
+        assert_eq!(px(&surf, 128, 100, 10), [124, 124, 124, 255]);
         for n in 0..s.len() {
             let _ = p.decode(0, &s[..n], &mut surf, 128, 64);
         }
@@ -724,5 +776,51 @@ mod tests {
             }
             let _ = p.decode(round, &g, &mut surf, 128, 64);
         }
+    }
+
+    #[test]
+    fn num_tiles_must_match_the_tiles_field() {
+        let mut surf = vec![0u8; 128 * 64 * 4];
+        let mut p = Progressive::new();
+        let two = [tile(WBT_TILE_SIMPLE, 0, 0, 1), tile(WBT_TILE_SIMPLE, 1, 0, 2)];
+        for n in [1u8, 3] {
+            let mut r = region_blk(&[(0, 0, 128, 64)], &two);
+            r[12] = n; // numTiles
+            assert!(p.decode(0, &frame(&[r]), &mut surf, 128, 64).is_err());
+        }
+    }
+
+    #[test]
+    fn tile_state_is_capped_across_contexts() {
+        let mut surf = vec![0u8; 128 * 64 * 4];
+        let mut p = Progressive::new();
+        let one = frame(&[region_blk(&[(0, 0, 64, 64)], &[tile(WBT_TILE_SIMPLE, 0, 0, 1)])]);
+        p.decode(1, &one, &mut surf, 128, 64).unwrap();
+        p.tiles = MAX_TILES;
+        // Tuile déjà connue : remplacée sans compter ; nouvelle tuile (autre contexte) : refusée.
+        assert!(p.decode(1, &one, &mut surf, 128, 64).is_ok());
+        assert!(p.decode(2, &one, &mut surf, 128, 64).is_err());
+        p.delete_context(1);
+        assert_eq!(p.tiles, MAX_TILES - 1);
+    }
+
+    #[test]
+    fn rect_outside_the_tile_is_skipped() {
+        // Rectangle à gauche de la tuile (1, 0) : rien à peindre, pas de soustraction négative.
+        let mut surf = vec![0u8; 128 * 64 * 4];
+        let mut p = Progressive::new();
+        let s = frame(&[region_blk(&[(0, 0, 32, 64)], &[tile(WBT_TILE_SIMPLE, 1, 0, 5)])]);
+        assert_eq!(p.decode(0, &s, &mut surf, 128, 64).unwrap(), [(0, 0, 32, 64)]);
+        assert!(surf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn overlapping_rects_are_budgeted() {
+        // Des rectangles superposés sur une même tuile au-delà du budget : refusés avant de peindre.
+        let mut surf = vec![0u8; 64 * 64 * 4];
+        let rects = vec![(0, 0, 64, 64); MAX_PIXELS / (64 * 64) + 1];
+        let s = frame(&[region_blk(&rects, &[tile(WBT_TILE_SIMPLE, 0, 0, 5)])]);
+        assert!(Progressive::new().decode(0, &s, &mut surf, 64, 64).is_err());
+        assert!(surf.iter().all(|&b| b == 0));
     }
 }

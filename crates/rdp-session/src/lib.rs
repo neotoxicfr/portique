@@ -31,6 +31,9 @@ pub const CLIPRDR: &str = "cliprdr";
 const DRDYNVC: &str = "drdynvc";
 /// STATUS_NOT_SUPPORTED : refus de création d'un canal dynamique inconnu.
 const DVC_REFUSED: i32 = 0xC000_00BBu32 as i32;
+/// Canaux dynamiques ouverts à la fois : deux noms acceptés, et de quoi en recréer un avant la
+/// fermeture de l'ancien. Chaque réassembleur peut garder un message entier (64 Mio au plus).
+const MAX_DVCS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -101,6 +104,8 @@ pub struct Session {
     /// Canaux statiques : identifiant MCS → nom.
     channels: BTreeMap<u16, &'static str>,
     to_join: Vec<u16>,
+    /// Canal dont on attend le Channel Join Confirm.
+    joining: u16,
     /// Le serveur accepte qu'on saute les MCS Channel Join (MS-RDPBCGR 2.2.1.4.2) : un aller-retour de
     /// moins par canal, ce qui compte sur un lien lointain.
     skip_join: bool,
@@ -123,6 +128,7 @@ impl Session {
             io_channel: 0,
             channels: BTreeMap::new(),
             to_join: Vec::new(),
+            joining: 0,
             skip_join: false,
             share_id: 0,
             fastpath: fastpath::Reassembler::default(),
@@ -214,7 +220,11 @@ impl Session {
                 self.join_next(&mut ev);
             }
             State::Joining => {
-                mcs::channel_join_confirm(frame)?;
+                // T.125 : le confirm porte le canal joint ; un autre que celui demandé laisserait un
+                // canal non joint sans qu'on le sache.
+                if mcs::channel_join_confirm(frame)? != self.joining {
+                    return Err(Error::Invalid("MCS : canal confirmé différent du canal demandé"));
+                }
                 self.join_next(&mut ev);
             }
             _ => self.domain_pdu(frame, &mut ev)?,
@@ -225,6 +235,7 @@ impl Session {
     fn join_next(&mut self, ev: &mut Vec<Event>) {
         match self.to_join.pop() {
             Some(ch) => {
+                self.joining = ch;
                 ev.push(Event::Send(mcs::channel_join_request(self.user, ch)));
                 self.state = State::Joining;
             }
@@ -310,6 +321,13 @@ impl Session {
                 let (kind, body) = slowpath::read_data_pdu(sc.body)?;
                 self.data_pdu(kind, body, ev)?;
             }
+            // MS-RDPBCGR 2.2.13.3.1 : redirection vers un autre hôte d'une ferme RDS, non gérée ;
+            // mieux vaut le dire que laisser un écran noir.
+            pdu_type::SERVER_REDIRECT => {
+                return Err(Error::Invalid(
+                    "redirection de ferme RDS non gérée : vise directement l'hôte de session",
+                ));
+            }
             _ => {}
         }
         Ok(())
@@ -363,8 +381,10 @@ impl Session {
                 ev.extend(out.into_iter().map(Event::Send));
             }
             DvcPdu::Create { channel_id, name } => {
-                let accepted =
+                let wanted =
                     name == DVC_GRAPHICS || (name == DVC_DISPLAY_CONTROL && self.cfg.display_control);
+                let room = self.dvcs.contains_key(&channel_id) || self.dvcs.len() < MAX_DVCS;
+                let accepted = wanted && room;
                 let status = if accepted { 0 } else { DVC_REFUSED };
                 let out = self.static_send(DRDYNVC, &vc::dvc_create_response(channel_id, status));
                 ev.extend(out.into_iter().map(Event::Send));
@@ -431,8 +451,12 @@ impl Session {
         fastpath::input_frame(events)
     }
 
-    /// Redemande l'écran entier (après reprise d'affichage).
+    /// Redemande l'écran entier (après reprise d'affichage). Vide tant que la session n'est pas
+    /// active : l'utilisateur MCS et le partage ne sont pas encore connus.
     pub fn refresh(&self) -> Vec<u8> {
+        if self.state != State::Active {
+            return Vec::new();
+        }
         mcs::send_data_request(
             self.user,
             self.io_channel,
@@ -440,8 +464,12 @@ impl Session {
         )
     }
 
-    /// Demande de fermeture propre (le serveur répond par une déconnexion).
+    /// Demande de fermeture propre (le serveur répond par une déconnexion). Vide tant que la
+    /// session n'est pas active.
     pub fn shutdown(&mut self) -> Vec<u8> {
+        if self.state != State::Active {
+            return Vec::new();
+        }
         mcs::send_data_request(
             self.user,
             self.io_channel,
@@ -481,4 +509,64 @@ impl core::fmt::Debug for Session {
 /// Texte lisible d'une erreur de session.
 pub fn describe(e: &Error) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> Session {
+        Session::new(Config {
+            width: 800,
+            height: 600,
+            keyboard_layout: 0x040C,
+            client_name: "test".into(),
+            selected_protocol: 0,
+            username: "alice".into(),
+            domain: String::new(),
+            display_control: true,
+        })
+    }
+
+    #[test]
+    fn join_confirm_must_name_the_requested_channel() {
+        // Channel Join Confirm (T.125) : en-tête, résultat 0, initiateur, canal demandé, canal joint.
+        let confirm = |joined: u16| {
+            rdp_pdu::x224::data(&[&[0x3E, 0, 0, 7, 0x03, 0xEC][..], &joined.to_be_bytes()].concat())
+        };
+        let mut s = session();
+        s.state = State::Joining;
+        s.user = 1007;
+        s.joining = 1004;
+        assert!(s.feed(&confirm(1005)).is_err(), "autre canal : refus");
+        s.state = State::Joining;
+        assert!(s.feed(&confirm(1004)).is_ok());
+    }
+
+    #[test]
+    fn refresh_and_shutdown_wait_for_activation() {
+        let mut s = session();
+        assert!(s.refresh().is_empty());
+        assert!(s.shutdown().is_empty());
+    }
+
+    #[test]
+    fn open_dynamic_channels_are_capped() {
+        let mut s = session();
+        // DYNVC_CREATE_REQ (MS-RDPEDYC 2.2.2.1) : identifiant sur un octet, nom terminé par un nul.
+        let create = |id: u8| [&[0x10, id], DVC_GRAPHICS.as_bytes(), &[0]].concat();
+        let opened = |s: &mut Session, id: u8| {
+            let mut ev = Vec::new();
+            s.drdynvc(&create(id), &mut ev).unwrap();
+            ev.iter().any(|e| matches!(e, Event::DvcOpened { .. }))
+        };
+        for id in 1..=MAX_DVCS as u8 {
+            assert!(opened(&mut s, id));
+        }
+        assert!(!opened(&mut s, 9), "au-delà du plafond : refusé");
+        assert!(opened(&mut s, 1), "recréation d'un canal ouvert : acceptée");
+        s.drdynvc(&[0x40, 2], &mut Vec::new()).unwrap(); // DYNVC_CLOSE
+        assert!(opened(&mut s, 9));
+        assert_eq!(s.dvcs.len(), MAX_DVCS);
+    }
 }

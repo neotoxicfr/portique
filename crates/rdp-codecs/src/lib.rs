@@ -1,8 +1,8 @@
 //! Décodeurs d'image et de compression utilisés par le pipeline graphique (EGFX).
 //!
-//! Sortie commune : pixels RGBA 8 bits par canal, ligne après ligne, `stride = largeur * 4`
-//! (l'ordre attendu par `ImageData` côté navigateur). Aucune I/O, aucune allocation cachée
-//! au-delà des tampons internes des décodeurs avec état.
+//! Les décodeurs d'image écrivent des pixels RGBA 8 bits par canal, ligne après ligne,
+//! `stride = largeur * 4` (l'ordre attendu par `ImageData` côté navigateur) ; Planar et NSCodec
+//! passent par des plans temporaires. ZGFX ajoute les octets décompressés à un `Vec`. Aucune I/O.
 
 #![no_std]
 extern crate alloc;

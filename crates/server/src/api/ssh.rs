@@ -99,7 +99,7 @@ pub async fn open(
 
 /// Chaîne des sauts, premier rebond d'abord, cible en dernier. Les rebonds n'ont pas à être
 /// accessibles à l'utilisateur : seul l'accès à la cible compte.
-async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> {
+pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> {
     let mut rows = vec![target];
     while let Some(jump) = rows.last().and_then(|r| r.ssh_jump_id) {
         if rows.len() >= ssh::MAX_HOPS || rows.iter().any(|r| r.id == jump) {

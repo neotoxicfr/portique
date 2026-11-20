@@ -93,7 +93,7 @@ pub async fn ssh_command(
     use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
-    use russh::{ChannelMsg, client};
+    use russh::client;
 
     validate_command(template).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -147,6 +147,21 @@ pub async fn ssh_command(
         ok,
         "identifiants SSH refusés (clé du service absente de l'hôte, mot de passe absent ou faux)"
     );
+    let result = run_wake_command(&session, template, mac).await;
+    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "fr").await;
+    result
+}
+
+/// Lance la commande de réveil (`template`, `{mac}` remplacé) sur une session SSH déjà authentifiée et
+/// vérifie son résultat. Commune au réveil par adresse saisie et au réveil par un hôte SSH déclaré.
+pub async fn run_wake_command<H: russh::client::Handler>(
+    session: &russh::client::Handle<H>,
+    template: &str,
+    mac: [u8; 6],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use russh::ChannelMsg;
+
     let mut channel = session.channel_open_session().await.context("canal SSH")?;
     // La MAC est formatée par nous (hexadécimal et « : ») : rien d'injectable.
     let cmd = template.replace("{mac}", &format_mac(mac));
@@ -166,7 +181,6 @@ pub async fn ssh_command(
             _ => {}
         }
     }
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "fr").await;
     let text = String::from_utf8_lossy(&output).trim().to_owned();
     // Code de sortie non nul, ou erreur RouterOS écrite dans la sortie : RouterOS répond 0 même quand
     // la commande échoue.

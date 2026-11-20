@@ -113,6 +113,13 @@ pub struct Opened {
     pub pinned: Vec<(i64, String)>,
 }
 
+/// Chaîne ouverte et authentifiée : les connexions, premier rebond d'abord, cible en dernier.
+pub struct Chain {
+    pub sessions: Vec<client::Handle<Check>>,
+    /// Clés d'hôte approuvées à cette ouverture, à épingler : (hôte, empreinte).
+    pub pinned: Vec<(i64, String)>,
+}
+
 /// Ouvre la chaîne `hops` (premier rebond d'abord, cible en dernier) puis un shell `cols`×`rows`.
 /// `trust` : empreinte qu'un admin vient d'approuver pour l'hôte indiqué.
 pub async fn open(
@@ -122,6 +129,19 @@ pub async fn open(
     cols: u16,
     rows: u16,
 ) -> Result<Opened, OpenError> {
+    let Chain { sessions, pinned } = connect(hops, key, trust).await?;
+    let last = sessions.last().context("aucun hôte")?;
+    let channel = last.channel_open_session().await.context("ouverture du canal SSH")?;
+    channel
+        .request_pty(false, "xterm-256color", u32::from(cols), u32::from(rows), 0, 0, &[])
+        .await
+        .context("demande de terminal")?;
+    channel.request_shell(false).await.context("lancement du shell")?;
+    Ok(Opened { sessions, channel, pinned })
+}
+
+/// Ouvre et authentifie la chaîne `hops`, saut par saut.
+pub async fn connect(hops: &[Hop], key: &PrivateKey, trust: Option<(i64, &str)>) -> Result<Chain, OpenError> {
     let key = Arc::new(key.clone());
     let config =
         Arc::new(client::Config { keepalive_interval: Some(Duration::from_secs(30)), ..Default::default() });
@@ -190,12 +210,8 @@ pub async fn open(
         }
         sessions.push(session);
     }
-    let last = sessions.last().context("aucun hôte")?;
-    let channel = last.channel_open_session().await.context("ouverture du canal SSH")?;
-    channel
-        .request_pty(false, "xterm-256color", u32::from(cols), u32::from(rows), 0, 0, &[])
-        .await
-        .context("demande de terminal")?;
-    channel.request_shell(false).await.context("lancement du shell")?;
-    Ok(Opened { sessions, channel, pinned })
+    if sessions.is_empty() {
+        return Err(anyhow::anyhow!("aucun hôte").into());
+    }
+    Ok(Chain { sessions, pinned })
 }

@@ -411,6 +411,25 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let pc = list.as_array().unwrap().iter().find(|c| c["name"] == "PC").unwrap();
     assert_eq!((pc["rdp"].as_bool(), pc["ssh"].as_bool()), (Some(true), Some(true)));
 
+    // Réveil par un hôte SSH déclaré : un autre hôte, qui a le SSH.
+    let wol = |via: i64| {
+        json!({"name": "PC", "host": "192.0.2.50", "username": "alice", "wol_mac": "00:11:22:33:44:55",
+        "ssh": {"user": "alice", "port": 2201, "jump_id": gw_id},
+        "wol_command": {"via_id": via, "command": "/tool wol interface=ether1 mac={mac}"}})
+    };
+    for bad in [pc_id, rdp_only] {
+        let r =
+            call(&app, "PUT", &format!("/api/admin/connections/{pc_id}"), Some(&admin), Some(wol(bad)), &[])
+                .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "réveil par {bad} : {:?}", r.body);
+    }
+    let r =
+        call(&app, "PUT", &format!("/api/admin/connections/{pc_id}"), Some(&admin), Some(wol(gw_id)), &[])
+            .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body["wol_command"]["via_id"], gw_id);
+    assert_eq!(r.body["wol_command"]["host"], "");
+
     // Clé du service : créée une fois, stable ensuite.
     let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;
     let k2 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;

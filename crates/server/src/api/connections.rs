@@ -42,13 +42,14 @@ pub(crate) struct Row {
     pub(crate) ssh_hostkey: Option<String>,
     pub(crate) ssh_jump_id: Option<i64>,
     pub(crate) ssh_theme: Option<String>,
+    pub(crate) wol_via_id: Option<i64>,
 }
 
 macro_rules! columns {
     () => {
         "id, name, host, rdp_enabled, port, username, domain, password, wol_mac, wol_target, cert_sha256, \
          wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey, wol_ssh_hostkey_pending, \
-         ssh_enabled, ssh_port, ssh_user, ssh_password, ssh_hostkey, ssh_jump_id, ssh_theme"
+         ssh_enabled, ssh_port, ssh_user, ssh_password, ssh_hostkey, ssh_jump_id, ssh_theme, wol_via_id"
     };
 }
 
@@ -58,16 +59,32 @@ async fn save_wol_command(
     id: i64,
     cmd: &Option<portique_proto::WolCommandInput>,
 ) -> ApiResult<()> {
+    let clear = "UPDATE connections SET wol_ssh_host = NULL, wol_ssh_user = NULL, wol_ssh_password = NULL,
+         wol_ssh_command = NULL, wol_ssh_hostkey = NULL, wol_ssh_hostkey_pending = NULL, wol_via_id = NULL WHERE id = ?";
     let Some(r) = cmd else {
-        sqlx::query(
-            "UPDATE connections SET wol_ssh_host = NULL, wol_ssh_user = NULL, wol_ssh_password = NULL,
-             wol_ssh_command = NULL, wol_ssh_hostkey = NULL, wol_ssh_hostkey_pending = NULL WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+        sqlx::query(clear).bind(id).execute(&state.db).await?;
         return Ok(());
     };
+    if let Some(via) = r.via_id {
+        // Par un hôte SSH déclaré : sa clé, son mot de passe, sa clé d'hôte et ses rebonds servent.
+        wol::validate_command(r.command.trim()).map_err(bad)?;
+        let ssh: Option<bool> = sqlx::query_scalar("SELECT ssh_enabled FROM connections WHERE id = ?")
+            .bind(via)
+            .fetch_optional(&state.db)
+            .await?;
+        if via == id || ssh != Some(true) {
+            return Err(bad("réveil : choisir un autre hôte, qui a le SSH"));
+        }
+        sqlx::query(clear).bind(id).execute(&state.db).await?;
+        sqlx::query("UPDATE connections SET wol_via_id = ?, wol_ssh_command = ? WHERE id = ?")
+            .bind(via)
+            .bind(r.command.trim())
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        return Ok(());
+    }
+    sqlx::query("UPDATE connections SET wol_via_id = NULL WHERE id = ?").bind(id).execute(&state.db).await?;
     let host = r.host.trim();
     let ok = |v: &str, extra: &str| {
         !v.is_empty() && v.len() <= 253 && v.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
@@ -163,6 +180,28 @@ pub async fn wake(
 ) -> ApiResult<StatusCode> {
     let row = find_allowed(&state.db, u.id, u.is_admin, id).await?;
     let mac = row.wol_mac.as_deref().and_then(wol::parse_mac).ok_or_else(|| bad("WoL non configuré"))?;
+    if let (Some(via), Some(template)) = (row.wol_via_id, row.wol_ssh_command.as_deref()) {
+        let result = wake_via(&state, via, template, mac).await;
+        return match result {
+            Ok(name) => {
+                tracing::info!(
+                    user = u.username,
+                    connection = row.name,
+                    ssh = name,
+                    "WoL envoyé par commande"
+                );
+                Ok(StatusCode::NO_CONTENT)
+            }
+            Err(e) => {
+                tracing::warn!(user = u.username, connection = row.name, "échec du réveil : {e:#}");
+                Err(bad(if u.is_admin {
+                    format!("réveil par commande : {e:#}")
+                } else {
+                    "le réveil a échoué ; un admin trouvera le détail dans le journal".to_owned()
+                }))
+            }
+        };
+    }
     if let Some(host) = &row.wol_ssh_host {
         let password = match &row.wol_ssh_password {
             Some(sealed) => Some(
@@ -223,6 +262,26 @@ pub async fn wake(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Réveil par un hôte SSH déclaré : sa chaîne de rebonds, puis la commande. Renvoie son nom.
+async fn wake_via(state: &AppState, via: i64, template: &str, mac: [u8; 6]) -> anyhow::Result<String> {
+    let host = find_allowed(&state.db, 0, true, via)
+        .await
+        .map_err(|_| anyhow::anyhow!("hôte de réveil introuvable"))?;
+    let name = host.name.clone();
+    let hops = crate::api::ssh::chain(state, host).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let key = crate::ssh::service_key(state).await?;
+    let chain = match crate::ssh::connect(&hops, &key, None).await {
+        Ok(c) => c,
+        Err(crate::ssh::OpenError::Unapproved { name, .. }) => anyhow::bail!(
+            "clé d'hôte de « {name} » pas encore approuvée : ouvre une fois son terminal pour l'approuver"
+        ),
+        Err(crate::ssh::OpenError::Failed(e)) => return Err(e),
+    };
+    let last = chain.sessions.last().ok_or_else(|| anyhow::anyhow!("aucun hôte"))?;
+    wol::run_wake_command(last, template, mac).await?;
+    Ok(name)
+}
+
 async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
     let allowed_users =
         sqlx::query_scalar("SELECT user_id FROM connection_access WHERE connection_id = ? ORDER BY user_id")
@@ -242,10 +301,11 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
         wol_target: r.wol_target,
         allowed_users,
         cert_fingerprint: r.cert_sha256.as_deref().map(hex::encode),
-        wol_command: r.wol_ssh_host.clone().map(|host| portique_proto::WolCommandAdmin {
-            host,
+        wol_command: r.wol_ssh_command.clone().map(|command| portique_proto::WolCommandAdmin {
+            via_id: r.wol_via_id,
+            host: r.wol_ssh_host.clone().unwrap_or_default(),
             user: r.wol_ssh_user.clone().unwrap_or_default(),
-            command: r.wol_ssh_command.clone().unwrap_or_default(),
+            command,
             has_password: r.wol_ssh_password.is_some(),
             hostkey: r.wol_ssh_hostkey.clone(),
             pending_hostkey: r.wol_ssh_hostkey_pending.clone(),

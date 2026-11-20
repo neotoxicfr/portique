@@ -180,6 +180,8 @@ struct Form {
     cmd_hostkey: RwSignal<Option<String>>,
     cmd_pending: RwSignal<Option<String>>,
     cmd_approve: RwSignal<bool>,
+    /// Hôte SSH déclaré par lequel passe la commande ; vide = adresse saisie.
+    cmd_via: RwSignal<String>,
     ssh: RwSignal<bool>,
     ssh_port: RwSignal<String>,
     ssh_user: RwSignal<String>,
@@ -220,6 +222,7 @@ impl Form {
         self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
         self.cmd_pending.set(w.and_then(|w| w.pending_hostkey.clone()));
         self.cmd_approve.set(false);
+        self.cmd_via.set(w.and_then(|w| w.via_id).map(|v| v.to_string()).unwrap_or_default());
         let h = c.and_then(|c| c.ssh.as_ref());
         self.ssh.set(h.is_some());
         self.ssh_port.set(h.map(|h| h.port.to_string()).unwrap_or_default());
@@ -248,6 +251,7 @@ impl Form {
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
             wol_command: self.wol_by_command.get_untracked().then(|| portique_proto::WolCommandInput {
+                via_id: self.cmd_via.get_untracked().parse().ok(),
                 host: self.cmd_host.get_untracked(),
                 user: self.cmd_user.get_untracked(),
                 command: self.cmd_command.get_untracked(),
@@ -438,6 +442,16 @@ fn Connections(
                                         <label class="full">"Cible UDP"<input type="text" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
                                     }
                                 >
+                                    <label class="full">"Passer par"
+                                        <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
+                                            <option value="">"une adresse saisie ci-dessous"</option>
+                                            {move || conns.get().into_iter()
+                                                .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
+                                                .map(|c| view! { <option value=c.id.to_string()>{format!("l'hôte SSH « {} » (sa clé, ses rebonds)", c.name)}</option> })
+                                                .collect_view()}
+                                        </select>
+                                    </label>
+                                    <Show when=move || f.cmd_via.get().is_empty()>
                                     <div class="grid full">
                                         <label>"Hôte SSH"<input type="text" placeholder="10.0.0.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
                                         <label>"Utilisateur SSH"<input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
@@ -446,10 +460,11 @@ fn Connections(
                                                 placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "clé du service seulement" }
                                                 prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/>
                                         </label>
-                                        <label class="full">"Commande ({mac} est remplacé)"
-                                            <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/>
-                                        </label>
                                     </div>
+                                    </Show>
+                                    <label class="full">"Commande ({mac} est remplacé)"
+                                        <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/>
+                                    </label>
                                     {move || f.cmd_hostkey.get().map(|k| view! { <p class="muted mono">"Clé SSH approuvée : " {k}</p> })}
                                     {move || f.cmd_pending.get().map(|k| view! {
                                         <div class="full">

@@ -174,6 +174,8 @@ pub struct SshInput {
 /// MAC (ex. routeur MikroTik : `/tool wol interface=ether1 mac={mac}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WolCommandAdmin {
+    /// Hôte SSH déclaré par lequel passe la commande ; `None` = adresse `host` saisie.
+    pub via_id: Option<i64>,
     pub host: String,
     pub user: String,
     pub command: String,
@@ -188,7 +190,13 @@ pub struct WolCommandAdmin {
 /// `password: None` garde l'ancien.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WolCommandInput {
+    /// Hôte SSH déclaré par lequel passer (sa clé, son mot de passe, ses rebonds) ; s'il est donné,
+    /// `host`, `user` et `password` sont ignorés.
+    #[serde(default)]
+    pub via_id: Option<i64>,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub user: String,
     pub command: String,
     #[serde(default)]

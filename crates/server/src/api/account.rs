@@ -45,9 +45,9 @@ fn local(u: &UserRow) -> ApiResult<()> {
 /// Les tentatives comptent dans la même limitation que la connexion.
 async fn reauth(state: &AppState, ip: std::net::IpAddr, u: &UserRow, proof: &ReAuth) -> ApiResult<()> {
     local(u)?;
-    if !state.limiter.reserve(ip, &u.username) {
+    let Some(ticket) = state.limiter.reserve(ip, &u.username) else {
         return Err(AppError::TooManyAttempts);
-    }
+    };
     let ok = match u.password_hash.as_deref() {
         Some(h) => auth::verify_password(&proof.password, h).await,
         None => false,
@@ -61,7 +61,7 @@ async fn reauth(state: &AppState, ip: std::net::IpAddr, u: &UserRow, proof: &ReA
             return Err(bad("code TOTP invalide"));
         }
     }
-    state.limiter.succeeded(ip, &u.username);
+    state.limiter.succeeded(ip, &u.username, ticket);
     Ok(())
 }
 
@@ -73,11 +73,17 @@ pub async fn change_password(
 ) -> ApiResult<StatusCode> {
     reauth(&state, ip, &u, &req.auth).await?;
     auth::validate_password(&req.new)?;
-    sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+    // N'écrit que sur le hash que `reauth` vient de vérifier : un mot de passe remis par un admin pendant
+    // le hachage (sessions coupées) ne doit pas être écrasé par l'ancien détenteur du compte.
+    let r = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
         .bind(auth::hash_password(&req.new).await?)
         .bind(u.id)
+        .bind(u.password_hash.as_deref())
         .execute(&state.db)
         .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::Unauthorized);
+    }
     // Les autres sessions tombent : un mot de passe changé doit couper un intrus.
     sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(u.id).execute(&state.db).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -280,4 +286,49 @@ pub async fn terminal_set(
         .execute(&state.db)
         .await?;
     Ok(Json(TerminalPrefs { theme: p.theme, combos }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, extract::State};
+    use portique_proto::{ChangePassword, ReAuth};
+
+    use crate::{
+        auth::{self, ClientIp, CurrentUser, user_by_name},
+        state::AppError,
+    };
+
+    /// Un admin remet le mot de passe pendant que l'ancien détenteur change le sien (requête déjà
+    /// authentifiée, hash vérifié) : l'écriture de ce dernier ne passe plus, celle de l'admin reste.
+    #[tokio::test]
+    async fn password_reset_meanwhile_is_not_overwritten() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let stale = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        sqlx::query("UPDATE users SET password_hash = 'remis' WHERE id = ?")
+            .bind(stale.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let req = || ChangePassword {
+            auth: ReAuth { password: "admin-password-123".into(), totp: None },
+            new: "nouveau-mot-de-passe".into(),
+        };
+        let ip = ClientIp("192.0.2.1".parse().unwrap());
+        let r = super::change_password(State(s.clone()), ip, CurrentUser(stale.clone()), Json(req())).await;
+        assert!(matches!(r, Err(AppError::Unauthorized)));
+        let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        assert_eq!(now.password_hash.as_deref(), Some("remis"));
+
+        // Sans écriture concurrente, le changement passe.
+        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(stale.password_hash.as_deref())
+            .bind(stale.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let ip = ClientIp("192.0.2.1".parse().unwrap());
+        assert!(super::change_password(State(s.clone()), ip, CurrentUser(stale), Json(req())).await.is_ok());
+        let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        assert!(auth::verify_password("nouveau-mot-de-passe", now.password_hash.as_deref().unwrap()).await);
+    }
 }

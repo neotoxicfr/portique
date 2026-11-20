@@ -101,7 +101,8 @@ pub enum PointerUpdate {
         x: u16,
         y: u16,
     },
-    /// Nouveau curseur, à mémoriser dans l'emplacement `cache_index`.
+    /// Nouveau curseur, à mémoriser dans l'emplacement `cache_index`. Vide (0×0) si sa forme n'est pas
+    /// décodable : l'appelant montre alors le curseur par défaut, et le garde pour cet emplacement.
     New {
         cache_index: u16,
         pointer: Pointer,
@@ -201,9 +202,10 @@ fn color_pointer(r: &mut Reader, bpp: usize, large: bool) -> Result<Option<Point
     let xor = r.bytes(xor_len, "masque XOR")?;
     let and = r.bytes(and_len, "masque AND")?;
     if matches!(bpp, 4 | 8) {
-        // Indices dans la palette de la session (2.2.9.1.1.4.4), que Portique ne suit pas :
-        // curseur ignoré, la PDU ayant été lue en entier.
-        return Ok(None);
+        // Indices dans la palette de la session (2.2.9.1.1.4.4), que Portique ne suit pas. L'emplacement
+        // reçoit quand même un curseur, vide : un CACHED ultérieur ne doit pas ressortir l'image d'avant.
+        let pointer = Pointer { width: 0, height: 0, hot_x, hot_y, rgba: Vec::new() };
+        return Ok(Some(PointerUpdate::New { cache_index, pointer }));
     }
     let rgba = decode_masks(width as usize, height as usize, bpp, xor, and)?;
     Ok(Some(PointerUpdate::New { cache_index, pointer: Pointer { width, height, hot_x, hot_y, rgba } }))
@@ -376,14 +378,19 @@ mod tests {
     }
 
     #[test]
-    fn palette_pointer_ignored_but_checked() {
-        // Curseur 2×2 à 8 bpp : XOR 2 lignes de 2 octets, AND 2 lignes de 2 octets.
+    fn palette_pointer_empties_its_slot_but_is_checked() {
+        // Curseur 2×2 à 8 bpp en emplacement 3 : XOR 2 lignes de 2 octets, AND 2 lignes de 2 octets. Palette
+        // non suivie, mais l'emplacement est remplacé (vide) : un CACHED(3) ne ressort pas l'image d'avant.
         let mut p = 8u16.to_le_bytes().to_vec();
-        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 2, 0, 2, 0]);
+        p.extend_from_slice(&[3, 0, 0, 0, 0, 0, 2, 0, 2, 0]);
         p.extend_from_slice(&4u16.to_le_bytes());
         p.extend_from_slice(&4u16.to_le_bytes());
         p.extend_from_slice(&[0; 8]);
-        assert_eq!(pointer_update(update_code::POINTER, &p), Ok(None));
+        let empty = Pointer { width: 0, height: 0, hot_x: 0, hot_y: 0, rgba: Vec::new() };
+        assert_eq!(
+            pointer_update(update_code::POINTER, &p),
+            Ok(Some(PointerUpdate::New { cache_index: 3, pointer: empty }))
+        );
         assert_eq!(
             pointer_update(update_code::POINTER, &p[..p.len() - 1]),
             Err(Error::Truncated("masque AND"))

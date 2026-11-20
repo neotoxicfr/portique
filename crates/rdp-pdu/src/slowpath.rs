@@ -32,12 +32,25 @@ pub mod perf {
     pub const ENABLE_DESKTOP_COMPOSITION: u32 = 0x0000_0100;
 }
 
+/// Longueur maximale (unités UTF-16, sans le nul final) du domaine et de l'utilisateur d'un Client Info :
+/// 512 octets nul compris depuis RDP 5.1 (2.2.1.11.1.1).
+pub const MAX_INFO_STRING: usize = 255;
+
 /// Client Info PDU (2.2.1.11), sécurité de base comprise. Le mot de passe reste vide : avec NLA,
-/// le serveur a déjà les identifiants (CredSSP).
-pub fn client_info(domain: &str, username: &str, flags: u32, performance_flags: u32) -> Vec<u8> {
+/// le serveur a déjà les identifiants (CredSSP). Refuse un domaine ou un utilisateur trop long : le
+/// serveur le rejetterait, et la PDU ne tiendrait plus dans une longueur PER sur deux octets.
+pub fn client_info(
+    domain: &str,
+    username: &str,
+    flags: u32,
+    performance_flags: u32,
+) -> Result<Vec<u8>, Error> {
     // Les chaînes sont écrites en UTF-16LE : INFO_UNICODE doit l'annoncer (2.2.1.11.1.1).
     let flags = flags | info_flags::UNICODE;
     let (dom, user, empty) = (utf16z(domain), utf16z(username), utf16z(""));
+    if dom.len().max(user.len()) > (MAX_INFO_STRING + 1) * 2 {
+        return Err(Error::Invalid("domaine ou utilisateur RDP trop long (255 caractères au plus)"));
+    }
     let mut p = Vec::with_capacity(512);
     p.extend_from_slice(&SEC_INFO_PKT.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes());
@@ -61,7 +74,7 @@ pub fn client_info(domain: &str, username: &str, flags: u32, performance_flags: 
     p.extend_from_slice(&0u32.to_le_bytes()); // clientSessionId
     p.extend_from_slice(&performance_flags.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes()); // cbAutoReconnectCookie
-    p
+    Ok(p)
 }
 
 /// Message de licence (2.2.1.12) : `Ok(true)` si le serveur valide le client sans échange.
@@ -493,10 +506,25 @@ mod tests {
 
     #[test]
     fn client_info_lengths() {
-        let p = client_info("", "alice", info_flags::UNICODE, 0);
+        let p = client_info("", "alice", info_flags::UNICODE, 0).unwrap();
         assert_eq!(u16::from_le_bytes([p[0], p[1]]), SEC_INFO_PKT);
         assert_eq!(u16::from_le_bytes([p[14], p[15]]), 10, "cbUserName (UTF-16) sans le zéro final");
-        let p = client_info("", "alice", 0, 0);
+        let p = client_info("", "alice", 0, 0).unwrap();
         assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), info_flags::UNICODE);
+    }
+
+    #[test]
+    fn client_info_rejects_long_names() {
+        let max = "é".repeat(MAX_INFO_STRING);
+        let p = client_info(&max, &max, 0, 0).unwrap();
+        assert_eq!(u16::from_le_bytes([p[12], p[13]]), 510, "cbDomain au maximum");
+        let long = "a".repeat(MAX_INFO_STRING + 1);
+        // Un caractère hors BMP compte pour deux unités UTF-16.
+        let astral = "x".repeat(MAX_INFO_STRING - 1) + "\u{1F600}";
+        for (d, u) in
+            [(long.as_str(), "alice"), ("", long.as_str()), (astral.as_str(), ""), ("", astral.as_str())]
+        {
+            assert!(matches!(client_info(d, u, 0, 0), Err(Error::Invalid(_))), "{} {}", d.len(), u.len());
+        }
     }
 }

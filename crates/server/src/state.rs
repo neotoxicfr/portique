@@ -14,7 +14,11 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration, Webauthn};
 
-use crate::{config::Config, crypto::Vault, ratelimit::LoginLimiter};
+use crate::{
+    config::Config,
+    crypto::Vault,
+    ratelimit::{LoginLimiter, Ticket},
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,7 +32,7 @@ pub struct AppState {
 
 pub enum Ceremony {
     Register { user_id: i64, state: PasskeyRegistration },
-    Login { user_id: i64, state: PasskeyAuthentication },
+    Login { user_id: i64, state: PasskeyAuthentication, ticket: Ticket },
 }
 
 /// Cérémonies WebAuthn en cours (défi en attente de réponse), 5 minutes maximum.

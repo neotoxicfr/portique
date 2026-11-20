@@ -36,9 +36,9 @@ pub async fn login(
 ) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
     require_builtin(&state)?;
     let name = req.username.trim();
-    if !state.limiter.reserve(ip, name) {
+    let Some(ticket) = state.limiter.reserve(ip, name) else {
         return Err(AppError::TooManyAttempts);
-    }
+    };
     let user = auth::user_by_name(&state.db, name).await?;
     let ok = match user.as_ref().and_then(|u| u.password_hash.as_deref()) {
         Some(hash) => auth::verify_password(&req.password, hash).await,
@@ -55,7 +55,7 @@ pub async fn login(
     if let Some(sealed) = &user.totp_secret {
         let Some(code) = req.totp.as_deref().filter(|c| !c.is_empty()) else {
             // Mot de passe bon : on demande le code, sans compter d'échec.
-            state.limiter.release(ip, name);
+            state.limiter.release(ip, name, ticket);
             return Ok((jar, Json(LoginResponse::TotpRequired)));
         };
         if !auth::consume_totp(&state, &user, sealed, code).await? {
@@ -63,7 +63,7 @@ pub async fn login(
         }
     }
 
-    state.limiter.succeeded(ip, name);
+    state.limiter.succeeded(ip, name, ticket);
     tracing::info!(%ip, user = user.username, "connexion");
     // Mot de passe + TOTP vérifié ci-dessus : second facteur.
     let proof = auth::Proof::Password {
@@ -98,9 +98,9 @@ pub async fn passkey_start(
     let name = req.username.trim();
     // Chaque démarrage compte comme une tentative, rendue si la connexion aboutit : sinon des démarrages
     // sans fin pour un compte valide rempliraient la table des défis.
-    if !state.limiter.reserve(ip, name) {
+    let Some(ticket) = state.limiter.reserve(ip, name) else {
         return Err(AppError::TooManyAttempts);
-    }
+    };
     let user = auth::user_by_name(&state.db, name).await?;
     let keys = match &user {
         Some(u) => load_passkeys(&state, u.id).await?,
@@ -112,7 +112,7 @@ pub async fn passkey_start(
     let creds: Vec<Passkey> = keys.into_iter().map(|(_, k)| k).collect();
     let (options, st) =
         state.webauthn.start_passkey_authentication(&creds).map_err(|e| anyhow::anyhow!("webauthn : {e}"))?;
-    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st })?;
+    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st, ticket })?;
     Ok(Json(CeremonyChallenge { ceremony, options }))
 }
 
@@ -123,7 +123,7 @@ pub async fn passkey_finish(
     Json(req): Json<CeremonyFinish<PublicKeyCredential>>,
 ) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
     require_builtin(&state)?;
-    let Some(Ceremony::Login { user_id, state: st }) = state.ceremonies.take(req.ceremony) else {
+    let Some(Ceremony::Login { user_id, state: st, ticket }) = state.ceremonies.take(req.ceremony) else {
         return Err(AppError::BadRequest("défi expiré, recommence".into()));
     };
     let user = auth::user_by_id(&state.db, user_id).await?.ok_or(AppError::Unauthorized)?;
@@ -152,7 +152,7 @@ pub async fn passkey_finish(
             .await?;
     }
 
-    state.limiter.succeeded(ip, &user.username);
+    state.limiter.succeeded(ip, &user.username, ticket);
     tracing::info!(%ip, user = user.username, "connexion par passkey");
     let jar = auth::open_session(&state, jar, user.id, auth::Proof::Passkey(id)).await?;
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))

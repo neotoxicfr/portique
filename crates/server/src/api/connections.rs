@@ -377,6 +377,11 @@ fn validate(i: &ConnectionInput) -> ApiResult<Valid> {
     if port == 0 {
         return Err(bad("port invalide"));
     }
+    // Borne du Client Info RDP (MS-RDPBCGR 2.2.1.11.1.1, 512 octets UTF-16 nul compris) : au-delà, le bureau
+    // ne s'ouvrirait jamais, autant prévenir l'admin à la saisie.
+    if [&i.username, &i.domain].iter().any(|s| s.trim().encode_utf16().count() > 255) {
+        return Err(bad("utilisateur et domaine RDP : 255 caractères maximum"));
+    }
     if let Some(ssh) = &i.ssh {
         if ssh.port == Some(0) {
             return Err(bad("port SSH invalide"));
@@ -573,4 +578,27 @@ pub async fn delete(
 ) -> ApiResult<StatusCode> {
     let r = sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&state.db).await?;
     if r.rows_affected() == 0 { Err(AppError::NotFound) } else { Ok(StatusCode::NO_CONTENT) }
+}
+
+#[cfg(test)]
+mod tests {
+    use portique_proto::ConnectionInput;
+
+    fn input(username: &str, domain: &str) -> ConnectionInput {
+        serde_json::from_value(serde_json::json!({
+            "name": "pc", "host": "192.0.2.10", "port": null, "username": username, "domain": domain,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rdp_username_and_domain_are_bounded() {
+        let max = "é".repeat(255);
+        assert!(super::validate(&input(&max, &max)).is_ok());
+        let long = "a".repeat(256);
+        assert!(super::validate(&input(&long, "")).is_err(), "utilisateur");
+        assert!(super::validate(&input("alice", &long)).is_err(), "domaine");
+        // Hors BMP : deux unités UTF-16 par caractère.
+        assert!(super::validate(&input(&"\u{1F600}".repeat(128), "")).is_err());
+    }
 }

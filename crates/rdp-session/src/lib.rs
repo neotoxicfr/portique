@@ -217,7 +217,7 @@ impl Session {
                         .collect();
                     self.to_join.reverse();
                 }
-                self.join_next(&mut ev);
+                self.join_next(&mut ev)?;
             }
             State::Joining => {
                 // T.125 : le confirm porte le canal joint ; un autre que celui demandé laisserait un
@@ -225,14 +225,14 @@ impl Session {
                 if mcs::channel_join_confirm(frame)? != self.joining {
                     return Err(Error::Invalid("MCS : canal confirmé différent du canal demandé"));
                 }
-                self.join_next(&mut ev);
+                self.join_next(&mut ev)?;
             }
             _ => self.domain_pdu(frame, &mut ev)?,
         }
         Ok(ev)
     }
 
-    fn join_next(&mut self, ev: &mut Vec<Event>) {
+    fn join_next(&mut self, ev: &mut Vec<Event>) -> Result<(), Error> {
         match self.to_join.pop() {
             Some(ch) => {
                 self.joining = ch;
@@ -252,11 +252,12 @@ impl Session {
                         | slowpath::info_flags::LOGONERRORS
                         | slowpath::info_flags::NOAUDIOPLAYBACK,
                     slowpath::perf::ENABLE_FONT_SMOOTHING | slowpath::perf::ENABLE_DESKTOP_COMPOSITION,
-                );
+                )?;
                 ev.push(Event::Send(mcs::send_data_request(self.user, self.io_channel, &info)));
                 self.state = State::License;
             }
         }
+        Ok(())
     }
 
     fn io(&self, payload: &[u8]) -> Event {
@@ -541,6 +542,19 @@ mod tests {
         assert!(s.feed(&confirm(1005)).is_err(), "autre canal : refus");
         s.state = State::Joining;
         assert!(s.feed(&confirm(1004)).is_ok());
+    }
+
+    /// Un identifiant démesuré (base antérieure à la borne de saisie) donne une erreur, pas une panique de
+    /// l'encodage PER au moment du Client Info.
+    #[test]
+    fn oversized_username_is_an_error() {
+        let mut s = session();
+        s.cfg.username = "a".repeat(9000);
+        s.state = State::Joining;
+        s.user = 1007;
+        s.joining = 1004;
+        let confirm = rdp_pdu::x224::data(&[0x3E, 0, 0, 7, 0x03, 0xEC, 0x03, 0xEC]);
+        assert!(matches!(s.feed(&confirm), Err(Error::Invalid(_))));
     }
 
     #[test]

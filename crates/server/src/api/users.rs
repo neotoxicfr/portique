@@ -36,7 +36,7 @@ pub async fn list(State(state): State<AppState>, _: AdminUser) -> ApiResult<Json
 
 pub async fn create(
     State(state): State<AppState>,
-    _: AdminUser,
+    AdminUser(me): AdminUser,
     Json(i): Json<UserInput>,
 ) -> ApiResult<StatusCode> {
     if state.cfg.auth_mode == AuthMode::Proxy {
@@ -46,15 +46,20 @@ pub async fn create(
     auth::validate_username(name)?;
     let pw = i.password.as_deref().ok_or_else(|| bad("mot de passe requis"))?;
     auth::validate_password(pw)?;
-    let r =
-        sqlx::query("INSERT INTO users (username, password_hash, is_admin, webauthn_id) VALUES (?, ?, ?, ?)")
-            .bind(name)
-            .bind(auth::hash_password(pw).await?)
-            .bind(i.is_admin)
-            .bind(uuid::Uuid::new_v4().to_string())
-            .execute(&state.db)
-            .await;
+    // Même garde que `update` : l'auteur, rétrogradé pendant le hachage, ne crée plus de compte (admin compris).
+    let r = sqlx::query(
+        "INSERT INTO users (username, password_hash, is_admin, webauthn_id)
+         SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND is_admin)",
+    )
+    .bind(name)
+    .bind(auth::hash_password(pw).await?)
+    .bind(i.is_admin)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(me.id)
+    .execute(&state.db)
+    .await;
     match r {
+        Ok(r) if r.rows_affected() == 0 => Err(AppError::Forbidden),
         Ok(_) => Ok(StatusCode::CREATED),
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
             Err(AppError::Conflict("identifiant déjà pris".into()))
@@ -179,7 +184,8 @@ mod tests {
     };
 
     /// Deux admins se rétrogradent l'un l'autre en même temps : les deux requêtes ont passé `AdminUser`,
-    /// la seconde à écrire trouve son auteur déjà rétrogradé et ne laisse pas la base sans admin.
+    /// la seconde à écrire trouve son auteur déjà rétrogradé et ne laisse pas la base sans admin. Un admin
+    /// rétrogradé pendant le hachage ne crée pas non plus de compte.
     #[tokio::test]
     async fn an_admin_demoted_meanwhile_cannot_demote_or_delete() {
         let s = crate::api::ssh::tests::state("builtin").await;
@@ -209,6 +215,14 @@ mod tests {
         assert!(matches!(r, Err(AppError::Forbidden)), "remise à zéro 2FA");
         let bob = user_by_name(&s.db, "bob").await.unwrap().unwrap();
         assert!(bob.is_admin && bob.totp_secret.is_some());
+        let input = UserInput {
+            username: "carol".into(),
+            password: Some("mot-de-passe-long".into()),
+            is_admin: true,
+        };
+        let r = super::create(State(s.clone()), AdminUser(admin.clone()), Json(input)).await;
+        assert!(matches!(r, Err(AppError::Forbidden)), "création");
+        assert!(user_by_name(&s.db, "carol").await.unwrap().is_none());
     }
 
     /// Un admin réinitialise la 2FA de bob pendant qu'un autre le rétrograde : la remise à zéro ne

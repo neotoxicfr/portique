@@ -31,8 +31,17 @@ pub struct AppState {
 }
 
 pub enum Ceremony {
-    Register { user_id: i64, state: PasskeyRegistration },
-    Login { user_id: i64, state: PasskeyAuthentication, ticket: Ticket },
+    Register {
+        user_id: i64,
+        state: PasskeyRegistration,
+    },
+    /// `ip` : adresse du démarrage, celle sous laquelle la tentative a été réservée (et sera rendue).
+    Login {
+        user_id: i64,
+        state: PasskeyAuthentication,
+        ticket: Ticket,
+        ip: std::net::IpAddr,
+    },
 }
 
 /// Cérémonies WebAuthn en cours (défi en attente de réponse), 5 minutes maximum.

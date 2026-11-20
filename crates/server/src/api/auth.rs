@@ -112,7 +112,7 @@ pub async fn passkey_start(
     let creds: Vec<Passkey> = keys.into_iter().map(|(_, k)| k).collect();
     let (options, st) =
         state.webauthn.start_passkey_authentication(&creds).map_err(|e| anyhow::anyhow!("webauthn : {e}"))?;
-    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st, ticket })?;
+    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st, ticket, ip })?;
     Ok(Json(CeremonyChallenge { ceremony, options }))
 }
 
@@ -123,7 +123,9 @@ pub async fn passkey_finish(
     Json(req): Json<CeremonyFinish<PublicKeyCredential>>,
 ) -> ApiResult<(CookieJar, Json<LoginResponse>)> {
     require_builtin(&state)?;
-    let Some(Ceremony::Login { user_id, state: st, ticket }) = state.ceremonies.take(req.ceremony) else {
+    let Some(Ceremony::Login { user_id, state: st, ticket, ip: start_ip }) =
+        state.ceremonies.take(req.ceremony)
+    else {
         return Err(AppError::BadRequest("défi expiré, recommence".into()));
     };
     let user = auth::user_by_id(&state.db, user_id).await?.ok_or(AppError::Unauthorized)?;
@@ -152,7 +154,8 @@ pub async fn passkey_finish(
             .await?;
     }
 
-    state.limiter.succeeded(ip, &user.username, ticket);
+    // Rendue sous l'adresse du démarrage : celle de la fin peut différer (réseau mobile, double pile).
+    state.limiter.succeeded(start_ip, &user.username, ticket);
     tracing::info!(%ip, user = user.username, "connexion par passkey");
     let jar = auth::open_session(&state, jar, user.id, auth::Proof::Passkey(id)).await?;
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))

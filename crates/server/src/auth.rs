@@ -408,6 +408,19 @@ mod tests {
         let mfa: Vec<bool> =
             sqlx::query_scalar("SELECT mfa FROM sessions ORDER BY rowid").fetch_all(&s.db).await.unwrap();
         assert_eq!(mfa, [false, true]);
+        // L'identifiant d'une passkey supprimée n'est jamais redonné à la suivante (migration 0007).
+        let add = || async {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'k', '{}') RETURNING id",
+            )
+            .bind(u.id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap()
+        };
+        let first = add().await;
+        sqlx::query("DELETE FROM passkeys WHERE id = ?").bind(first).execute(&s.db).await.unwrap();
+        assert_ne!(add().await, first, "identifiant réattribué");
     }
 
     /// Deux requêtes avec le même code lisent le même `totp_last` : une seule consomme le pas.

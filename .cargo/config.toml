@@ -1,3 +1,0 @@
-# WebCodecs (VideoDecoder…) et l'API Clipboard sont « instables » dans web-sys.
-[target.wasm32-unknown-unknown]
-rustflags = ["--cfg=web_sys_unstable_apis"]

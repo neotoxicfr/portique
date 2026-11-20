@@ -1,0 +1,37 @@
+name: Bug
+description: Quelque chose ne marche pas comme prévu
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Une faille de sécurité ? Ne l'ouvre pas ici : voir SECURITY.md."
+  - type: textarea
+    id: what
+    attributes:
+      label: Ce qui se passe
+      description: Étapes pour reproduire, puis ce que tu attendais.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version de Portique
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: PC distant
+      placeholder: Windows 11 Pro 24H2, GPU NVIDIA, scripts /setup/ appliqués
+  - type: input
+    id: browser
+    attributes:
+      label: Navigateur et système du client
+      placeholder: Chrome 141 sur Android 16
+  - type: textarea
+    id: logs
+    attributes:
+      label: Journaux
+      description: Console du navigateur, `docker logs portique`. Retire noms d'hôte, utilisateurs et captures privées.
+      render: text

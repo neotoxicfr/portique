@@ -1,0 +1,44 @@
+# Exemple : portique derrière Traefik + Authelia (mode proxy), dans l'espace réseau d'un conteneur
+# WireGuard qui joint le réseau du PC (ici `wireguard`). Secrets en fichiers (Docker secrets).
+services:
+  portique:
+    image: portique:0.1.0
+    container_name: portique
+    network_mode: "container:wireguard"   # le PC n'est joignable que par ce tunnel
+    environment:
+      PORTIQUE_LISTEN: 0.0.0.0:8090        # 8080-8083 déjà pris dans cet espace réseau
+      PORTIQUE_PUBLIC_URL: https://portique.example.net
+      PORTIQUE_AUTH_MODE: proxy
+      PORTIQUE_TRUSTED_PROXIES: traefik    # nom résolu toutes les 10 s (IP Docker non fixe), valable 60 s
+      PORTIQUE_PROXY_ADMIN_GROUP: admin
+      PORTIQUE_MASTER_KEY_FILE: /run/secrets/master_key
+    secrets:
+      - master_key
+    volumes:
+      - ./data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges=true
+    cap_drop: [ALL]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+secrets:
+  master_key:
+    file: ./secrets/master_key           # openssl rand -base64 32 > secrets/master_key ; chmod 600
+
+# Route Traefik (fichier dynamique, le conteneur partageant le réseau de wireguard) :
+# http:
+#   routers:
+#     portique:
+#       rule: Host(`portique.example.net`)
+#       service: portique
+#       middlewares: [admin-chain-app]    # Authelia devant ; la CSP de portique n'est pas écrasée
+#   services:
+#     portique:
+#       loadBalancer:
+#         servers:
+#           - url: http://wireguard:8090

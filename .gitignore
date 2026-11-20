@@ -1,0 +1,38 @@
+# Compilation
+/target/
+/dist/
+# xterm.js : téléchargé et vérifié par scripts/vendor-xterm.sh (seul le README est suivi)
+/crates/web/vendor/xterm/*
+!/crates/web/vendor/xterm/README.md
+/pkg/
+
+# Données locales et secrets (jamais dans Git)
+/data/
+/secrets/
+*.db
+*.db-*
+.env
+.env.*
+!.env.exemple
+
+# Sorties de la sonde : captures et enregistrements EGFX de l'écran distant
+*.png
+!crates/web/pwa/*.png
+*.egfx
+*.dump
+
+# Scratch et consignes locales des sessions d'analyse
+/.audit/
+CLAUDE.md
+.claude/
+
+# Paquets de release construits par scripts/release.sh
+/release/
+
+# Éditeurs et systèmes
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+# cargo audit (lancé par scripts/ci.sh). Chaque exception dit pourquoi elle n'est pas atteignable.
+[advisories]
+ignore = [
+    # rsa 0.10 (Marvin, timing sur le déchiffrement/la signature RSA), aucun correctif publié.
+    # Seul russh l'utilise, côté client SSH du Wake-on-LAN : vérification de la clé publique de
+    # l'hôte, aucune clé privée RSA chez nous (authentification par mot de passe). 04/11/2026.
+    "RUSTSEC-2023-0071",
+    # libsqlite3-sys < 0.39 (SQLite < 3.54, CVE-2026-119375) : page de cache non initialisée quand une base
+    # et son fichier -wal piégés, de tailles de page différentes, sont ouverts ensemble. Il faut pouvoir
+    # écrire dans /data, où seul portique écrit (et qui peut y écrire contrôle déjà la base). sqlx 0.9.0
+    # impose libsqlite3-sys < 0.38 : à retirer dès qu'une version de sqlx l'accepte. 13/11/2026.
+    "RUSTSEC-2026-0459",
+]

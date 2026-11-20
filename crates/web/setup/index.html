@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Préparer un PC Windows</title>
+<style>
+:root{--bg:#fff;--fg:#1c1f24;--mut:#5b6470;--card:#f3f5f8;--ac:#1f5fd1}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--fg:#e6e9ee;--mut:#9aa4b2;--card:#1d222a;--ac:#6ea3ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,sans-serif}
+main{max-width:40rem;margin:0 auto;padding:1.5rem 1rem 3rem}
+h1{font-size:1.5rem;margin:.2rem 0 1rem}
+.card{background:var(--card);border-radius:.6rem;padding:.9rem 1rem;margin:.8rem 0}
+a{color:var(--ac)} code{font-size:.92em} ul{padding-left:1.2rem}
+p.mut{color:var(--mut);font-size:.92rem}
+</style>
+</head>
+<body>
+<main>
+<h1>Préparer un PC Windows</h1>
+<p>Ça règle tout ce qu'il faut pour Portique sur Windows 10/11 Pro, sans rien installer. Lance l'un des deux outils en administrateur (clic droit). Tu peux le relancer sans risque.</p>
+<div class="card">
+<strong>Option A : fichiers .reg + .cmd</strong>
+<ul>
+<li>Télécharge les trois fichiers dans le même dossier : <a href="portique.reg" download>portique.reg</a>, <a href="portique.cmd" download>portique.cmd</a>, <a href="annuler.reg" download>annuler.reg</a>.</li>
+<li>Clic droit sur <code>portique.cmd</code> puis « Exécuter en tant qu'administrateur » : il importe le .reg et fait le reste.</li>
+</ul>
+</div>
+<div class="card">
+<strong>Option B : un seul script PowerShell</strong>
+<ul>
+<li>Télécharge <a href="portique.ps1" download>portique.ps1</a>, puis dans PowerShell administrateur : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1</code></li>
+</ul>
+</div>
+<h2>Ce que ça change</h2>
+<ul>
+<li>Bureau à distance activé, authentification NLA obligatoire.</li>
+<li>Graphiques : H.264 AVC 4:4:4, encodage matériel et GPU pour toutes les sessions, 60 images/s, qualité d'image haute.</li>
+<li>Presse-papier, lecteurs, son et micro autorisés ; plus de déconnexion automatique.</li>
+<li>Pare-feu : règles « Bureau à distance » activées.</li>
+<li>Empreinte du certificat RDP affichée à la fin : à la première connexion, Portique montre une empreinte à l'admin, elle doit être <strong>identique</strong> avant de l'approuver.</li>
+<li>Réveil à distance : carte réseau autorisée à réveiller le PC, démarrage rapide désactivé, adresse MAC affichée (à recopier dans Portique). Active aussi Wake-on-LAN dans le BIOS/UEFI.</li>
+</ul>
+<h2>Annuler</h2>
+<p>Option A : importe <code>annuler.reg</code> puis lance <code>portique.cmd annuler</code> (ou seulement la seconde commande, elle importe le .reg). Option B : <code>.\portique.ps1 -Annuler</code>.</p>
+<p class="mut">Un redémarrage peut être nécessaire pour que les réglages graphiques s'appliquent.</p>
+</main>
+</body>
+</html>

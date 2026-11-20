@@ -152,6 +152,27 @@ struct Announce {
     waiters: Vec<oneshot::Sender<Ack>>,
 }
 
+/// Durée de validité d'une annonce sans réponse (ms) : au-delà, on réannonce.
+const ANNOUNCE_TTL_MS: f64 = 2000.0;
+
+/// Relevé pris avant une lecture du presse-papier local (`Announces::mark`).
+#[derive(Clone, Copy)]
+pub struct Mark {
+    remote_copies: u32,
+    published: u32,
+}
+
+/// Suite à donner à une lecture locale terminée (`Announces::after_read`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AfterRead {
+    /// Rien à annoncer ni à attendre.
+    Done,
+    /// Attendre l'accusé de la dernière liste en vol (`join`).
+    Join,
+    /// Contenu à publier (`set_local`, puis `sent` si une liste part).
+    Publish,
+}
+
 /// Nos listes de formats sans réponse, dans l'ordre d'envoi. Windows répond dans l'ordre : chaque
 /// réponse solde la plus ancienne, et seules les attentes de celle-ci reçoivent son verdict.
 #[derive(Default)]
@@ -159,6 +180,8 @@ pub struct Announces {
     pending: VecDeque<Announce>,
     /// Copies faites sur le PC : une lecture locale commencée avant la dernière est dépassée.
     remote_copies: u32,
+    /// Contenus locaux publiés : une lecture commencée avant le dernier est dépassée aussi.
+    published: u32,
 }
 
 impl Announces {
@@ -188,23 +211,52 @@ impl Announces {
         }
     }
 
-    pub fn remote_copies(&self) -> u32 {
-        self.remote_copies
+    /// À relever avant une lecture locale, pour `after_read`.
+    pub fn mark(&self) -> Mark {
+        Mark { remote_copies: self.remote_copies, published: self.published }
     }
 
-    /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Renvoie
-    /// l'empreinte désormais commune aux deux côtés : acceptée, connue et pas remplacée.
-    pub fn answered(&mut self, ok: bool) -> Option<u64> {
-        let a = self.pending.pop_front()?;
+    /// Lecture locale commencée à `mark`, d'empreinte `fp` ; `common` : empreinte commune.
+    /// `Publish` compte la publication : une lecture concurrente plus ancienne sera écartée.
+    pub fn after_read(&mut self, mark: Mark, fp: u64, common: Option<u64>, now: f64) -> AfterRead {
+        // Windows a copié pendant la lecture : son contenu est le plus récent, le nôtre ne doit
+        // ni l'écraser ni invalider sa récupération.
+        if self.remote_copies != mark.remote_copies {
+            return AfterRead::Done;
+        }
+        // Une lecture commencée après celle-ci a déjà publié : ce contenu-ci est plus ancien. On
+        // attend plutôt l'accusé de la publication récente, si elle est encore en vol.
+        if self.published != mark.published {
+            return if self.pending.is_empty() { AfterRead::Done } else { AfterRead::Join };
+        }
+        match self.latest() {
+            // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : même accusé.
+            Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
+            None if common == Some(fp) => AfterRead::Done,
+            _ => {
+                self.published = self.published.wrapping_add(1);
+                AfterRead::Publish
+            }
+        }
+    }
+
+    /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Met à jour
+    /// `common`, l'empreinte commune aux deux côtés : toute liste acceptée a remplacé le contenu
+    /// du PC, il ne reste commun que si c'est la dernière et que son contenu est connu. Le verdict
+    /// des attentes, lui, reste `Replaced` pour une liste suivie d'une autre.
+    pub fn answered(&mut self, ok: bool, common: &mut Option<u64>) {
+        let Some(a) = self.pending.pop_front() else { return };
         let verdict = match (self.pending.is_empty(), ok) {
             (false, _) => Ack::Replaced,
             (true, true) => Ack::Accepted,
             (true, false) => Ack::Refused,
         };
+        if ok {
+            *common = a.fp.filter(|_| verdict == Ack::Accepted);
+        }
         for w in a.waiters {
             let _ = w.send(verdict);
         }
-        a.fp.filter(|_| verdict == Ack::Accepted)
     }
 
     /// Session finie : les attentes sont abandonnées (leur récepteur voit l'annulation).
@@ -444,35 +496,87 @@ mod tests {
         let (tb, mut rb) = wait();
         a.sent(Some(2), 20.0, Some(tb));
         // Monitor Ready, A refusée, B acceptée : A est remplacée, pas créditée du succès de B.
-        assert_eq!(a.answered(true), None);
+        let mut common = Some(9);
+        a.answered(true, &mut common);
         assert_eq!(ra.try_recv(), Ok(None));
-        assert_eq!(a.answered(false), None);
+        assert_eq!(common, None, "liste acceptée au contenu inconnu");
+        common = Some(9);
+        a.answered(false, &mut common);
+        assert_eq!(common, Some(9), "liste refusée : contenu du PC inchangé");
         assert_eq!(ra.try_recv(), Ok(Some(Ack::Replaced)));
         assert_eq!(ra2.try_recv(), Ok(Some(Ack::Replaced)), "attente jointe à A");
         assert_eq!(rb.try_recv(), Ok(None));
-        assert_eq!(a.answered(true), Some(2));
+        a.answered(true, &mut common);
+        assert_eq!(common, Some(2));
         assert_eq!(rb.try_recv(), Ok(Some(Ack::Accepted)));
         assert_eq!(a.latest(), None);
         // Seule en vol : son propre verdict, refus compris.
         let (tc, mut rc) = wait();
         a.sent(Some(3), 30.0, Some(tc));
-        assert_eq!(a.answered(false), None);
+        a.answered(false, &mut common);
         assert_eq!(rc.try_recv(), Ok(Some(Ack::Refused)));
+        assert_eq!(common, Some(2));
+        // A acceptée puis B refusée : le PC a pris A, le contenu commun d'avant n'est plus le sien.
+        let (ta, mut ra) = wait();
+        a.sent(Some(1), 31.0, Some(ta));
+        let (tb, mut rb) = wait();
+        a.sent(Some(2), 32.0, Some(tb));
+        a.answered(true, &mut common);
+        assert_eq!(ra.try_recv(), Ok(Some(Ack::Replaced)));
+        assert_eq!(common, None, "empreinte commune invalidée");
+        a.answered(false, &mut common);
+        assert_eq!(rb.try_recv(), Ok(Some(Ack::Refused)));
+        assert_eq!(common, None);
         // Copie sur le PC pendant l'attente : plus rien à rejoindre ni à valider, verdict remis.
+        common = Some(9);
         let (td, mut rd) = wait();
         a.sent(Some(4), 40.0, Some(td));
-        let copies = a.remote_copies();
         a.remote_changed();
-        assert_ne!(a.remote_copies(), copies);
         assert_eq!(a.latest(), None);
-        assert_eq!(a.answered(true), None);
+        a.answered(true, &mut common);
+        assert_eq!(common, None, "acceptée, contenu inconnu");
         assert_eq!(rd.try_recv(), Ok(Some(Ack::Accepted)));
         // Réponse sans liste en vol : ignorée ; fin de session : attentes annulées.
-        assert_eq!(a.answered(true), None);
+        common = Some(9);
+        a.answered(true, &mut common);
+        assert_eq!(common, Some(9));
         let (te, mut re) = wait();
         a.sent(Some(5), 50.0, Some(te));
         a.clear();
         assert!(re.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_reads_overtaken_are_dropped() {
+        let mut a = Announces::default();
+        // Rien en vol, contenu commun identique : rien à faire ; différent : publié.
+        assert_eq!(a.after_read(a.mark(), 1, Some(1), 0.0), AfterRead::Done);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 2, Some(1), 0.0), AfterRead::Publish);
+        a.sent(Some(2), 0.0, None);
+        // Même contenu encore en vol : on rejoint son accusé ; au-delà du délai : réannoncé.
+        assert_eq!(a.after_read(a.mark(), 2, Some(1), 100.0), AfterRead::Join);
+        assert_eq!(a.after_read(a.mark(), 2, Some(1), 2100.0), AfterRead::Publish);
+        // Lecture A (retour du focus) commencée, puis lecture B (Ctrl+V) qui publie avant elle.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 3, Some(1), 200.0), AfterRead::Publish);
+        a.sent(Some(3), 200.0, None);
+        // A se termine : dépassée, elle attend l'accusé de B au lieu de publier son contenu.
+        assert_eq!(a.after_read(ma, 4, Some(1), 300.0), AfterRead::Join);
+        assert_eq!(a.after_read(ma, 2, Some(1), 300.0), AfterRead::Join);
+        // B déjà accusée : A n'a plus rien à attendre.
+        let mut common = Some(1);
+        a.answered(true, &mut common);
+        a.answered(true, &mut common);
+        assert_eq!(a.after_read(ma, 4, common, 400.0), AfterRead::Done);
+        // Sans publication intermédiaire, la lecture se termine normalement.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 4, common, 500.0), AfterRead::Publish);
+        // Copie sur le PC pendant la lecture : écartée.
+        let m = a.mark();
+        a.remote_changed();
+        assert_eq!(a.after_read(m, 5, common, 600.0), AfterRead::Done);
     }
 
     #[test]

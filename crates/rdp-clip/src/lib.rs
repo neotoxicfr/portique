@@ -205,8 +205,10 @@ impl Clipboard {
     pub fn receive(&mut self, msg: &[u8]) -> Result<Vec<ClipEvent>, Error> {
         let (Some(msg_type), Some(flags), Some(len)) = (le16(msg, 0), le16(msg, 2), le32(msg, 4)) else {
             // Peut-être la réponse attendue, mutilée : comme une réponse tronquée, elle termine la
-            // demande en vol, sinon plus aucune demande ne partirait.
-            if self.pending.take().is_some() {
+            // demande en vol, sinon plus aucune demande ne partirait. Pas si les octets reçus
+            // désignent déjà un autre type : la vraie réponse est encore à venir.
+            let maybe_data = msg.iter().zip(msg::FORMAT_DATA_RESPONSE.to_le_bytes()).all(|(a, b)| *a == b);
+            if maybe_data && self.pending.take().is_some() {
                 self.stale = false;
                 return Ok(alloc::vec![ClipEvent::RemoteData(None)]);
             }
@@ -389,13 +391,18 @@ impl Clipboard {
             while !rest.is_empty() {
                 let id = le32(rest, 0).ok_or(Error::Truncated("Format List"))?;
                 let name = &rest[4..];
-                let units =
-                    name.as_chunks::<2>().0.iter().position(|c| c == &[0, 0]).unwrap_or(name.len() / 2);
+                // Terminateur exigé, même pour un nom vide (2.2.3.1.2.1) : sans lui, liste refusée.
+                let units = name
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|c| c == &[0, 0])
+                    .ok_or(Error::Truncated("nom de format sans terminateur"))?;
                 if out.len() == MAX_FORMATS {
                     return Err(Error::Invalid("Format List trop longue"));
                 }
                 out.push((id, utf16_to_string(&name[..units * 2])));
-                rest = name.get(units * 2 + 2..).unwrap_or_default();
+                rest = &name[units * 2 + 2..];
             }
         } else {
             if !body.len().is_multiple_of(36) {

@@ -84,8 +84,9 @@ struct Inner {
     /// Écrans (et écran courant) sur lesquels porte l'extension en cours.
     staged_screens: Option<(Vec<ScreenGeom>, usize)>,
     touch: Touch,
-    /// Taille voulue (fenêtre) : appliquée dès que le contrôle d'affichage devient prêt.
-    desired: Option<(u32, u32)>,
+    /// Taille voulue (fenêtre) et retour forcé à un écran pas encore envoyé : appliqués dès que
+    /// le contrôle d'affichage devient prêt (voir `single_layout`).
+    desired: Option<((u32, u32), bool)>,
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
@@ -102,7 +103,8 @@ struct Inner {
     /// Écriture locale refusée (page sans focus) : retentée au prochain geste.
     clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>)>,
     /// Empreinte du dernier contenu commun aux deux côtés (évite l'écho PC → navigateur → PC) :
-    /// reçu du PC, ou annoncé par nous ET accepté par Windows. Gardée quand Windows copie un
+    /// reçu du PC, ou annoncé par nous ET accepté par Windows ; effacée quand Windows accepte une
+    /// autre de nos listes (remplacée ensuite, ou au contenu inconnu). Gardée quand Windows copie un
     /// contenu sans format pris en charge (fichiers…) : le contenu local, plus ancien que cette
     /// copie, ne doit pas l'écraser au prochain Ctrl+V.
     clip_last: Option<u64>,
@@ -141,8 +143,6 @@ pub enum Extend {
     Next { opened: usize, total: usize },
 }
 
-/// Durée de validité d'une annonce de presse-papier sans réponse (ms) : au-delà, on réannonce.
-const ANNOUNCE_TTL_MS: f64 = 2000.0;
 /// Classe du champ caché qui reçoit le clavier virtuel (voir `SessionPage`).
 pub const KEYBOARD_CLASS: &str = "session-kbd";
 
@@ -413,7 +413,8 @@ impl Engine {
                         i.display_caps = Some(caps);
                         i.desired
                     };
-                    if let Some((w, h)) = desired {
+                    // Un retour forcé en attente reste forcé (`single_layout`).
+                    if let Some(((w, h), _)) = desired {
                         self.resize(w, h);
                     }
                 }
@@ -1153,12 +1154,10 @@ impl Engine {
     }
 
     /// Réponse de Windows à l'une de nos listes de formats (il répond dans l'ordre d'envoi).
-    /// Acceptée et pas remplacée : notre contenu est celui du PC.
     fn format_list_answered(&self, ok: bool) {
         let mut i = self.inner.borrow_mut();
-        if let Some(fp) = i.clip_announces.answered(ok) {
-            i.clip_last = Some(fp);
-        }
+        let Inner { clip_announces, clip_last, .. } = &mut *i;
+        clip_announces.answered(ok, clip_last);
     }
 
     /// Écrit localement ce que Windows a copié, hors de la boucle de réception : une demande de
@@ -1222,7 +1221,7 @@ impl Engine {
             return true;
         }
         let t0 = js_sys::Date::now();
-        let copies = self.inner.borrow().clip_announces.remote_copies();
+        let mark = self.inner.borrow().clip_announces.mark();
         let items = clip::read_local().await;
         web_sys::console::debug_1(
             &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),
@@ -1239,21 +1238,15 @@ impl Engine {
             if !i.connected || i.closing {
                 return true;
             }
-            // Windows a copié pendant la lecture : son contenu est le plus récent, le nôtre ne doit
-            // ni l'écraser ni invalider sa récupération.
-            if i.clip_announces.remote_copies() != copies {
-                return true;
-            }
             let now = js_sys::Date::now();
-            match i.clip_announces.latest() {
-                // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : on
-                // attend le même accusé.
-                Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => {
+            let common = i.clip_last;
+            match i.clip_announces.after_read(mark, fp, common, now) {
+                clip::AfterRead::Done => return true,
+                clip::AfterRead::Join => {
                     i.clip_announces.join(tx);
                     Vec::new()
                 }
-                None if i.clip_last == Some(fp) => return true,
-                _ => {
+                clip::AfterRead::Publish => {
                     let events = i.clip.set_local(items);
                     // Canal pas encore prêt : la liste partira avec Monitor Ready.
                     if events.is_empty() {
@@ -1396,29 +1389,47 @@ impl Engine {
 
     /// `force` : envoyer même à taille égale (retour d'une extension multi-écran).
     fn send_size(&self, width: u32, height: u32, force: bool) {
-        let (w, h) = clamp_size(width, height);
-        let (channel, caps, current, multi) = {
-            let i = self.inner.borrow();
-            (i.display_channel, i.display_caps, i.desktop, i.multi.is_some())
+        let (channel, layout) = {
+            let mut i = self.inner.borrow_mut();
+            let Inner { desired, display_channel, display_caps, desktop, multi, .. } = &mut *i;
+            // En multi-écran, la disposition vient des écrans, pas de la taille de la fenêtre.
+            if multi.is_some() {
+                return;
+            }
+            let caps = display_caps.filter(|_| display_channel.is_some());
+            (*display_channel, single_layout(desired, caps, clamp_size(width, height), force, *desktop))
         };
-        // En multi-écran, la disposition vient des écrans, pas de la taille de la fenêtre.
-        if multi {
-            return;
+        match (channel, layout) {
+            (Some(channel), Ok(Some(monitor))) => self.dvc_send(channel, &views::layout_pdu(&[monitor], 0)),
+            (_, Err(e)) => web_sys::console::warn_1(&format!("contrôle d'affichage : {e}").into()),
+            _ => {}
         }
-        self.inner.borrow_mut().desired = Some((w, h));
-        let (Some(channel), Some(caps)) = (channel, caps) else { return };
-        // Fenêtre plus grande que la surface permise : le PC ignorerait la disposition.
-        let (w, h) = caps.fit(w, h);
-        let monitor = [(0, 0, w, h)];
-        if let Err(e) = caps.check(&monitor) {
-            web_sys::console::warn_1(&format!("contrôle d'affichage : {e}").into());
-            return;
-        }
-        if !force && (w, h) == current {
-            return;
-        }
-        self.dvc_send(channel, &views::layout_pdu(&monitor, 0));
     }
+}
+
+/// Écran seul à envoyer pour `size` (déjà bornée), `None` s'il n'y a rien à envoyer. `desired`
+/// retient la taille et un retour forcé à un écran tant qu'aucune disposition n'est partie :
+/// contrôle d'affichage pas prêt (`caps` absent) ou PC trop limité. Le PC peut garder sa
+/// disposition à plusieurs écrans pendant la fermeture du canal, même à taille de bureau égale.
+fn single_layout(
+    desired: &mut Option<((u32, u32), bool)>,
+    caps: Option<DisplayCaps>,
+    size: (u32, u32),
+    force: bool,
+    current: (u32, u32),
+) -> Result<Option<views::Monitor>, String> {
+    let force = force || desired.is_some_and(|(_, f)| f);
+    *desired = Some((size, force));
+    let Some(caps) = caps else { return Ok(None) };
+    // Fenêtre plus grande que la surface permise : le PC ignorerait la disposition.
+    let (w, h) = caps.fit(size.0, size.1);
+    let monitor = (0, 0, w, h);
+    caps.check(&[monitor])?;
+    if !force && (w, h) == current {
+        return Ok(None);
+    }
+    *desired = Some((size, false));
+    Ok(Some(monitor))
 }
 
 /// Zones d'image d'avant le dernier changement de taille d'un lot : `Gfx::process` a déjà remplacé
@@ -1465,6 +1476,30 @@ fn cursor_css(p: &rdp_pdu::fastpath::Pointer) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_single_layout_survives_a_closed_display_channel() {
+        let caps = Some(DisplayCaps { max_monitors: 2, max_area: 4 * 1920 * 1080 });
+        let mut desired = None;
+        // Retour à un écran pendant que le canal est fermé : rien ne part, le forçage est retenu.
+        assert_eq!(single_layout(&mut desired, None, (1920, 1080), true, (1920, 1080)), Ok(None));
+        // Redimensionnement ordinaire entre-temps, canal toujours fermé : toujours forcé.
+        assert_eq!(single_layout(&mut desired, None, (1920, 1080), false, (1920, 1080)), Ok(None));
+        assert_eq!(desired, Some(((1920, 1080), true)));
+        // Canal rouvert (rejeu sans forçage) : la disposition part malgré la taille égale.
+        let monitor = Some((0, 0, 1920, 1080));
+        assert_eq!(single_layout(&mut desired, caps, (1920, 1080), false, (1920, 1080)), Ok(monitor));
+        // Envoyée : le forçage est consommé.
+        assert_eq!(single_layout(&mut desired, caps, (1920, 1080), false, (1920, 1080)), Ok(None));
+        assert_eq!(
+            single_layout(&mut desired, caps, (1280, 720), false, (1920, 1080)),
+            Ok(Some((0, 0, 1280, 720)))
+        );
+        // PC trop limité : refus, le forçage attend une disposition acceptable.
+        let tiny = Some(DisplayCaps { max_monitors: 1, max_area: 100 * 100 });
+        assert!(single_layout(&mut desired, tiny, (1920, 1080), true, (1920, 1080)).is_err());
+        assert_eq!(desired, Some(((1920, 1080), true)));
+    }
 
     #[test]
     fn presents_before_last_reset_are_dropped() {

@@ -199,10 +199,20 @@ fn hostile_messages() {
     assert!(c.receive(&unhex("04 00 00 00 00 00 00 00")).is_err());
     assert!(c.receive(&unhex("07 00 00 00 08 00 00 00 05 00 00 00 01 00 00 00")).is_err());
     assert!(c.receive(&unhex("07 00 00 00 04 00 00 00 02 00 00 00")).is_err());
-    // Format List longue tronquée en plein identifiant : refusée ; nom sans terminateur toléré.
-    let ev = c.receive(&unhex("02 00 00 00 02 00 00 00 0d 00")).unwrap();
-    assert_eq!(ev, [ClipEvent::Send(unhex(LIST_FAIL))]);
-    assert!(c.receive(&unhex("02 00 00 00 06 00 00 00 0d 00 00 00 41 00")).is_ok());
+    // Format List longue tronquée en plein identifiant ou nom sans terminateur : refusée, le
+    // contenu local reste servi ; identifiant suivi de 00 00 : acceptée.
+    c.set_local(vec![LocalData::Text("local".to_string())]);
+    for bad in [
+        "02 00 00 00 02 00 00 00 0d 00",
+        "02 00 00 00 04 00 00 00 0d 00 00 00",
+        "02 00 00 00 06 00 00 00 0d 00 00 00 41 00",
+    ] {
+        assert_eq!(c.receive(&unhex(bad)).unwrap(), [ClipEvent::Send(unhex(LIST_FAIL))], "{bad}");
+    }
+    assert_eq!(c.local.len(), 1, "contenu local conservé");
+    let ev = c.receive(&unhex("02 00 00 00 06 00 00 00 0d 00 00 00 00 00")).unwrap();
+    assert_eq!(ev[0], ClipEvent::Send(unhex("03 00 01 00 00 00 00 00")));
+    assert!(c.local.is_empty());
     // Type inconnu, remplissage après dataLen : sans effet.
     assert!(c.receive(&unhex("63 00 00 00 00 00 00 00")).unwrap().is_empty());
     assert!(c.receive(&unhex("03 00 01 00 00 00 00 00 00 00 00 00")).unwrap().is_empty());
@@ -232,6 +242,13 @@ fn truncated_response_ends_the_request() {
         assert!(c.receive(&unhex(short)).is_err(), "sans demande en vol : erreur");
         assert_eq!(c.request(&[ClipFormat::Text]).len(), 1, "nouvelle demande possible");
     }
+    // En-tête incomplet d'un autre type (accusé de liste) : la demande attend toujours sa réponse.
+    for other in ["03 00 01", "03"] {
+        assert!(c.receive(&unhex(other)).is_err());
+        assert!(c.request(&[ClipFormat::Text]).is_empty(), "demande toujours en vol");
+    }
+    let text = pdu(msg::FORMAT_DATA_RESPONSE, RESPONSE_OK, &string_to_utf16("a"));
+    assert_eq!(c.receive(&text).unwrap(), [ClipEvent::RemoteData(Some(LocalData::Text("a".to_string())))]);
 }
 
 #[test]

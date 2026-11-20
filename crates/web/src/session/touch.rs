@@ -10,6 +10,9 @@
 const SLOP: f64 = 10.0;
 /// Variation de l'écart entre deux doigts qui fait d'un geste un pincement (px CSS).
 const PINCH_SLOP: f64 = 24.0;
+/// Mouvements d'un doigt sans que l'autre bouge au-delà desquels celui-ci est tenu pour fixe :
+/// avant, il peut s'agir d'un défilement dont le second doigt n'est pas encore signalé.
+const SOLO_MOVES: u32 = 3;
 /// Durée d'un appui long (ms).
 pub const LONG_PRESS_MS: i32 = 500;
 /// Toucher suivant dans ce délai et ce rayon : même point que le précédent, pour que Windows y
@@ -92,10 +95,11 @@ enum State {
     /// Geste terminé (appui long rendu, doigt principal levé) : on attend que tout soit levé.
     Done,
     /// `a0`, `b0`, `d0`, `m0` : doigts, écart et milieu au départ ; `last` : milieu précédent ;
-    /// `zoom0` : zoom au départ.
+    /// `zoom0` : zoom au départ ; `moves` : mouvements signalés de chaque doigt.
     Two {
         a: Finger,
         b: Finger,
+        moves: [u32; 2],
         a0: (f64, f64),
         b0: (f64, f64),
         d0: f64,
@@ -165,6 +169,7 @@ impl Touch {
                 self.state = State::Two {
                     a,
                     b: f,
+                    moves: [0, 0],
                     a0: (a.x, a.y),
                     b0: (x, y),
                     d0: dist((a.x, a.y), (x, y)).max(1.0),
@@ -215,9 +220,10 @@ impl Touch {
                 (f.x, f.y) = (x, y);
                 vec![Action::Move { x, y }]
             }
-            State::Two { a, b, .. } if a.id == id || b.id == id => {
-                let f = if a.id == id { a } else { b };
+            State::Two { a, b, moves, .. } if a.id == id || b.id == id => {
+                let (f, k) = if a.id == id { (a, 0) } else { (b, 1) };
                 (f.x, f.y) = (x, y);
+                moves[k] += 1;
                 self.two_moved()
             }
             _ => Vec::new(),
@@ -225,18 +231,21 @@ impl Touch {
     }
 
     fn two_moved(&mut self) -> Vec<Action> {
-        let State::Two { a, b, a0, b0, d0, m0, last, zoom0, mode } = &mut self.state else {
+        let State::Two { a, b, moves, a0, b0, d0, m0, last, zoom0, mode } = &mut self.state else {
             return Vec::new();
         };
         let m = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
         let d = dist((a.x, a.y), (b.x, b.y));
         if let Mode::Undecided = mode {
-            // Défilement : les deux doigts ont bougé, dans le même sens. Un seul doigt qui part
-            // déplace aussi le milieu, mais c'est le début d'un pincement.
+            // Défilement : les deux doigts ont bougé, dans le même sens. Un seul doigt parti change
+            // l'écart comme un pincement, mais l'autre peut n'être signalé qu'à l'événement suivant :
+            // pincement à un doigt fixe seulement après plusieurs mouvements du premier.
             let (da, db) = ((a.x - a0.0, a.y - a0.1), (b.x - b0.0, b.y - b0.1));
             let moved = |v: (f64, f64)| v.0.hypot(v.1) > SLOP / 2.0;
-            let together = moved(da) && moved(db) && da.0 * db.0 + da.1 * db.1 > 0.0;
-            if (d - *d0).abs() > PINCH_SLOP {
+            let (ma, mb) = (moved(da), moved(db));
+            let together = ma && mb && da.0 * db.0 + da.1 * db.1 > 0.0;
+            let solo = (ma && !mb && moves[0] >= SOLO_MOVES) || (mb && !ma && moves[1] >= SOLO_MOVES);
+            if (d - *d0).abs() > PINCH_SLOP && (ma && mb || solo) {
                 *mode = Mode::Pinch;
             } else if together && dist(m, *m0) > SLOP {
                 *mode = Mode::Scroll { acc_x: 0.0, acc_y: 0.0 };
@@ -466,6 +475,33 @@ mod tests {
             let out = t.moved(second.0, second.1, 300.0);
             assert!(matches!(out[..], [Action::Zoom(z)] if (z.scale - 1.44).abs() < 1e-9), "{out:?}");
         }
+    }
+
+    #[test]
+    fn aligned_fingers_scroll_in_either_order() {
+        // Doigts l'un au-dessus de l'autre, qui descendent de 30 px : le premier mouvement seul
+        // réduit ou allonge l'écart de 30 px, sans faire un pincement.
+        for (first, second) in [((1, 330.0), (2, 430.0)), ((2, 430.0), (1, 330.0))] {
+            let mut t = touch();
+            t.down(1, 100.0, 300.0);
+            t.down(2, 100.0, 400.0);
+            assert!(t.moved(first.0, 100.0, first.1).is_empty(), "un seul doigt : rien de décidé");
+            let out = t.moved(second.0, 100.0, second.1);
+            assert_eq!(out, vec![Action::Wheel { delta: 60, horizontal: false, x: 100.0, y: 380.0 }]);
+            assert_eq!(t.zoom, Zoom::default());
+        }
+    }
+
+    #[test]
+    fn pinch_with_one_finger_held_still() {
+        let mut t = touch();
+        t.down(1, 100.0, 300.0);
+        t.down(2, 200.0, 300.0);
+        // Le doigt gauche reste posé ; le droit s'écarte : zoom dès qu'il a bougé seul trois fois.
+        assert!(t.moved(2, 230.0, 300.0).is_empty());
+        assert!(t.moved(2, 260.0, 300.0).is_empty());
+        let out = t.moved(2, 290.0, 300.0);
+        assert!(matches!(out[..], [Action::Zoom(z)] if (z.scale - 1.9).abs() < 1e-9), "{out:?}");
     }
 
     #[test]

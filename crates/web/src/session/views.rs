@@ -191,8 +191,11 @@ impl DisplayCaps {
         }
         let k = (self.max_area as f64 / area as f64).sqrt();
         let (w, h) = crate::session::engine::clamp_size((f64::from(w) * k) as u32, (f64::from(h) * k) as u32);
-        // L'arrondi flottant ne doit pas faire déborder d'un pixel : hauteur recalculée en entiers.
-        let h = h.min(u32::try_from(self.max_area / u64::from(w)).unwrap_or(u32::MAX)).max(200);
+        // Ni l'arrondi flottant ni une borne minimale de 200 ne doivent faire déborder : chaque
+        // côté est recalculé en entiers sur l'autre (largeur paire).
+        let side = |other: u32| u32::try_from(self.max_area / u64::from(other)).unwrap_or(u32::MAX);
+        let h = h.min(side(w)).max(200);
+        let w = (w.min(side(h)) & !1).max(200);
         (w, h)
     }
 }
@@ -313,6 +316,10 @@ mod tests {
         let (w, h) = caps.fit(3001, 1999);
         assert!(w % 2 == 0 && caps.check(&[(0, 0, w, h)]).is_ok(), "{w}×{h}");
         assert!(u64::from(w) * u64::from(h) > 1920 * 1080 * 99 / 100, "pas de réduction excessive");
+        // Fenêtre très plate ou très haute : le côté au minimum (200) réduit l'autre.
+        let flat = DisplayCaps { max_monitors: 1, max_area: 200_000 };
+        assert_eq!(flat.fit(8192, 200), (1000, 200));
+        assert_eq!(flat.fit(200, 8192), (200, 1000));
         let tiny = DisplayCaps { max_monitors: 1, max_area: 100 * 100 };
         let (w, h) = tiny.fit(1920, 1080);
         assert!(w >= 200 && h >= 200 && tiny.check(&[(0, 0, w, h)]).is_err(), "bornes du protocole");

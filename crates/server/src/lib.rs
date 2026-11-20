@@ -175,7 +175,11 @@ fn static_cache_control(path: &str) -> Option<&'static str> {
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.cfg.static_dir.clone();
-    let spa = ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
+    // Front compressé (gzip ou brotli selon le navigateur) : le wasm passe de 1,3 Mo à 0,5 Mo, même sans
+    // reverse proxy qui compresse. L'API et le WebSocket ne passent pas par là.
+    let spa = tower_http::compression::Compression::new(
+        ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
+    );
 
     let api = api::router().layer(middleware::from_fn(csrf_guard)).layer(SetResponseHeaderLayer::overriding(
         header::CACHE_CONTROL,

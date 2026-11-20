@@ -42,6 +42,17 @@ pub struct Connected {
     /// Drapeaux de RDP_NEG_RSP (EGFX supporté…).
     pub negotiation_flags: u8,
     pub cert_sha256: [u8; 32],
+    /// Durée de chaque phase, pour le journal : où passe le temps d'ouverture.
+    pub timings: Timings,
+}
+
+/// Durées des phases de connexion, en millisecondes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timings {
+    pub tcp: u32,
+    pub x224: u32,
+    pub tls: u32,
+    pub nla: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,11 +171,19 @@ pub fn hex(b: &[u8]) -> String {
 /// la connexion s'arrête après TLS (`UntrustedCertificate`) : aucune réponse NTLM ne part vers
 /// un serveur que personne n'a approuvé.
 pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connected, ConnectError> {
+    let mut t = std::time::Instant::now();
+    let mut lap = || {
+        let ms = t.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        t = std::time::Instant::now();
+        ms
+    };
+    let mut timings = Timings::default();
     let mut tcp = timeout(STEP_TIMEOUT, TcpStream::connect((target.host.as_str(), target.port)))
         .await
         .map_err(|_| ConnectError::Timeout)?
         .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
     tcp.set_nodelay(true)?;
+    timings.tcp = lap();
 
     let requested = protocol::SSL | protocol::HYBRID | protocol::HYBRID_EX;
     send(&mut tcp, &x224::connection_request(Some(&target.credentials.username), requested)).await?;
@@ -177,6 +196,7 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
             x224::protocol_name(cc.selected_protocol)
         )));
     }
+    timings.x224 = lap();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -199,6 +219,7 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
         .ok_or_else(|| ConnectError::Tls("aucun certificat".into()))?
         .to_vec();
     let cert_sha256: [u8; 32] = Sha256::digest(&cert).into();
+    timings.tls = lap();
     match pinned {
         None => return Err(ConnectError::UntrustedCertificate(hex(&cert_sha256))),
         Some(expected) if expected != cert_sha256 => {
@@ -234,10 +255,12 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
         timeout(STEP_TIMEOUT, tls.read_exact(&mut res)).await.map_err(|_| ConnectError::Timeout)??;
         credssp::early_user_auth_result(&res).map_err(|e| ConnectError::Auth(e.to_string()))?;
     }
+    timings.nla = lap();
     Ok(Connected {
         stream: tls,
         selected_protocol: cc.selected_protocol,
         negotiation_flags: cc.flags,
         cert_sha256,
+        timings,
     })
 }

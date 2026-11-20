@@ -44,7 +44,23 @@ enum Incoming {
     Closed(String),
 }
 
+/// Repères d'ouverture (ms, `Date.now()`), résumés en console à la première image.
+#[derive(Default)]
+struct Marks {
+    /// Vérification du décodeur H.264 avant l'ouverture.
+    support_ms: f64,
+    opened: f64,
+    ready: Option<f64>,
+    connected: Option<f64>,
+    first_frame: bool,
+    /// Images H.264 traitées (décodage, copie, conversion, composition) et leurs durées (ms).
+    h264_frames: u32,
+    h264_total_ms: f64,
+    h264_max_ms: f64,
+}
+
 struct Inner {
+    marks: Marks,
     ws: WebSocket,
     /// Vue 0 = fenêtre principale ; les suivantes = fenêtres des écrans secondaires.
     views: Vec<View>,
@@ -97,6 +113,8 @@ pub struct Open {
     /// Empreinte approuvée par l'admin pour un premier contact.
     pub trust: Option<String>,
     pub avc: h264::Avc,
+    /// Durée de la vérification du décodeur, pour le résumé d'ouverture.
+    pub support_ms: f64,
 }
 
 fn ws_url(id: i64, trust: Option<&str>) -> String {
@@ -122,6 +140,7 @@ impl Engine {
         let (w, h) = clamp_size(opts.width, opts.height);
         let main_view = View::new(canvas, Rect { x: 0, y: 0, w, h }, None)?;
         let inner = Rc::new(RefCell::new(Inner {
+            marks: Marks { support_ms: opts.support_ms, opened: js_sys::Date::now(), ..Default::default() },
             ws: ws.clone(),
             views: vec![main_view],
             multi: None,
@@ -229,6 +248,7 @@ impl Engine {
         match serde_json::from_str::<SessionMessage>(text).map_err(|e| e.to_string())? {
             SessionMessage::Ready { selected_protocol, username, domain, .. } => {
                 let mut i = self.inner.borrow_mut();
+                i.marks.ready = Some(js_sys::Date::now());
                 let (w, h) = i.desktop;
                 let session = Session::new(Config {
                     width: w as u16,
@@ -304,6 +324,7 @@ impl Engine {
                 {
                     let mut i = self.inner.borrow_mut();
                     i.connected = true;
+                    i.marks.connected = Some(js_sys::Date::now());
                     i.desktop = (width as u32, height as u32);
                 }
                 (self.status)(Status::Connected);
@@ -376,6 +397,7 @@ impl Engine {
                 Out::Reset { width, height, monitors } => self.reset_views(width, height, &monitors),
                 Out::Present { damage } => self.present(&damage),
                 Out::Avc420 { data } => {
+                    let t0 = js_sys::Date::now();
                     if h264.is_none() {
                         *h264 = H264::new().ok();
                     }
@@ -397,9 +419,11 @@ impl Engine {
                         }
                     }
                     .map_err(|e| e.to_string())?;
+                    self.count_h264(t0);
                     queue.extend(more);
                 }
                 Out::Avc444 { main, aux } => {
+                    let t0 = js_sys::Date::now();
                     if h264.is_none() {
                         *h264 = H264::new().ok();
                     }
@@ -450,6 +474,7 @@ impl Engine {
                     }
                     .map_err(|e| e.to_string())?;
                     drop(gfx);
+                    self.count_h264(t0);
                     queue.extend(more);
                 }
                 Out::Ignored(t) => web_sys::console::debug_1(&t.into()),
@@ -459,7 +484,52 @@ impl Engine {
     }
 
     /// Recopie les zones modifiées de la sortie composée vers chaque vue.
+    /// Coût par image H.264, résumé en console toutes les 100 images.
+    fn count_h264(&self, t0: f64) {
+        let dt = js_sys::Date::now() - t0;
+        let mut i = self.inner.borrow_mut();
+        let m = &mut i.marks;
+        m.h264_frames += 1;
+        m.h264_total_ms += dt;
+        m.h264_max_ms = m.h264_max_ms.max(dt);
+        if m.h264_frames.is_multiple_of(100) {
+            web_sys::console::info_1(
+                &format!(
+                    "Portique : H.264 {} images, {:.1} ms par image en moyenne, {:.0} ms au pire",
+                    m.h264_frames,
+                    m.h264_total_ms / f64::from(m.h264_frames),
+                    m.h264_max_ms
+                )
+                .into(),
+            );
+        }
+    }
+
+    /// Où passe le temps d'ouverture : décodeur, serveur (TCP + TLS + NLA), session Windows, image.
+    fn log_opening(&self) {
+        let i = self.inner.borrow();
+        let m = &i.marks;
+        let since = |t: Option<f64>| t.map(|t| format!("{:.0} ms", t - m.opened)).unwrap_or_else(|| "?".into());
+        web_sys::console::info_1(
+            &format!(
+                "Portique : décodeur vérifié en {:.0} ms ; serveur prêt à {} ; session Windows à {} ; première image à {:.0} ms ({:?})",
+                m.support_ms,
+                since(m.ready),
+                since(m.connected),
+                js_sys::Date::now() - m.opened,
+                i.avc
+            )
+            .into(),
+        );
+    }
+
     fn present(&self, damage: &[Rect]) {
+        let i = self.inner.borrow();
+        if !i.marks.first_frame {
+            drop(i);
+            self.log_opening();
+            self.inner.borrow_mut().marks.first_frame = true;
+        }
         let i = self.inner.borrow();
         let (fb, w, _) = i.gfx.output();
         for v in &i.views {

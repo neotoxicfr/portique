@@ -166,6 +166,16 @@ async fn run(
             return fail(socket, e.to_string()).await;
         }
     };
+    let tm = connected.timings;
+    tracing::info!(
+        connection = row.name,
+        tcp_ms = tm.tcp,
+        x224_ms = tm.x224,
+        tls_ms = tm.tls,
+        nla_ms = tm.nla,
+        total_ms = started.elapsed().as_millis() as u64,
+        "connexion RDP prête"
+    );
     if stored.is_none() {
         // Empreinte approuvée par un admin et vérifiée avant CredSSP : on l'épingle.
         let _ = sqlx::query("UPDATE connections SET cert_sha256 = ? WHERE id = ? AND cert_sha256 IS NULL")

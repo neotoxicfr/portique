@@ -101,6 +101,9 @@ pub struct Session {
     /// Canaux statiques : identifiant MCS → nom.
     channels: BTreeMap<u16, &'static str>,
     to_join: Vec<u16>,
+    /// Le serveur accepte qu'on saute les MCS Channel Join (MS-RDPBCGR 2.2.1.4.2) : un aller-retour de
+    /// moins par canal, ce qui compte sur un lien lointain.
+    skip_join: bool,
     share_id: u32,
     fastpath: fastpath::Reassembler,
     static_reassembly: BTreeMap<u16, vc::ChannelReassembler>,
@@ -120,6 +123,7 @@ impl Session {
             io_channel: 0,
             channels: BTreeMap::new(),
             to_join: Vec::new(),
+            skip_join: false,
             share_id: 0,
             fastpath: fastpath::Reassembler::default(),
             static_reassembly: BTreeMap::new(),
@@ -145,7 +149,8 @@ impl Session {
                     | early_caps::STRONG_ASYMMETRIC_KEYS
                     | early_caps::VALID_CONNECTION_TYPE
                     | early_caps::SUPPORT_MONITOR_LAYOUT_PDU
-                    | early_caps::SUPPORT_DYNVC_GFX_PROTOCOL,
+                    | early_caps::SUPPORT_DYNVC_GFX_PROTOCOL
+                    | early_caps::SUPPORT_SKIP_CHANNELJOIN,
                 selected_protocol: self.cfg.selected_protocol,
             },
             channels: STATIC_CHANNELS
@@ -185,6 +190,9 @@ impl Session {
             State::ConnectResponse => {
                 let server = mcs::connect_response(frame)?;
                 self.io_channel = server.io_channel;
+                self.skip_join = server
+                    .early_capability_flags
+                    .is_some_and(|f| f & gcc::server_early_caps::SKIP_CHANNELJOIN_SUPPORTED != 0);
                 for (name, id) in STATIC_CHANNELS.iter().zip(&server.channel_ids) {
                     self.channels.insert(*id, name);
                 }
@@ -194,9 +202,13 @@ impl Session {
             }
             State::AttachUser => {
                 self.user = mcs::attach_user_confirm(frame)?;
-                self.to_join =
-                    [self.user, self.io_channel].into_iter().chain(self.channels.keys().copied()).collect();
-                self.to_join.reverse();
+                // MS-RDPBCGR 1.3.1.1 : avec SKIP_CHANNELJOIN accepté par le serveur, les canaux sont joints
+                // d'office ; on passe directement aux informations du client.
+                if !self.skip_join {
+                    self.to_join =
+                        [self.user, self.io_channel].into_iter().chain(self.channels.keys().copied()).collect();
+                    self.to_join.reverse();
+                }
                 self.join_next(&mut ev);
             }
             State::Joining => {

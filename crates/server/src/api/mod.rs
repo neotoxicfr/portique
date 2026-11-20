@@ -38,4 +38,5 @@ pub fn router() -> Router<AppState> {
         .route("/admin/connections/{id}", put(connections::update).delete(connections::delete))
         .route("/admin/users", get(users::list).post(users::create))
         .route("/admin/users/{id}", put(users::update).delete(users::delete))
+        .route("/admin/users/{id}/reset-2fa", post(users::reset_2fa))
 }

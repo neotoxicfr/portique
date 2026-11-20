@@ -49,9 +49,10 @@ if ($Annuler) {
     powercfg /devicedisablewake $desc 2>$null | Out-Null
     $null = Test-Exit 'Reveil (powercfg)'
   }
-  if (-not $echecs) { Remove-Item -Path $mem -ErrorAction SilentlyContinue }
   gpupdate /force | Out-Null
   $null = Test-Exit 'gpupdate'
+  # Memo garde tant qu'une etape echoue : une nouvelle annulation vise la meme carte.
+  if (-not $echecs) { Remove-Item -Path $mem -ErrorAction SilentlyContinue }
   if ($echecs) {
     Write-Host "[!] Annulation INCOMPLETE : etapes en echec : $($echecs -join ', ')."
     exit 1

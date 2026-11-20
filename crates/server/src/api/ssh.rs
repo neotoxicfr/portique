@@ -229,10 +229,11 @@ async fn run(
     let trust_ref = trust.as_ref().map(|(id, fp)| (*id, fp.as_str()));
     // Ouverture bornée dans le temps et abandonnée si l'onglet se ferme : sinon la tâche et les connexions
     // de la chaîne resteraient pendues sur un hôte muet, à chaque nouvelle tentative.
-    // Ce que le navigateur envoie entre-temps (saisie, redimensionnement) est gardé pour l'hôte, dans une
-    // limite raisonnable.
+    // Ce que le navigateur envoie entre-temps (saisie, redimensionnement) est gardé pour l'hôte ; au-delà
+    // de `MAX_PENDING`, l'ouverture échoue plutôt que de perdre une partie de la saisie.
     let opening = tokio::time::timeout(OPEN_TIMEOUT, ssh::open(&hops, &key, trust_ref, cols, rows));
     let mut pending = Vec::new();
+    // Fin de l'attente côté navigateur : `true` si la saisie dépasse la limite, `false` si l'onglet se ferme.
     let gone = async {
         let mut kept = 0;
         while let Some(Ok(msg)) = socket.recv().await {
@@ -244,14 +245,21 @@ async fn run(
                 Message::Text(t) => t.len(),
                 _ => 0,
             };
-            if kept <= MAX_PENDING {
-                pending.push(Ok::<_, axum::Error>(msg));
+            if kept > MAX_PENDING {
+                return true;
             }
+            pending.push(Ok::<_, axum::Error>(msg));
         }
+        false
     };
     let opened = tokio::select! {
         r = opening => r.unwrap_or_else(|_| Err(anyhow::anyhow!("ouverture SSH trop longue (délai dépassé)").into())),
-        _ = gone => {
+        overflow = gone => {
+            if overflow {
+                tracing::info!(user = user.username, connection = target.1, "saisie trop abondante pendant l'ouverture SSH");
+                let message = "trop de saisie pendant l'ouverture du terminal, rien n'a été envoyé : réessaie".into();
+                return send(&mut socket, &fail(message)).await;
+            }
             tracing::info!(user = user.username, connection = target.1, "onglet fermé pendant l'ouverture SSH");
             return;
         }

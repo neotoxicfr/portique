@@ -1,0 +1,3 @@
+# Scripts Windows : cmd.exe rate des étiquettes (goto, call :x) dans un fichier en fins de ligne LF.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

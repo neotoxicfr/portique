@@ -70,12 +70,19 @@ pub async fn user_by_name(db: &SqlitePool, name: &str) -> sqlx::Result<Option<Us
         .await
 }
 
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// Calcul Argon2 (~19 Mio, des dizaines de ms) hors des workers async, quelques-uns à la fois : la mémoire
 /// du conteneur est bornée et une rafale de connexions ne doit pas bloquer les relais en cours.
 async fn argon2<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
-    static PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-    let _permit = PERMITS.acquire().await?;
-    Ok(tokio::task::spawn_blocking(f).await?)
+    let permit = ARGON2_PERMITS.acquire().await?;
+    // Le permis suit le calcul : une requête abandonnée (client parti) n'arrête pas la tâche bloquante,
+    // elle ne doit pas non plus rendre sa place avant la fin.
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await?)
 }
 
 fn hash_password_sync(pw: &str) -> anyhow::Result<String> {
@@ -418,6 +425,37 @@ mod tests {
         );
         let ok = [a.unwrap(), b.unwrap(), c.unwrap()];
         assert_eq!(ok.iter().filter(|o| **o).count(), 1, "{ok:?}");
+    }
+
+    #[tokio::test]
+    async fn argon2_permit_held_until_computation_ends() {
+        // Chaque calcul bloque jusqu'à la fermeture de son canal `gates`.
+        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gates, tasks): (Vec<_>, Vec<_>) = (0..4)
+            .map(|_| {
+                let (gate, wait) = std::sync::mpsc::channel::<()>();
+                let started = started.clone();
+                let task = tokio::spawn(argon2(move || {
+                    started.send(()).unwrap();
+                    let _ = wait.recv();
+                }));
+                (gate, task)
+            })
+            .unzip();
+        for _ in 0..4 {
+            started_rx.recv().await.unwrap();
+        }
+        // Requêtes abandonnées pendant le calcul : les calculs continuent, leurs permis aussi.
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            assert!(t.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(ARGON2_PERMITS.available_permits(), 0);
+        drop(gates);
+        let all = tokio::time::timeout(std::time::Duration::from_secs(5), ARGON2_PERMITS.acquire_many(4));
+        assert!(all.await.is_ok(), "permis rendus à la fin des calculs");
     }
 
     #[tokio::test]

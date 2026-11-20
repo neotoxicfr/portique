@@ -96,8 +96,7 @@ pub async fn update(
     .await?;
     if r.rows_affected() == 0 {
         drop(tx);
-        let still_admin = auth::user_by_id(&state.db, me.id).await?.is_some_and(|u| u.is_admin);
-        return Err(if still_admin { AppError::NotFound } else { AppError::Forbidden });
+        return Err(not_written(&state, me.id).await?);
     }
     if let Some(hash) = hash {
         sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
@@ -107,15 +106,33 @@ pub async fn update(
             .await?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
     }
-    if i.reset_2fa {
-        sqlx::query("UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0 WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM passkeys WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        // Facteur perdu ou volé : les sessions ouvertes avec lui ne doivent plus ouvrir le SSH.
-        sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Supprime le TOTP et les passkeys d'un compte (facteur perdu ou volé). Opération à part de `update` :
+/// elle ne réécrit pas le rôle, qu'un autre admin a pu changer depuis que la liste a été lue.
+pub async fn reset_2fa(
+    State(state): State<AppState>,
+    AdminUser(me): AdminUser,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    let mut tx = state.db.begin().await?;
+    let r = sqlx::query(
+        "UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0
+         WHERE id = ? AND EXISTS (SELECT 1 FROM users WHERE id = ? AND is_admin)",
+    )
+    .bind(id)
+    .bind(me.id)
+    .execute(&mut *tx)
+    .await?;
+    if r.rows_affected() == 0 {
+        drop(tx);
+        return Err(not_written(&state, me.id).await?);
     }
+    sqlx::query("DELETE FROM passkeys WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+    // Les sessions ouvertes avec le facteur perdu ne doivent plus ouvrir le SSH.
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -139,8 +156,13 @@ pub async fn delete(
     if r.rows_affected() > 0 {
         return Ok(StatusCode::NO_CONTENT);
     }
-    let still_admin = auth::user_by_id(&state.db, me.id).await?.is_some_and(|u| u.is_admin);
-    Err(if still_admin { AppError::NotFound } else { AppError::Forbidden })
+    Err(not_written(&state, me.id).await?)
+}
+
+/// Écriture gardée qui n'a touché aucune ligne : compte cible absent, ou auteur rétrogradé entre-temps.
+async fn not_written(state: &AppState, me: i64) -> ApiResult<AppError> {
+    let still_admin = auth::user_by_id(&state.db, me).await?.is_some_and(|u| u.is_admin);
+    Ok(if still_admin { AppError::NotFound } else { AppError::Forbidden })
 }
 
 #[cfg(test)]
@@ -173,11 +195,70 @@ mod tests {
             .execute(&s.db)
             .await
             .unwrap();
-        let input = UserInput { username: "bob".into(), password: None, is_admin: false, reset_2fa: false };
+        let input = UserInput { username: "bob".into(), password: None, is_admin: false };
         let r = super::update(State(s.clone()), AdminUser(admin.clone()), Path(bob.id), Json(input)).await;
         assert!(matches!(r, Err(AppError::Forbidden)), "rétrogradation");
         let r = super::delete(State(s.clone()), AdminUser(admin.clone()), Path(bob.id)).await;
         assert!(matches!(r, Err(AppError::Forbidden)), "suppression");
-        assert!(user_by_name(&s.db, "bob").await.unwrap().unwrap().is_admin);
+        sqlx::query("UPDATE users SET totp_secret = x'01' WHERE id = ?")
+            .bind(bob.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let r = super::reset_2fa(State(s.clone()), AdminUser(admin.clone()), Path(bob.id)).await;
+        assert!(matches!(r, Err(AppError::Forbidden)), "remise à zéro 2FA");
+        let bob = user_by_name(&s.db, "bob").await.unwrap().unwrap();
+        assert!(bob.is_admin && bob.totp_secret.is_some());
+    }
+
+    /// Un admin réinitialise la 2FA de bob pendant qu'un autre le rétrograde : la remise à zéro ne
+    /// lui rend pas ses droits (elle ne touche qu'aux facteurs et aux sessions).
+    #[tokio::test]
+    async fn reset_2fa_keeps_role_and_password() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, totp_secret, totp_pending, totp_last, webauthn_id)
+             VALUES ('bob', 'hash', 0, x'01', x'02', 7, 'b')",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+        let admin = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let bob = user_by_name(&s.db, "bob").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'clé', '{}')")
+            .bind(bob.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (x'aa', ?, 0, 1)")
+            .bind(bob.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+
+        let r = super::reset_2fa(State(s.clone()), AdminUser(admin.clone()), Path(bob.id)).await;
+        assert!(r.is_ok());
+        let after = user_by_name(&s.db, "bob").await.unwrap().unwrap();
+        assert!(!after.is_admin, "rôle inchangé");
+        assert_eq!(after.password_hash.as_deref(), Some("hash"), "mot de passe inchangé");
+        assert!(after.totp_secret.is_none());
+        let (pending, last): (Option<Vec<u8>>, i64) =
+            sqlx::query_as("SELECT totp_pending, totp_last FROM users WHERE id = ?")
+                .bind(bob.id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert!(pending.is_none() && last == 0);
+        let left: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM passkeys WHERE user_id = ?1), (SELECT count(*) FROM sessions WHERE user_id = ?1)",
+        )
+        .bind(bob.id)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(left, (0, 0), "passkeys et sessions supprimées");
+
+        let r = super::reset_2fa(State(s.clone()), AdminUser(admin), Path(9999)).await;
+        assert!(matches!(r, Err(AppError::NotFound)));
     }
 }

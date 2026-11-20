@@ -27,6 +27,9 @@ pub const MAX_HOPS: usize = 5;
 /// aucun délai d'inactivité par défaut, et un hôte qui se tait après l'échange de clés bloquerait
 /// l'ouverture indéfiniment.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Sortie gardée avant la réponse au lancement du shell (bannière, invite) : la fenêtre SSH se renouvelle
+/// à la réception, le délai seul ne borne pas ce qu'un hôte bavard empile en mémoire.
+const MAX_EARLY: usize = 64 * 1024;
 const KEY_SETTING: &str = "ssh_key";
 
 /// Clé du service : créée au premier besoin, chiffrée par la clé maîtresse dans `settings`.
@@ -172,7 +175,7 @@ async fn reply(
                 Some(ChannelMsg::Success) => return Ok(()),
                 Some(ChannelMsg::Failure) => anyhow::bail!("« {name} » refuse le {what}"),
                 Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
-                    early.extend_from_slice(&data)
+                    keep_early(early, &data, name, what)?
                 }
                 Some(_) => {}
                 None => anyhow::bail!("« {name} » a fermé le canal (demande de {what})"),
@@ -182,6 +185,14 @@ async fn reply(
     tokio::time::timeout(CONNECT_TIMEOUT, wait)
         .await
         .map_err(|_| anyhow::anyhow!("« {name} » ne répond pas (demande de {what}, délai dépassé)"))?
+}
+
+fn keep_early(early: &mut Vec<u8>, data: &[u8], name: &str, what: &str) -> anyhow::Result<()> {
+    if early.len() + data.len() > MAX_EARLY {
+        anyhow::bail!("« {name} » envoie trop de données avant de répondre (demande de {what})");
+    }
+    early.extend_from_slice(data);
+    Ok(())
 }
 
 /// Attente bornée par `CONNECT_TIMEOUT` : dépassée, l'ouverture échoue et les connexions déjà ouvertes
@@ -271,4 +282,19 @@ pub async fn connect(hops: &[Hop], key: &PrivateKey, trust: Option<(i64, &str)>)
         return Err(anyhow::anyhow!("aucun hôte").into());
     }
     Ok(Chain { sessions, pinned })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_output_is_capped_across_replies() {
+        let mut early = Vec::new();
+        keep_early(&mut early, &[b'a'; 1000], "h", "terminal").unwrap();
+        keep_early(&mut early, &vec![b'b'; MAX_EARLY - 1000], "h", "shell").unwrap();
+        assert_eq!(early.len(), MAX_EARLY);
+        assert!(keep_early(&mut early, b"c", "h", "shell").is_err());
+        assert_eq!(early.len(), MAX_EARLY);
+    }
 }

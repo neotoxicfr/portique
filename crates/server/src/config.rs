@@ -173,9 +173,10 @@ fn is_hostname(s: &str) -> bool {
 impl ProxyConfig {
     /// Adresse d'un proxy de confiance (CIDR configurés ou noms résolus récemment) ?
     pub fn is_trusted(&self, ip: &std::net::IpAddr) -> bool {
-        // Écoute double pile (`[::]`) : un proxy IPv4 arrive en `::ffff:a.b.c.d`.
-        let ip = &ip.to_canonical();
-        if self.trusted.iter().any(|n| n.contains(ip)) {
+        // Écoute double pile (`[::]`) : un proxy IPv4 arrive en `::ffff:a.b.c.d`. On compare les deux
+        // formes : un CIDR IPv4 vise la forme canonique, un CIDR `::ffff:…` l'adresse telle quelle.
+        let ips = [*ip, ip.to_canonical()];
+        if self.trusted.iter().any(|n| ips.iter().any(|ip| n.contains(ip))) {
             return true;
         }
         // Une adresse résolue n'est fiable que peu de temps : un conteneur peut hériter de
@@ -184,7 +185,7 @@ impl ProxyConfig {
             .read()
             .unwrap()
             .as_ref()
-            .is_some_and(|(at, ips)| at.elapsed() < RESOLVED_TTL && ips.contains(ip))
+            .is_some_and(|(at, known)| at.elapsed() < RESOLVED_TTL && ips.iter().any(|ip| known.contains(ip)))
     }
 
     /// Résout les noms de proxys (au démarrage puis toutes les `RESOLVE_EVERY`). Une résolution
@@ -303,11 +304,13 @@ mod tests {
             ("PORTIQUE_MASTER_KEY", KEY),
             ("PORTIQUE_ADMIN_PASSWORD", "admin-password-123"),
             ("PORTIQUE_AUTH_MODE", "proxy"),
-            ("PORTIQUE_TRUSTED_PROXIES", "172.16.0.0/12, traefik"),
+            ("PORTIQUE_TRUSTED_PROXIES", "172.16.0.0/12, ::ffff:192.0.2.9/128, traefik"),
         ];
         let c = Config::from_env(&env).unwrap();
         let mapped: std::net::IpAddr = "::ffff:172.18.0.2".parse().unwrap();
         assert!(c.proxy.is_trusted(&mapped), "CIDR IPv4");
+        assert!(c.proxy.is_trusted(&"::ffff:192.0.2.9".parse().unwrap()), "CIDR IPv6 mappé");
+        assert!(!c.proxy.is_trusted(&"::ffff:192.0.2.10".parse().unwrap()));
         *c.proxy.resolved.write().unwrap() =
             Some((std::time::Instant::now(), vec!["192.0.2.7".parse().unwrap()]));
         assert!(c.proxy.is_trusted(&"::ffff:192.0.2.7".parse().unwrap()), "nom résolu");

@@ -268,9 +268,6 @@ pub struct UserInput {
     pub password: Option<String>,
     #[serde(default)]
     pub is_admin: bool,
-    /// Supprime le TOTP et les passkeys (compte perdu).
-    #[serde(default)]
-    pub reset_2fa: bool,
 }
 
 /// Messages texte du WebSocket de session (`/api/connections/{id}/session`) ; les messages

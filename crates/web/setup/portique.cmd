@@ -46,6 +46,7 @@ rem Carte reseau active : autoriser le reveil par paquet magique, afficher l'adr
 set "NICDESC="
 for /f "usebackq tokens=1,2,3 delims=|" %%a in (`powershell -NoProfile -Command "$a=Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1; if($a){$a.Name+'|'+$a.InterfaceDescription+'|'+$a.MacAddress}"`) do (
   set "NICDESC=%%b"
+  set "NICNAME=%%a"
   call :reveil "%%a" "%%b" "%%c"
 )
 if not defined NICDESC echo [!] Aucune carte reseau physique active trouvee.
@@ -73,6 +74,7 @@ exit /b 0
 
 :reveil
 rem %~1 nom de la carte, %~2 description (nom de peripherique de powercfg), %~3 adresse MAC.
+rem PowerShell lit le nom dans NICNAME : une valeur, jamais du code (le nom d'une carte se renomme).
 powercfg /deviceenablewake "%~2" >nul 2>&1
 if errorlevel 1 (
   echo [!] Reveil : powercfg refuse la carte "%~2", reveil non autorise.
@@ -81,7 +83,14 @@ if errorlevel 1 (
 )
 rem Memorise la carte modifiee : l'annulation la retrouve meme debranchee.
 reg add "HKLM\SOFTWARE\Portique" /v WakeNic /t REG_SZ /d "%~2" /f >nul
-powershell -NoProfile -Command "try { Set-NetAdapterPowerManagement -Name '%~1' -WakeOnMagicPacket Enabled -ErrorAction Stop } catch { exit 1 }" >nul 2>&1
+if errorlevel 1 (
+  rem Sans memo, l'annulation viserait la carte active : on retire l'autorisation.
+  powercfg /devicedisablewake "%~2" >nul 2>&1
+  echo [!] Reveil : carte "%~2" non memorisee dans le registre, reveil non autorise.
+  set "ECHEC=1"
+  goto :eof
+)
+powershell -NoProfile -Command "try { Set-NetAdapterPowerManagement -Name $env:NICNAME -WakeOnMagicPacket Enabled -ErrorAction Stop } catch { exit 1 }" >nul 2>&1
 if errorlevel 1 goto reveil_note
 echo [ok] Reveil autorise pour : %~2
 goto reveil_mac
@@ -109,12 +118,13 @@ if defined NICDESC if errorlevel 1 (
   echo [!] Reveil : powercfg n'a pas pu retirer l'autorisation de la carte.
   set "ECHEC=1"
 )
-if not defined ECHEC reg delete "HKLM\SOFTWARE\Portique" /f >nul 2>&1
 gpupdate /force >nul
 if errorlevel 1 (
   echo [!] Echec de gpupdate : strategies non appliquees ^(redemarrer ou relancer^).
   set "ECHEC=1"
 )
+rem Memo garde tant qu'une etape echoue : une nouvelle annulation vise la meme carte.
+if not defined ECHEC reg delete "HKLM\SOFTWARE\Portique" /f >nul 2>&1
 if defined ECHEC (
   echo [!] Annulation INCOMPLETE : les etapes marquees [!] ont echoue.
   pause

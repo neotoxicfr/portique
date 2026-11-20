@@ -509,7 +509,8 @@ impl Engine {
     fn log_opening(&self) {
         let i = self.inner.borrow();
         let m = &i.marks;
-        let since = |t: Option<f64>| t.map(|t| format!("{:.0} ms", t - m.opened)).unwrap_or_else(|| "?".into());
+        let since =
+            |t: Option<f64>| t.map(|t| format!("{:.0} ms", t - m.opened)).unwrap_or_else(|| "?".into());
         web_sys::console::info_1(
             &format!(
                 "Portique : décodeur vérifié en {:.0} ms ; serveur prêt à {} ; session Windows à {} ; première image à {:.0} ms ({:?})",

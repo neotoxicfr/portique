@@ -205,8 +205,10 @@ impl Session {
                 // MS-RDPBCGR 1.3.1.1 : avec SKIP_CHANNELJOIN accepté par le serveur, les canaux sont joints
                 // d'office ; on passe directement aux informations du client.
                 if !self.skip_join {
-                    self.to_join =
-                        [self.user, self.io_channel].into_iter().chain(self.channels.keys().copied()).collect();
+                    self.to_join = [self.user, self.io_channel]
+                        .into_iter()
+                        .chain(self.channels.keys().copied())
+                        .collect();
                     self.to_join.reverse();
                 }
                 self.join_next(&mut ev);

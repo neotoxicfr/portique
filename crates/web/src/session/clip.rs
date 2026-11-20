@@ -88,6 +88,15 @@ impl Fetch {
         self.next(request)
     }
 
+    /// Copie locale publiée : le contenu du PC en cours de récupération est dépassé. La réponse en vol
+    /// sera soldée (et jetée) à son arrivée ; plus rien n'est demandé, ni repli, pour cette annonce.
+    pub fn local_published(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.wanted.clear();
+        self.received.clear();
+        self.fallback.clear();
+    }
+
     /// Génération de l'annonce courante (à rendre à `png_unusable`).
     pub fn generation(&self) -> u32 {
         self.generation
@@ -363,6 +372,28 @@ mod tests {
         asked.borrow_mut().clear();
         assert!(f.png_unusable(g + 1, &req).is_none());
         assert!(asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn local_copy_supersedes_a_fetch_in_flight() {
+        use ClipFormat::*;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let req = |x| {
+            asked.borrow_mut().push(x);
+            true
+        };
+        let mut f = Fetch::default();
+        f.changed(&[Png, Dib], &req);
+        let png = LocalData::Png(vec![0x89]);
+        assert!(f.received(Some(png), &req).is_some());
+        let g = f.generation();
+        // PNG illisible : DIB demandé… puis l'utilisateur copie localement avant la réponse.
+        assert!(f.png_unusable(g, &req).is_none());
+        f.local_published();
+        let rgba = LocalData::Rgba { width: 1, height: 1, rgba: vec![1, 2, 3, 4] };
+        assert!(f.received(Some(rgba), &req).is_none(), "DIB en retard : jeté");
+        assert!(f.png_unusable(g, &req).is_none(), "plus de repli pour l'ancienne annonce");
+        assert_eq!(*asked.borrow(), [Png, Dib]);
     }
 
     #[test]

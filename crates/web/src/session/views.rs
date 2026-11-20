@@ -158,7 +158,10 @@ impl DisplayCaps {
             return None;
         }
         let (n, a, b) = (u(8)?, u(12)?, u(16)?);
-        Some(Self { max_monitors: n, max_area: u64::from(n) * u64::from(a) * u64::from(b) })
+        Some(Self {
+            max_monitors: n,
+            max_area: u64::try_from(u128::from(n) * u128::from(a) * u128::from(b)).unwrap_or(u64::MAX),
+        })
     }
 
     /// La disposition tient-elle dans les limites du PC ? Sinon, la raison à afficher.
@@ -271,6 +274,11 @@ mod tests {
         assert!(small.check(&[(0, 0, 3840, 2160), (3840, 0, 1920, 1080)]).is_err(), "surface");
         assert_eq!(DisplayCaps::parse(&le([2, 20, 1, 1, 1])), None, "pas une CAPS PDU");
         assert_eq!(DisplayCaps::parse(&le([5, 20, 1, 1, 1])[..16]), None, "tronquée");
+        // 16 × 2^30 × 2^30 = 2^64 : plafonné, pas de débordement silencieux.
+        assert_eq!(
+            DisplayCaps::parse(&le([5, 20, 16, 1 << 30, 1 << 30])).map(|c| c.max_area),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

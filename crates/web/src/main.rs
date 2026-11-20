@@ -20,6 +20,9 @@ pub struct Session {
     /// Échec de déconnexion : gardé ici et non dans `Shell`, recréé à chaque page, pour qu'une réponse
     /// arrivée après un changement de page reste affichée.
     pub logout_error: RwSignal<Option<String>>,
+    /// Génération de session, avancée à chaque fin de session : une réponse de déconnexion d'une session
+    /// précédente ne doit rien afficher dans la suivante.
+    pub epoch: RwSignal<u32>,
 }
 
 impl Session {
@@ -107,12 +110,14 @@ fn App() -> impl IntoView {
         me: RwSignal::new(None),
         checked: RwSignal::new(false),
         logout_error: RwSignal::new(None),
+        epoch: RwSignal::new(0),
     };
     provide_context(session);
     // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion).
     Effect::new(move || {
         if session.me.with(Option::is_none) {
             session.logout_error.set(None);
+            session.epoch.update(|e| *e = e.wrapping_add(1));
         }
     });
     // Panne réseau ou serveur (hors 401) : on le dit et on propose de réessayer. Une requête qui ne revient
@@ -190,8 +195,14 @@ fn Shell(children: Children) -> impl IntoView {
     let logout_error = session.logout_error;
     let logout = move || {
         logout_error.set(None);
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::send_empty::<()>("POST", "/api/auth/logout", None).await {
+            let result = api::send_empty::<()>("POST", "/api/auth/logout", None).await;
+            // Session déjà terminée (double clic, reconnexion entre-temps) : réponse périmée, ignorée.
+            if session.epoch.get_untracked() != epoch {
+                return;
+            }
+            match result {
                 Ok(()) | Err(api::Error::Unauthorized) => session.me.set(None),
                 Err(e) => logout_error.set(Some(e.to_string())),
             }

@@ -1235,9 +1235,11 @@ impl Engine {
                     }
                     i.clip_unacked += 1;
                     i.clip_announced = Some((fp, now));
-                    // Copie locale plus récente : une écriture en attente du contenu du PC est dépassée.
+                    // Copie locale plus récente : une écriture en attente du contenu du PC est dépassée,
+                    // tout comme une récupération en cours (une réponse en retard ne doit rien écrire).
                     i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
                     i.clip_pending_write = None;
+                    i.clip_fetch.local_published();
                     i.clip_ack.push(tx);
                     events
                 }

@@ -253,12 +253,16 @@ fn region(
     }
 
     // Toutes les tuiles du champ, en nombre `numTiles` (2.2.4.2.1.4) ; comme FreeRDP, moins de
-    // 6 octets restants ne font pas un bloc.
+    // 6 octets restants ne font pas un bloc. Un bloc en trop est refusé avant d'être décodé : sinon
+    // des milliers de petites tuiles sur la même clé coûteraient chacune un décodage complet.
     let mut count = 0usize;
     while tiles.len() >= 6 {
         let (kind, tb, next) = block(tiles)?;
         tiles = next;
         count += 1;
+        if count > usize::from(num_tiles) {
+            return Err(Error::Invalid("progressif : numTiles ne correspond pas aux tuiles"));
+        }
         if !matches!(kind, WBT_TILE_SIMPLE | WBT_TILE_FIRST | WBT_TILE_UPGRADE) {
             continue;
         }
@@ -783,10 +787,12 @@ mod tests {
         let mut surf = vec![0u8; 128 * 64 * 4];
         let mut p = Progressive::new();
         let two = [tile(WBT_TILE_SIMPLE, 0, 0, 1), tile(WBT_TILE_SIMPLE, 1, 0, 2)];
-        for n in [1u8, 3] {
+        for n in [0u8, 1, 3] {
             let mut r = region_blk(&[(0, 0, 128, 64)], &two);
             r[12] = n; // numTiles
             assert!(p.decode(0, &frame(&[r]), &mut surf, 128, 64).is_err());
+            // Les blocs au-delà de numTiles ne sont pas décodés.
+            assert_eq!(p.contexts[&0].tiles.len(), usize::from(n).min(2), "numTiles = {n}");
         }
     }
 

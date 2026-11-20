@@ -119,8 +119,9 @@ fn check_layout(caps: &[u8], mons: &[(u32, u32)]) -> Result<(), String> {
     {
         return Err(format!("écran {w}×{h} hors bornes (200 à 8192, largeur paire)"));
     }
-    let area: u64 = mons.iter().map(|&(w, h)| u64::from(w) * u64::from(h)).sum();
-    let max = u64::from(n) * u64::from(a) * u64::from(b);
+    // Trois facteurs u32 : leur produit peut dépasser u64.
+    let area: u128 = mons.iter().map(|&(w, h)| u128::from(w) * u128::from(h)).sum();
+    let max = u128::from(n) * u128::from(a) * u128::from(b);
     if area > max {
         return Err(format!("aire totale {area} px au-delà de {max}"));
     }
@@ -479,5 +480,7 @@ mod tests {
         assert!(check_layout(&caps[..12], &[(1920, 1080)]).is_err());
         let caps: Vec<u8> = [5u32, 20, 2, 1000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert!(check_layout(&caps, &[(1920, 1080), (1920, 1080)]).is_err(), "aire totale dépassée");
+        let caps: Vec<u8> = [5u32, 20, 16, 1 << 30, 1 << 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(check_layout(&caps, &[(1920, 1080)]).is_ok(), "produit de 2^64");
     }
 }

@@ -7,7 +7,7 @@
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.1.5-green)
+![Version](https://img.shields.io/badge/version-v0.2.0-green)
 
 </div>
 
@@ -79,7 +79,7 @@ La séquence de connexion et les comportements mesurés sur Windows sont décrit
 ### 1. Construire l'image
 
 ```sh
-docker build -t portique:0.1.0 .
+docker build -t portique:0.2.0 .     # ou l'image publiée ghcr.io/neotoxicfr/portique (amd64 et arm64)
 openssl rand -base64 32 > secrets/master_key   # clé de chiffrement de la base
 ```
 
@@ -88,7 +88,7 @@ openssl rand -base64 32 > secrets/master_key   # clé de chiffrement de la base
 ```yaml
 services:
   portique:
-    image: portique:0.1.0
+    image: portique:0.2.0
     environment:
       PORTIQUE_PUBLIC_URL: https://rdp.example.net
       PORTIQUE_MASTER_KEY_FILE: /run/secrets/master_key
@@ -164,8 +164,9 @@ La V1 (`v0.1.0`) couvre l'usage bureau quotidien. Pour la suite :
 
 Prérequis : Rust stable (1.90 ou plus), cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev).
 `./scripts/ci.sh` lance toutes les vérifications ; `./scripts/release.sh X.Y.Z` publie une version
-(image, archive, release GitHub) depuis le poste, sans CI ; `./scripts/publish-dev.sh` republie l'image
-de branche `ghcr.io/neotoxicfr/portique:dev` après chaque livraison sur `dev`.
+(images amd64 + arm64, archives, release GitHub) depuis le poste, sans CI ; `./scripts/publish-dev.sh`
+republie l'image de branche `ghcr.io/neotoxicfr/portique:dev` après chaque livraison sur `dev`. Les hôtes
+de construction se règlent dans `.env` (modèle : `.env.exemple`).
 
 ```sh
 cargo test --workspace --exclude portique-web

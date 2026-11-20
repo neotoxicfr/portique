@@ -2,6 +2,29 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.2.0] - 2026-11-20
+
+### Modifié
+
+- **yawrdp devient Portique.** Le projet ne se limitera plus au RDP (le SSH arrive) : nouveau nom, nouveau
+  dépôt (`neotoxicfr/portique`) et nouvelle image (`ghcr.io/neotoxicfr/portique`).
+- **Changements à reporter dans un déploiement existant** :
+  - variables `YAWRDP_*` renommées `PORTIQUE_*` ;
+  - binaire `portique` (healthcheck : `portique healthcheck`) ;
+  - base `portique.db` : renommer `yawrdp.db` (et ses fichiers `-wal`/`-shm`) dans le dossier de données ;
+  - scripts de préparation du PC : `portique.reg`, `portique.cmd`, `portique.ps1` ;
+  - le cookie de session et l'en-tête anti-CSRF changent de nom : les sessions ouvertes sont à refaire.
+
+### Ajouté
+
+- Image **multi-architecture** : amd64 et arm64 sous le même tag. L'arm64 est construite en natif sur une
+  machine ARM, sans émulation (`scripts/build-image.sh`). La release publie aussi une archive aarch64.
+
+### Dépendances
+
+- `webauthn-rs` 0.6.2 : les passkeys déjà enregistrées restent valides (même format stocké).
+- `leptos` 0.8.23, `openssl` 0.10.82, `uuid` 1.29.2, image de build Rust 1.100.
+
 ## [v0.1.5] - 2026-11-04
 
 ### Sécurité

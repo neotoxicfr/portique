@@ -183,7 +183,8 @@ pub struct Announces {
     remote_copies: u32,
     /// Lectures locales commencées (numéros de départ).
     started: u64,
-    /// Numéro de départ de la dernière lecture publiée : une lecture commencée avant elle est dépassée.
+    /// Numéro de départ de la plus récente lecture conclue (publiée, rejointe ou sans objet) : une
+    /// lecture commencée avant elle est dépassée.
     published_seq: u64,
 }
 
@@ -234,14 +235,14 @@ impl Announces {
         if self.published_seq > mark.seq {
             return if self.pending.is_empty() { AfterRead::Done } else { AfterRead::Join };
         }
+        // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
+        // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
+        self.published_seq = mark.seq;
         match self.latest() {
             // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : même accusé.
             Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
             None if common == Some(fp) => AfterRead::Done,
-            _ => {
-                self.published_seq = mark.seq;
-                AfterRead::Publish
-            }
+            _ => AfterRead::Publish,
         }
     }
 
@@ -589,6 +590,23 @@ mod tests {
         assert_eq!(a.after_read(ma, 6, common, 700.0), AfterRead::Publish);
         a.sent(Some(6), 700.0, None);
         assert_eq!(a.after_read(mb, 7, common, 750.0), AfterRead::Publish, "B reste prioritaire");
+        a.sent(Some(7), 750.0, None);
+        a.answered(true, &mut common);
+        a.answered(true, &mut common);
+        // Lecture récente sans objet (contenu déjà commun) : l'ancienne lecture A (image lente) ne
+        // réannonce pas A par-dessus.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 7, common, 800.0), AfterRead::Done);
+        assert_eq!(a.after_read(ma, 8, common, 900.0), AfterRead::Done, "A dépassée par une lecture conclue");
+        // Lecture récente qui rejoint un accusé en vol : A attend le même accusé au lieu de publier.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 9, common, 1000.0), AfterRead::Publish);
+        a.sent(Some(9), 1000.0, None);
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 9, common, 1100.0), AfterRead::Join);
+        assert_eq!(a.after_read(ma, 10, common, 1200.0), AfterRead::Join, "A ne publie pas");
         // Copie sur le PC pendant la lecture : écartée.
         let m = a.mark();
         a.remote_changed();

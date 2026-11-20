@@ -13,6 +13,9 @@ step "clippy (front, wasm uniquement)"
 cargo clippy -p portique-web --target wasm32-unknown-unknown --locked -- -D warnings
 step "tests"
 cargo test --workspace --exclude portique-web --locked
+step "tests du front (logique pure, en natif)"
+# Dossier cible à part : RUSTFLAGS différent, il invaliderait le cache des autres étapes.
+CARGO_TARGET_DIR=target/web-natif RUSTFLAGS=--cfg=web_sys_unstable_apis cargo test -p portique-web --locked
 step "front"
 ./scripts/vendor-xterm.sh
 (cd crates/web && trunk build --release --dist ../../dist)

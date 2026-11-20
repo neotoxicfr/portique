@@ -29,7 +29,8 @@ git push origin "v$version"
 # Le run du tag peut mettre quelques secondes à apparaître.
 sha=$(git rev-parse HEAD) run=
 for _ in {1..30}; do
-  run=$(gh run list -R "$repo" --workflow release.yml --event push --commit "$sha" --json databaseId -q '.[0].databaseId')
+  # Le run déclenché par CE tag (headBranch = nom du tag), pas un autre tag poussé sur le même commit.
+  run=$(gh run list -R "$repo" --workflow release.yml --event push --branch "v$version" --commit "$sha" --json databaseId -q '.[0].databaseId')
   [[ -n $run ]] && break
   sleep 10
 done

@@ -1,7 +1,7 @@
 // Service worker minimal : rend l'appli installable et sert la coquille hors ligne (page de
 // reconnexion). L'API, le WebSocket et les scripts de préparation ne passent jamais par le cache.
 // Changer le nom purge l'ancienne coquille (v1 pouvait resservir une page périmée).
-const CACHE = "yawrdp-v2";
+const CACHE = "portique-v2";
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/", "/manifest.webmanifest", "/icon.svg"])));

@@ -1,9 +1,9 @@
 //! Sonde RDP : connexion authentifiée (rdp-connect), session complète (rdp-session), rendu EGFX
 //! (rdp-gfx) et capture PNG du bureau.
 //!
-//! Variables : YAWRDP_PROBE_HOST, YAWRDP_PROBE_PORT (3389), YAWRDP_PROBE_USER,
-//! YAWRDP_PROBE_DOMAIN (vide), YAWRDP_PROBE_PASSWORD ou YAWRDP_PROBE_PASSWORD_FILE,
-//! YAWRDP_PROBE_SECONDS (8), YAWRDP_PROBE_PNG (chemin de capture), YAWRDP_PROBE_PIN (empreinte). Le mot de passe n'est
+//! Variables : PORTIQUE_PROBE_HOST, PORTIQUE_PROBE_PORT (3389), PORTIQUE_PROBE_USER,
+//! PORTIQUE_PROBE_DOMAIN (vide), PORTIQUE_PROBE_PASSWORD ou PORTIQUE_PROBE_PASSWORD_FILE,
+//! PORTIQUE_PROBE_SECONDS (8), PORTIQUE_PROBE_PNG (chemin de capture), PORTIQUE_PROBE_PIN (empreinte). Le mot de passe n'est
 //! jamais affiché.
 
 use std::time::Duration;
@@ -16,20 +16,20 @@ use rdp_session::{Config, Event, Session};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(format!("YAWRDP_PROBE_{name}")).ok().filter(|v| !v.is_empty())
+    std::env::var(format!("PORTIQUE_PROBE_{name}")).ok().filter(|v| !v.is_empty())
 }
 
 fn password() -> anyhow::Result<String> {
     match (env("PASSWORD"), env("PASSWORD_FILE")) {
         (Some(_), Some(_)) => {
-            bail!("YAWRDP_PROBE_PASSWORD et YAWRDP_PROBE_PASSWORD_FILE définis tous les deux")
+            bail!("PORTIQUE_PROBE_PASSWORD et PORTIQUE_PROBE_PASSWORD_FILE définis tous les deux")
         }
         (Some(p), None) => Ok(p),
         (None, Some(path)) => {
             let raw = std::fs::read_to_string(&path).with_context(|| format!("lecture de {path}"))?;
             Ok(raw.trim_end_matches(['\n', '\r']).to_owned())
         }
-        (None, None) => bail!("YAWRDP_PROBE_PASSWORD(_FILE) manquant"),
+        (None, None) => bail!("PORTIQUE_PROBE_PASSWORD(_FILE) manquant"),
     }
 }
 
@@ -40,9 +40,9 @@ async fn send<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> anyhow::Result<(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let host = env("HOST").context("YAWRDP_PROBE_HOST manquant")?;
+    let host = env("HOST").context("PORTIQUE_PROBE_HOST manquant")?;
     let port: u16 = env("PORT").map(|p| p.parse()).transpose()?.unwrap_or(3389);
-    let user = env("USER").context("YAWRDP_PROBE_USER manquant")?;
+    let user = env("USER").context("PORTIQUE_PROBE_USER manquant")?;
     let domain = env("DOMAIN").unwrap_or_default();
     let target = Target {
         host: host.clone(),
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         credentials: Credentials { username: user.clone(), domain, password: password()? },
     };
     println!("→ connexion à {host}:{port}");
-    // YAWRDP_PROBE_PIN : empreinte SHA-256 attendue ; sans elle, la sonde s'arrête avant NLA et
+    // PORTIQUE_PROBE_PIN : empreinte SHA-256 attendue ; sans elle, la sonde s'arrête avant NLA et
     // affiche l'empreinte à vérifier.
     let pin = env("PIN")
         .map(|h| {
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .transpose()?
         .map(|v| {
-            <[u8; 32]>::try_from(v).map_err(|_| anyhow::anyhow!("YAWRDP_PROBE_PIN : 64 caractères hexa"))
+            <[u8; 32]>::try_from(v).map_err(|_| anyhow::anyhow!("PORTIQUE_PROBE_PIN : 64 caractères hexa"))
         })
         .transpose()?;
     let mut c = rdp_connect::connect(&target, pin).await?;
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Session complète après NLA : séquence de connexion, EGFX rendu par `rdp-gfx` pendant
-/// YAWRDP_PROBE_SECONDS (8 par défaut), puis capture PNG du bureau dans YAWRDP_PROBE_PNG.
+/// PORTIQUE_PROBE_SECONDS (8 par défaut), puis capture PNG du bureau dans PORTIQUE_PROBE_PNG.
 async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     tls: &mut S,
     user: &str,
@@ -88,7 +88,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
         width: 1920,
         height: 1080,
         keyboard_layout: 0x040C,
-        client_name: "yawrdp".into(),
+        client_name: "portique".into(),
         selected_protocol,
         username: user.into(),
         domain: String::new(),
@@ -100,7 +100,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     let mut clip = rdp_clip::Clipboard::new();
     let clip_test = env("CLIPTEST").is_some();
     let mut clip_started = false;
-    // YAWRDP_PROBE_DUMP : enregistre les messages EGFX bruts (longueur u32 + octets) pour le rejeu
+    // PORTIQUE_PROBE_DUMP : enregistre les messages EGFX bruts (longueur u32 + octets) pour le rejeu
     // hors ligne (`gfx-replay`). Contient l'écran : à garder hors du dépôt.
     let mut dump = env("DUMP").map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
     let mut ignored = std::collections::BTreeMap::<String, u32>::new();

@@ -42,14 +42,14 @@ IronRDP et FreeRDP ne servent que de référence légère.
 ## Sonde
 
 `crates/rdp-probe` rejoue toute la séquence et affiche le résultat. Le mot de passe est lu depuis
-`YAWRDP_PROBE_PASSWORD_FILE` et n'est jamais affiché.
+`PORTIQUE_PROBE_PASSWORD_FILE` et n'est jamais affiché.
 
 ```sh
 docker run --rm --network container:wireguard \
-  -v /srv/yawrdp/probe/rdp-probe:/rdp-probe:ro \
-  -v /srv/yawrdp/secrets/rdp_password:/run/secrets/rdp_password:ro \
-  -e YAWRDP_PROBE_HOST=192.0.2.50 -e YAWRDP_PROBE_USER=alice \
-  -e YAWRDP_PROBE_PASSWORD_FILE=/run/secrets/rdp_password \
+  -v /srv/portique/probe/rdp-probe:/rdp-probe:ro \
+  -v /srv/portique/secrets/rdp_password:/run/secrets/rdp_password:ro \
+  -e PORTIQUE_PROBE_HOST=192.0.2.50 -e PORTIQUE_PROBE_USER=alice \
+  -e PORTIQUE_PROBE_PASSWORD_FILE=/run/secrets/rdp_password \
   debian:bookworm-slim /rdp-probe
 ```
 

@@ -1,5 +1,5 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use yawrdp_proto::{ConnectionAdmin, ConnectionInput, Protocol, UserAdmin, UserInput};
+use portique_proto::{ConnectionAdmin, ConnectionInput, Protocol, UserAdmin, UserInput};
 
 use crate::{Session, api};
 
@@ -233,7 +233,7 @@ impl Form {
             wol_target: opt(self.wol_target),
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
-            wol_command: self.wol_by_command.get_untracked().then(|| yawrdp_proto::WolCommandInput {
+            wol_command: self.wol_by_command.get_untracked().then(|| portique_proto::WolCommandInput {
                 host: self.cmd_host.get_untracked(),
                 user: self.cmd_user.get_untracked(),
                 command: self.cmd_command.get_untracked(),

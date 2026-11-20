@@ -8,11 +8,11 @@ step() { printf '\n== %s\n' "$*"; }
 step "format"
 cargo fmt --all --check
 step "clippy (serveur et pile RDP)"
-cargo clippy --workspace --exclude yawrdp-web --all-targets --locked -- -D warnings
+cargo clippy --workspace --exclude portique-web --all-targets --locked -- -D warnings
 step "clippy (front, wasm uniquement)"
-cargo clippy -p yawrdp-web --target wasm32-unknown-unknown --locked -- -D warnings
+cargo clippy -p portique-web --target wasm32-unknown-unknown --locked -- -D warnings
 step "tests"
-cargo test --workspace --exclude yawrdp-web --locked
+cargo test --workspace --exclude portique-web --locked
 step "front"
 (cd crates/web && trunk build --release --dist ../../dist)
 if command -v cargo-audit >/dev/null; then

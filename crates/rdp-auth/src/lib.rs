@@ -1,4 +1,4 @@
-//! Authentification NLA pour la pile RDP de yawrdp : NTLMv2 et CredSSP, sans I/O.
+//! Authentification NLA pour la pile RDP de portique : NTLMv2 et CredSSP, sans I/O.
 //!
 //! Référence : MS-NLMP et MS-CSSP. Toute la cryptographie vient de RustCrypto.
 

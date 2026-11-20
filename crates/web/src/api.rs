@@ -1,15 +1,15 @@
 //! Appels à l'API du serveur. Toute requête porte l'en-tête anti-CSRF attendu par le serveur.
 
 use gloo_net::http::{Request, RequestBuilder, Response};
+use portique_proto::{ApiError, CeremonyChallenge, CeremonyFinish};
 use serde::{Serialize, de::DeserializeOwned};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use webauthn_rs_proto::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse,
 };
-use yawrdp_proto::{ApiError, CeremonyChallenge, CeremonyFinish};
 
-const CSRF: (&str, &str) = ("x-yawrdp", "1");
+const CSRF: (&str, &str) = ("x-portique", "1");
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -93,11 +93,11 @@ fn js_err(e: wasm_bindgen::JsValue) -> Error {
 }
 
 /// Connexion par passkey : défi du serveur, signature par l'authentificateur, vérification.
-pub async fn passkey_login(username: &str) -> Result<yawrdp_proto::LoginResponse> {
+pub async fn passkey_login(username: &str) -> Result<portique_proto::LoginResponse> {
     let start: CeremonyChallenge<RequestChallengeResponse> = send(
         "POST",
         "/api/auth/passkey/start",
-        &yawrdp_proto::PasskeyLoginStart { username: username.into() },
+        &portique_proto::PasskeyLoginStart { username: username.into() },
     )
     .await?;
     let opts: web_sys::CredentialRequestOptions = start.options.into();
@@ -108,7 +108,7 @@ pub async fn passkey_login(username: &str) -> Result<yawrdp_proto::LoginResponse
     send("POST", "/api/auth/passkey/finish", &finish).await
 }
 
-pub async fn passkey_register(name: String, proof: yawrdp_proto::ReAuth) -> Result<()> {
+pub async fn passkey_register(name: String, proof: portique_proto::ReAuth) -> Result<()> {
     let start: CeremonyChallenge<CreationChallengeResponse> =
         send("POST", "/api/account/passkeys/register/start", &proof).await?;
     let opts: web_sys::CredentialCreationOptions = start.options.into();

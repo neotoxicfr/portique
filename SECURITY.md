@@ -24,4 +24,4 @@ Dans le périmètre : le serveur (authentification, sessions, relais, Wake-on-LA
 malveillant ne doit pas pouvoir compromettre le navigateur ni le serveur), les scripts de `/setup/`.
 
 Hors périmètre : une faille de Windows ou du serveur RDP lui-même, ou une configuration qui contredit la
-documentation (par exemple un mode proxy sans `YAWRDP_TRUSTED_PROXIES`).
+documentation (par exemple un mode proxy sans `PORTIQUE_TRUSTED_PROXIES`).

@@ -5,11 +5,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use uuid::Uuid;
-use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential};
-use yawrdp_proto::{
+use portique_proto::{
     CeremonyChallenge, CeremonyFinish, ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup,
 };
+use uuid::Uuid;
+use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential};
 
 use crate::{
     api::auth::load_passkeys,

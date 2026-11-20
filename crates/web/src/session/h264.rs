@@ -43,9 +43,7 @@ impl std::fmt::Display for DecodeError {
 }
 
 /// User-agent du navigateur dont le décodeur H.264 a échoué (H.264 désactivé pour lui).
-const OFF_KEY: &str = "yawrdp.h264-off";
-/// Clé de la v0.1.1, posée pour les images RGB qu'on sait désormais afficher : effacée.
-const OLD_KEY: &str = "yawrdp.h264-unusable";
+const OFF_KEY: &str = "portique.h264-off";
 
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
@@ -65,7 +63,6 @@ pub fn disable(reason: &str) {
 
 fn disabled() -> bool {
     let Some(s) = storage() else { return false };
-    let _ = s.remove_item(OLD_KEY);
     s.get_item(OFF_KEY).ok().flatten().is_some_and(|ua| ua == user_agent())
 }
 

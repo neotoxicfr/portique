@@ -9,8 +9,8 @@
 ## Liste de contrôle
 
 - [ ] `./scripts/ci.sh` passe (ou, à défaut, les étapes ci-dessous)
-- [ ] `cargo test --workspace --exclude yawrdp-web`
-- [ ] `cargo clippy` (hôte sans `yawrdp-web`, puis `yawrdp-web` en `--target wasm32-unknown-unknown`) et `cargo fmt --all --check`
+- [ ] `cargo test --workspace --exclude portique-web`
+- [ ] `cargo clippy` (hôte sans `portique-web`, puis `portique-web` en `--target wasm32-unknown-unknown`) et `cargo fmt --all --check`
 - [ ] `trunk build --release` si le front change
 - [ ] sections de spec citées pour tout nouveau PDU
 - [ ] aucune donnée réelle (capture, mot de passe, adresse) dans le diff

@@ -1,5 +1,5 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use yawrdp_proto::{ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup};
+use portique_proto::{ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup};
 
 use crate::{Session, api};
 

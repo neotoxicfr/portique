@@ -17,6 +17,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
+use portique_proto::AuthMode;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -27,7 +28,6 @@ use tower_http::{
     trace::TraceLayer,
 };
 use webauthn_rs::WebauthnBuilder;
-use yawrdp_proto::AuthMode;
 
 use crate::{
     config::Config,
@@ -38,7 +38,7 @@ use crate::{
 
 /// En-tête exigé sur toute requête API qui modifie quelque chose. Un site tiers ne peut pas
 /// l'ajouter sans pré-vol CORS (que l'on ne sert pas) : protection CSRF sans jeton.
-pub const CSRF_HEADER: &str = "x-yawrdp";
+pub const CSRF_HEADER: &str = "x-portique";
 
 pub async fn open_db(url: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(url)?
@@ -53,10 +53,10 @@ pub async fn open_db(url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 pub fn build_state(cfg: Config, db: SqlitePool) -> anyhow::Result<AppState> {
-    let rp_id = cfg.public_url.host_str().context("YAWRDP_PUBLIC_URL sans hôte")?.to_owned();
+    let rp_id = cfg.public_url.host_str().context("PORTIQUE_PUBLIC_URL sans hôte")?.to_owned();
     let webauthn = WebauthnBuilder::new(&rp_id, &cfg.public_url)
         .context("configuration WebAuthn")?
-        .rp_name("yawrdp")
+        .rp_name("Portique")
         .build()
         .context("configuration WebAuthn")?;
     Ok(AppState {
@@ -80,9 +80,9 @@ pub async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
     let pw = state.cfg.admin_password.as_deref().context(
-        "aucun admin en base : définir YAWRDP_ADMIN_PASSWORD(_FILE) pour créer le compte « admin »",
+        "aucun admin en base : définir PORTIQUE_ADMIN_PASSWORD(_FILE) pour créer le compte « admin »",
     )?;
-    auth::validate_password(pw).map_err(|e| anyhow::anyhow!("YAWRDP_ADMIN_PASSWORD : {e}"))?;
+    auth::validate_password(pw).map_err(|e| anyhow::anyhow!("PORTIQUE_ADMIN_PASSWORD : {e}"))?;
     sqlx::query(
         "INSERT INTO users (username, password_hash, is_admin, webauthn_id) VALUES ('admin', ?, 1, ?)
          ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash, is_admin = 1",
@@ -214,12 +214,12 @@ mod tests {
     #[test]
     fn static_cache_control_by_name() {
         use super::static_cache_control as c;
-        assert_eq!(c("/yawrdp-web-705c14e6e4113241_bg.wasm"), Some("public, max-age=31536000, immutable"));
+        assert_eq!(c("/portique-web-705c14e6e4113241_bg.wasm"), Some("public, max-age=31536000, immutable"));
         assert_eq!(c("/style-d9330bfebee7e4ea.css"), Some("public, max-age=31536000, immutable"));
         assert_eq!(c("/"), Some("no-cache"));
         assert_eq!(c("/session/1"), Some("no-cache"));
         assert_eq!(c("/sw.js"), Some("no-cache"));
-        assert_eq!(c("/setup/yawrdp.ps1"), Some("no-cache"));
+        assert_eq!(c("/setup/portique.ps1"), Some("no-cache"));
         assert_eq!(c("/api/me"), None);
     }
 

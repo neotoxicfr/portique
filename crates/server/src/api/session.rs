@@ -12,9 +12,9 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
+use portique_proto::SessionMessage;
 use rdp_auth::ntlm::Credentials;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use yawrdp_proto::SessionMessage;
 
 use crate::{
     api::connections::{Row, find_allowed},
@@ -83,7 +83,7 @@ async fn still_allowed(state: &AppState, user_id: i64, connection_id: i64, token
         Ok(Some(u)) => u,
         _ => return false,
     };
-    if state.cfg.auth_mode == yawrdp_proto::AuthMode::Builtin {
+    if state.cfg.auth_mode == portique_proto::AuthMode::Builtin {
         let Some(token) = token else { return false };
         let alive: Result<Option<i64>, _> = sqlx::query_scalar(
             "SELECT 1 FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at >= unixepoch()",

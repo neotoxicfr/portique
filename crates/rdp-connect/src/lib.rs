@@ -1,4 +1,4 @@
-//! Ouverture d'une connexion RDP authentifiée, côté serveur yawrdp : TCP, négociation X.224,
+//! Ouverture d'une connexion RDP authentifiée, côté serveur portique : TCP, négociation X.224,
 //! TLS avec épinglage du certificat, NLA (CredSSP/NTLMv2). Le flux TLS obtenu est ensuite
 //! relayé tel quel au navigateur, qui reprend à MCS Connect Initial.
 //!

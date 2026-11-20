@@ -1,6 +1,6 @@
 [package]
 name = "rdp-connect"
-description = "Connexion RDP côté serveur yawrdp : TCP, négociation, TLS épinglé, NLA"
+description = "Connexion RDP côté serveur Portique : TCP, négociation, TLS épinglé, NLA"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

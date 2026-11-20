@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use portique_server::{app, bootstrap_admin, build_state, config};
 use tracing_subscriber::EnvFilter;
-use yawrdp_server::{app, bootstrap_admin, build_state, config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `yawrdp healthcheck` : sonde de santé pour Docker (pas de curl dans l'image).
+    // `portique healthcheck` : sonde de santé pour Docker (pas de curl dans l'image).
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck().await;
     }
@@ -16,8 +16,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::Config::from_env(&config::ProcessEnv)?;
     std::fs::create_dir_all(&cfg.data_dir).context("création du dossier de données")?;
-    let db_url = format!("sqlite://{}", cfg.data_dir.join("yawrdp.db").display());
-    let db = yawrdp_server::open_db(&db_url).await?;
+    let db_url = format!("sqlite://{}", cfg.data_dir.join("portique.db").display());
+    let db = portique_server::open_db(&db_url).await?;
     let listen = cfg.listen;
     let mode = cfg.auth_mode;
     let state = build_state(cfg, db)?;
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listener =
         tokio::net::TcpListener::bind(listen).await.with_context(|| format!("écoute sur {listen}"))?;
-    tracing::info!(%listen, ?mode, "yawrdp démarré");
+    tracing::info!(%listen, ?mode, "portique démarré");
     axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -61,7 +61,7 @@ async fn shutdown() {
 async fn healthcheck() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listen: SocketAddr =
-        std::env::var("YAWRDP_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
+        std::env::var("PORTIQUE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
     let target = SocketAddr::new(
         if listen.ip().is_unspecified() { std::net::Ipv4Addr::LOCALHOST.into() } else { listen.ip() },
         listen.port(),

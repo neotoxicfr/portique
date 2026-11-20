@@ -1,5 +1,5 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use yawrdp_proto::{LoginRequest, LoginResponse};
+use portique_proto::{LoginRequest, LoginResponse};
 
 use crate::{Session, api};
 
@@ -50,7 +50,7 @@ pub fn Login() -> impl IntoView {
     view! {
         <main class="center">
             <form class="card login" on:submit=submit>
-                <h1>"yawrdp"</h1>
+                <h1>"Portique"</h1>
                 <label>"Identifiant"
                     <input type="text" autocomplete="username webauthn" required
                         prop:value=move || username.get()

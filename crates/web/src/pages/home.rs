@@ -1,5 +1,5 @@
 use leptos::{prelude::*, task::spawn_local};
-use yawrdp_proto::{ConnectionSummary, Protocol};
+use portique_proto::{ConnectionSummary, Protocol};
 
 use crate::{Session, api};
 

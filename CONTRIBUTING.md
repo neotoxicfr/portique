@@ -1,4 +1,4 @@
-# Contribuer à yawrdp
+# Contribuer à Portique
 
 Merci de ton intérêt ! Ce guide tient en une page.
 
@@ -9,9 +9,9 @@ Merci de ton intérêt ! Ce guide tient en une page.
 - [trunk](https://trunkrs.dev) pour le front : `cargo install --locked trunk`
 
 ```sh
-cargo test --workspace --exclude yawrdp-web
-cargo clippy --workspace --exclude yawrdp-web --all-targets -- -D warnings
-cargo clippy -p yawrdp-web --target wasm32-unknown-unknown -- -D warnings   # le front ne compile qu'en wasm
+cargo test --workspace --exclude portique-web
+cargo clippy --workspace --exclude portique-web --all-targets -- -D warnings
+cargo clippy -p portique-web --target wasm32-unknown-unknown -- -D warnings   # le front ne compile qu'en wasm
 cargo fmt --all --check
 (cd crates/web && trunk build --release --dist ../../dist)
 ```

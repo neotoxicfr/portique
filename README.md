@@ -1,8 +1,8 @@
 <div align="center">
 
-# yawrdp
+# Portique
 
-**Yet Another Web RDP** : le bureau Windows dans un navigateur, sans Java, sans guacd, sans plugin.
+**Ton bureau Windows dans un navigateur**, sans Java, sans guacd, sans plugin.
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
@@ -11,14 +11,14 @@
 
 </div>
 
-yawrdp est un client RDP web auto-hébergé, écrit en Rust de bout en bout. Le serveur établit la connexion
+Portique est un client RDP web auto-hébergé, écrit en Rust de bout en bout. Le serveur établit la connexion
 authentifiée avec le PC, puis ne fait que relayer les octets. C'est le navigateur qui décode l'image (wasm
 et WebCodecs). La pile RDP est **écrite à partir des spécifications Microsoft**, sans aucune crate RDP
 tierce.
 
 Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de léger :
 
-|  | Guacamole | yawrdp |
+|  | Guacamole | Portique |
 |---|---|---|
 | Côté serveur | Tomcat (Java) + guacd (C) | un binaire Rust, image de 103 Mo |
 | Décodage de l'image | sur le serveur, réencodée en PNG/JPEG | dans le navigateur ; H.264 décodé par le GPU du client |
@@ -47,7 +47,7 @@ Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de lé
 
 ```mermaid
 flowchart LR
-    B["Navigateur<br/>Leptos + pile RDP en wasm<br/>WebCodecs"] -- "WSS<br/>(flux RDP chiffré)" --> S["Serveur yawrdp<br/>axum, SQLite"]
+    B["Navigateur<br/>Leptos + pile RDP en wasm<br/>WebCodecs"] -- "WSS<br/>(flux RDP chiffré)" --> S["Serveur portique<br/>axum, SQLite"]
     S -- "TCP 3389<br/>TLS + CredSSP/NLA" --> P["PC Windows"]
     S -. "Wake-on-LAN<br/>UDP ou SSH" .-> P
 ```
@@ -79,7 +79,7 @@ La séquence de connexion et les comportements mesurés sur Windows sont décrit
 ### 1. Construire l'image
 
 ```sh
-docker build -t yawrdp:0.1.0 .
+docker build -t portique:0.1.0 .
 openssl rand -base64 32 > secrets/master_key   # clé de chiffrement de la base
 ```
 
@@ -87,12 +87,12 @@ openssl rand -base64 32 > secrets/master_key   # clé de chiffrement de la base
 
 ```yaml
 services:
-  yawrdp:
-    image: yawrdp:0.1.0
+  portique:
+    image: portique:0.1.0
     environment:
-      YAWRDP_PUBLIC_URL: https://rdp.example.net
-      YAWRDP_MASTER_KEY_FILE: /run/secrets/master_key
-      YAWRDP_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      PORTIQUE_PUBLIC_URL: https://rdp.example.net
+      PORTIQUE_MASTER_KEY_FILE: /run/secrets/master_key
+      PORTIQUE_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
     secrets: [master_key, admin_password]
     volumes: ["./data:/data"]
     read_only: true
@@ -112,7 +112,7 @@ tunnel WireGuard, est dans [`deploy/docker-compose.example.yml`](deploy/docker-c
 
 Sur le PC Windows (Pro ou Entreprise), ouvre `https://<ton-domaine>/setup/` et lance au choix le `.ps1`, ou
 le `.reg` puis le `.cmd`. Le script affiche l'empreinte SHA-256 du certificat RDP. À la première connexion,
-un admin la compare à celle affichée par yawrdp, puis l'approuve.
+un admin la compare à celle affichée par Portique, puis l'approuve.
 
 ## Configuration
 
@@ -120,22 +120,22 @@ Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets). Définir les deux à
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `YAWRDP_PUBLIC_URL` | requis | URL publique : origine des passkeys et du WebSocket |
-| `YAWRDP_MASTER_KEY(_FILE)` | requis | 32 octets en base64, chiffre les secrets en base |
-| `YAWRDP_ADMIN_PASSWORD(_FILE)` | aucun | crée le compte `admin` au premier démarrage (mode intégré, 12 caractères minimum) |
-| `YAWRDP_AUTH_MODE` | `builtin` | `builtin` (mot de passe, TOTP, passkeys) ou `proxy` |
-| `YAWRDP_TRUSTED_PROXIES` | aucun | IP, CIDR ou nom d'hôte (ex. `traefik`) des proxys de confiance |
-| `YAWRDP_PROXY_USER_HEADER` | `Remote-User` | en-tête de l'identifiant en mode proxy |
-| `YAWRDP_PROXY_GROUPS_HEADER` | `Remote-Groups` | en-tête des groupes |
-| `YAWRDP_PROXY_ADMIN_GROUP` | aucun | groupe qui donne le rôle admin |
-| `YAWRDP_LISTEN` | `0.0.0.0:8080` | adresse d'écoute |
-| `YAWRDP_DATA_DIR` | `/data` | base SQLite |
-| `YAWRDP_STATIC_DIR` | `/app/web` | front compilé |
-| `YAWRDP_INSECURE_COOKIES` | aucun | `1` = cookies sans `Secure` (développement en HTTP seulement) |
+| `PORTIQUE_PUBLIC_URL` | requis | URL publique : origine des passkeys et du WebSocket |
+| `PORTIQUE_MASTER_KEY(_FILE)` | requis | 32 octets en base64, chiffre les secrets en base |
+| `PORTIQUE_ADMIN_PASSWORD(_FILE)` | aucun | crée le compte `admin` au premier démarrage (mode intégré, 12 caractères minimum) |
+| `PORTIQUE_AUTH_MODE` | `builtin` | `builtin` (mot de passe, TOTP, passkeys) ou `proxy` |
+| `PORTIQUE_TRUSTED_PROXIES` | aucun | IP, CIDR ou nom d'hôte (ex. `traefik`) des proxys de confiance |
+| `PORTIQUE_PROXY_USER_HEADER` | `Remote-User` | en-tête de l'identifiant en mode proxy |
+| `PORTIQUE_PROXY_GROUPS_HEADER` | `Remote-Groups` | en-tête des groupes |
+| `PORTIQUE_PROXY_ADMIN_GROUP` | aucun | groupe qui donne le rôle admin |
+| `PORTIQUE_LISTEN` | `0.0.0.0:8080` | adresse d'écoute |
+| `PORTIQUE_DATA_DIR` | `/data` | base SQLite |
+| `PORTIQUE_STATIC_DIR` | `/app/web` | front compilé |
+| `PORTIQUE_INSECURE_COOKIES` | aucun | `1` = cookies sans `Secure` (développement en HTTP seulement) |
 
 **Mode proxy.** Le login intégré est désactivé. Les comptes sont créés à la volée à partir de `Remote-User`,
 et le rôle admin est resynchronisé à chaque requête. Seuls les proxys de confiance peuvent fournir ces
-en-têtes. Le proxy doit authentifier **toutes** les requêtes vers yawrdp : une règle `bypass`, par exemple
+en-têtes. Le proxy doit authentifier **toutes** les requêtes vers Portique : une règle `bypass`, par exemple
 pour le réseau local, laisse passer les requêtes sans `Remote-User`, et l'API répond alors 401.
 
 ## Sécurité
@@ -165,16 +165,16 @@ La V1 (`v0.1.0`) couvre l'usage bureau quotidien. Pour la suite :
 Prérequis : Rust stable (1.90 ou plus), cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev).
 `./scripts/ci.sh` lance toutes les vérifications ; `./scripts/release.sh X.Y.Z` publie une version
 (image, archive, release GitHub) depuis le poste, sans CI ; `./scripts/publish-dev.sh` republie l'image
-de branche `ghcr.io/neotoxicfr/yawrdp:dev` après chaque livraison sur `dev`.
+de branche `ghcr.io/neotoxicfr/portique:dev` après chaque livraison sur `dev`.
 
 ```sh
-cargo test --workspace --exclude yawrdp-web
-cargo clippy --workspace --exclude yawrdp-web --all-targets
-cargo clippy -p yawrdp-web --target wasm32-unknown-unknown
+cargo test --workspace --exclude portique-web
+cargo clippy --workspace --exclude portique-web --all-targets
+cargo clippy -p portique-web --target wasm32-unknown-unknown
 (cd crates/web && trunk build --release --dist ../../dist)
-YAWRDP_PUBLIC_URL=http://localhost:18431 YAWRDP_LISTEN=127.0.0.1:18431 YAWRDP_DATA_DIR=./data \
-YAWRDP_STATIC_DIR=./dist YAWRDP_INSECURE_COOKIES=1 YAWRDP_MASTER_KEY=$(openssl rand -base64 32) \
-YAWRDP_ADMIN_PASSWORD=change-me-please cargo run -p yawrdp-server
+PORTIQUE_PUBLIC_URL=http://localhost:18431 PORTIQUE_LISTEN=127.0.0.1:18431 PORTIQUE_DATA_DIR=./data \
+PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY=$(openssl rand -base64 32) \
+PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 
 Les contributions sont bienvenues : voir [CONTRIBUTING.md](CONTRIBUTING.md) et le

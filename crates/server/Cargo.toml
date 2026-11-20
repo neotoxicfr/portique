@@ -1,16 +1,16 @@
 [package]
-name = "yawrdp-server"
-description = "Serveur yawrdp : comptes, connexions, relais RDP"
+name = "portique-server"
+description = "Serveur Portique : comptes, connexions, relais RDP"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "yawrdp"
+name = "portique"
 path = "src/main.rs"
 
 [dependencies]
-yawrdp-proto.workspace = true
+portique-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }

@@ -1,8 +1,8 @@
 Windows Registry Editor Version 5.00
 
-; Annule yawrdp.reg : retire les strategies posees et referme le Bureau a distance.
-; Complement : yawrdp.cmd annuler (pare-feu, demarrage rapide).
-; Sources : memes que yawrdp.reg ; la syntaxe "nom"=- supprime une valeur (support.microsoft.com/kb/310516).
+; Annule portique.reg : retire les strategies posees et referme le Bureau a distance.
+; Complement : portique.cmd annuler (pare-feu, demarrage rapide).
+; Sources : memes que portique.reg ; la syntaxe "nom"=- supprime une valeur (support.microsoft.com/kb/310516).
 
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server]
 "fDenyTSConnections"=dword:00000001

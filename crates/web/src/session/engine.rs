@@ -7,6 +7,7 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 use futures::{StreamExt, channel::mpsc};
+use portique_proto::SessionMessage;
 use rdp_gfx::{Gfx, Out, Rect};
 use rdp_pdu::fastpath::{Input, PointerUpdate};
 use rdp_session::{Config, Event, Session};
@@ -14,7 +15,6 @@ use wasm_bindgen::{Clamped, JsCast, closure::Closure};
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, CloseEvent, HtmlCanvasElement, ImageData, MessageEvent, WebSocket,
 };
-use yawrdp_proto::SessionMessage;
 
 use super::{
     clip,
@@ -234,7 +234,7 @@ impl Engine {
                     width: w as u16,
                     height: h as u16,
                     keyboard_layout: 0x040C,
-                    client_name: "yawrdp".into(),
+                    client_name: "portique".into(),
                     selected_protocol,
                     username,
                     domain,

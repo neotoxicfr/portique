@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release sans CI GitHub : ./scripts/release.sh 0.1.0 [notes.md]
 # - vérifications de scripts/ci.sh ;
-# - image Docker ghcr.io/neotoxicfr/yawrdp:X.Y.Z (sans « v ») et :latest, poussée ;
+# - image Docker ghcr.io/neotoxicfr/portique:X.Y.Z (sans « v ») et :latest, poussée ;
 # - archive binaire + front (linux x86_64, glibc 2.38+) et SHA256SUMS ;
 # - tag vX.Y.Z et release GitHub avec les notes rédigées (jamais générées).
 # Prérequis : docker connecté à ghcr.io (write:packages), gh authentifié, arbre propre sur main.
@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 version=${1:?usage: release.sh X.Y.Z [notes.md]}
 notes=${2:-.audit/release-v$version.md}
-repo=neotoxicfr/yawrdp
+repo=neotoxicfr/portique
 image=ghcr.io/$repo
 
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version X.Y.Z attendue (sans v)" >&2; exit 1; }
@@ -24,10 +24,10 @@ grep -q "^## \[v$version\]" CHANGELOG.md || { echo "CHANGELOG.md sans entrée v$
 
 docker build --build-arg VERSION="$version" -t "$image:$version" -t "$image:latest" .
 
-out=release/yawrdp-$version-x86_64-linux
+out=release/portique-$version-x86_64-linux
 rm -rf release && mkdir -p "$out"
 cid=$(docker create "$image:$version")
-docker cp "$cid:/usr/local/bin/yawrdp" "$out/yawrdp"
+docker cp "$cid:/usr/local/bin/portique" "$out/portique"
 docker cp "$cid:/app/web" "$out/web"
 docker rm "$cid" >/dev/null
 cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$out/"

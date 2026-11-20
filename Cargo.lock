@@ -2849,6 +2849,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "portique-proto"
+version = "0.1.5"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "portique-server"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "argon2 0.6.0",
+ "axum",
+ "axum-extra",
+ "base64 0.23.1",
+ "chacha20poly1305",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "ipnet",
+ "openssl",
+ "portique-proto",
+ "qrcode",
+ "rand 0.10.3",
+ "rdp-auth",
+ "rdp-connect",
+ "russh",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "totp-rs",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "portique-web"
+version = "0.1.5"
+dependencies = [
+ "console_error_panic_hook",
+ "futures",
+ "gloo-net 0.7.0",
+ "js-sys",
+ "leptos",
+ "leptos_router",
+ "portique-proto",
+ "rdp-clip",
+ "rdp-gfx",
+ "rdp-pdu",
+ "rdp-session",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webauthn-rs-proto",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5261,75 +5330,6 @@ name = "xxhash-rust"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
-
-[[package]]
-name = "yawrdp-proto"
-version = "0.1.5"
-dependencies = [
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "yawrdp-server"
-version = "0.1.5"
-dependencies = [
- "anyhow",
- "argon2 0.6.0",
- "axum",
- "axum-extra",
- "base64 0.23.1",
- "chacha20poly1305",
- "futures-util",
- "hex",
- "http-body-util",
- "ipnet",
- "openssl",
- "qrcode",
- "rand 0.10.3",
- "rdp-auth",
- "rdp-connect",
- "russh",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "sqlx",
- "thiserror 2.0.21",
- "time",
- "tokio",
- "totp-rs",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "webauthn-rs",
- "yawrdp-proto",
-]
-
-[[package]]
-name = "yawrdp-web"
-version = "0.1.5"
-dependencies = [
- "console_error_panic_hook",
- "futures",
- "gloo-net 0.7.0",
- "js-sys",
- "leptos",
- "leptos_router",
- "rdp-clip",
- "rdp-gfx",
- "rdp-pdu",
- "rdp-session",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webauthn-rs-proto",
- "yawrdp-proto",
-]
 
 [[package]]
 name = "yoke"

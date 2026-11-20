@@ -9,9 +9,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{Context, bail};
 use base64::Engine;
 use ipnet::IpNet;
-use yawrdp_proto::AuthMode;
+use portique_proto::AuthMode;
 
-pub const PREFIX: &str = "YAWRDP_";
+pub const PREFIX: &str = "PORTIQUE_";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -66,7 +66,7 @@ fn plain(env: &dyn Env, name: &str) -> Option<String> {
     env.var(&format!("{PREFIX}{name}")).filter(|v| !v.is_empty())
 }
 
-/// Lit `YAWRDP_<name>` ou `YAWRDP_<name>_FILE`.
+/// Lit `PORTIQUE_<name>` ou `PORTIQUE_<name>_FILE`.
 pub fn secret(env: &dyn Env, name: &str) -> anyhow::Result<Option<String>> {
     let direct = plain(env, name);
     let file = plain(env, &format!("{name}_FILE"));
@@ -89,21 +89,22 @@ impl Config {
         let listen = plain(env, "LISTEN")
             .unwrap_or_else(|| "0.0.0.0:8080".into())
             .parse()
-            .context("YAWRDP_LISTEN invalide")?;
+            .context("PORTIQUE_LISTEN invalide")?;
         let data_dir = PathBuf::from(plain(env, "DATA_DIR").unwrap_or_else(|| "/data".into()));
         let static_dir = PathBuf::from(plain(env, "STATIC_DIR").unwrap_or_else(|| "/app/web".into()));
-        let public_url = plain(env, "PUBLIC_URL")
-            .context("YAWRDP_PUBLIC_URL manquant (ex. https://rdp.example.com), requis pour les passkeys")?;
-        let public_url = url::Url::parse(&public_url).context("YAWRDP_PUBLIC_URL invalide")?;
+        let public_url = plain(env, "PUBLIC_URL").context(
+            "PORTIQUE_PUBLIC_URL manquant (ex. https://rdp.example.com), requis pour les passkeys",
+        )?;
+        let public_url = url::Url::parse(&public_url).context("PORTIQUE_PUBLIC_URL invalide")?;
 
         let master_key = secret(env, "MASTER_KEY")?
-            .context("YAWRDP_MASTER_KEY(_FILE) manquant : 32 octets en base64 (openssl rand -base64 32)")?;
+            .context("PORTIQUE_MASTER_KEY(_FILE) manquant : 32 octets en base64 (openssl rand -base64 32)")?;
         let master_key = decode_key(&master_key)?;
 
         let auth_mode = match plain(env, "AUTH_MODE").as_deref() {
             None | Some("builtin") => AuthMode::Builtin,
             Some("proxy") => AuthMode::Proxy,
-            Some(other) => bail!("YAWRDP_AUTH_MODE inconnu : {other} (builtin ou proxy)"),
+            Some(other) => bail!("PORTIQUE_AUTH_MODE inconnu : {other} (builtin ou proxy)"),
         };
 
         let (mut trusted, mut trusted_hosts) = (Vec::new(), Vec::new());
@@ -117,7 +118,7 @@ impl Config {
             }
         }
         if auth_mode == AuthMode::Proxy && trusted.is_empty() && trusted_hosts.is_empty() {
-            bail!("YAWRDP_AUTH_MODE=proxy exige YAWRDP_TRUSTED_PROXIES (IP, CIDR ou nom du proxy)");
+            bail!("PORTIQUE_AUTH_MODE=proxy exige PORTIQUE_TRUSTED_PROXIES (IP, CIDR ou nom du proxy)");
         }
 
         Ok(Self {
@@ -195,10 +196,10 @@ impl ProxyConfig {
 fn decode_key(b64: &str) -> anyhow::Result<[u8; 32]> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .context("YAWRDP_MASTER_KEY n'est pas du base64")?;
+        .context("PORTIQUE_MASTER_KEY n'est pas du base64")?;
     bytes
         .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("YAWRDP_MASTER_KEY fait {} octets, 32 attendus", v.len()))
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("PORTIQUE_MASTER_KEY fait {} octets, 32 attendus", v.len()))
 }
 
 fn parse_net(s: &str) -> anyhow::Result<IpNet> {
@@ -215,28 +216,28 @@ mod tests {
 
     #[test]
     fn secret_from_file_strips_newline() {
-        let dir = std::env::temp_dir().join(format!("yawrdp-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("portique-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pw");
         std::fs::write(&path, "s3cret\n").unwrap();
         let p = path.to_str().unwrap();
-        let env = [("YAWRDP_ADMIN_PASSWORD_FILE", p)];
+        let env = [("PORTIQUE_ADMIN_PASSWORD_FILE", p)];
         assert_eq!(secret(&env, "ADMIN_PASSWORD").unwrap().as_deref(), Some("s3cret"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn secret_both_defined_is_error() {
-        let env = [("YAWRDP_X", "a"), ("YAWRDP_X_FILE", "/nope")];
+        let env = [("PORTIQUE_X", "a"), ("PORTIQUE_X_FILE", "/nope")];
         assert!(secret(&env, "X").is_err());
     }
 
     #[test]
     fn proxy_mode_requires_trusted() {
         let env = [
-            ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
-            ("YAWRDP_MASTER_KEY", KEY),
-            ("YAWRDP_AUTH_MODE", "proxy"),
+            ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+            ("PORTIQUE_MASTER_KEY", KEY),
+            ("PORTIQUE_AUTH_MODE", "proxy"),
         ];
         assert!(Config::from_env(&env).is_err());
     }
@@ -244,11 +245,11 @@ mod tests {
     #[test]
     fn full_config() {
         let env = [
-            ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
-            ("YAWRDP_MASTER_KEY", KEY),
-            ("YAWRDP_AUTH_MODE", "proxy"),
-            ("YAWRDP_TRUSTED_PROXIES", "172.16.0.0/12, 10.0.0.1, traefik"),
-            ("YAWRDP_PROXY_ADMIN_GROUP", "admins"),
+            ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+            ("PORTIQUE_MASTER_KEY", KEY),
+            ("PORTIQUE_AUTH_MODE", "proxy"),
+            ("PORTIQUE_TRUSTED_PROXIES", "172.16.0.0/12, 10.0.0.1, traefik"),
+            ("PORTIQUE_PROXY_ADMIN_GROUP", "admins"),
         ];
         let c = Config::from_env(&env).unwrap();
         assert_eq!(c.auth_mode, AuthMode::Proxy);
@@ -261,10 +262,10 @@ mod tests {
     #[test]
     fn resolved_proxies_expire() {
         let env = [
-            ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
-            ("YAWRDP_MASTER_KEY", KEY),
-            ("YAWRDP_AUTH_MODE", "proxy"),
-            ("YAWRDP_TRUSTED_PROXIES", "traefik"),
+            ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+            ("PORTIQUE_MASTER_KEY", KEY),
+            ("PORTIQUE_AUTH_MODE", "proxy"),
+            ("PORTIQUE_TRUSTED_PROXIES", "traefik"),
         ];
         let c = Config::from_env(&env).unwrap();
         let ip: std::net::IpAddr = "172.20.0.45".parse().unwrap();
@@ -278,7 +279,7 @@ mod tests {
 
     #[test]
     fn short_key_rejected() {
-        let env = [("YAWRDP_PUBLIC_URL", "https://rdp.example.com"), ("YAWRDP_MASTER_KEY", "AAAA")];
+        let env = [("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"), ("PORTIQUE_MASTER_KEY", "AAAA")];
         assert!(Config::from_env(&env).is_err());
     }
 }

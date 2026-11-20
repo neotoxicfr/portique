@@ -1,12 +1,12 @@
 [package]
-name = "yawrdp-web"
-description = "Front yawrdp (Leptos CSR, wasm)"
+name = "portique-web"
+description = "Front Portique (Leptos CSR, wasm)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-yawrdp-proto.workspace = true
+portique-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 webauthn-rs-proto = { workspace = true, features = ["wasm"] }

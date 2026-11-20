@@ -38,7 +38,7 @@ pub struct Config {
     pub height: u16,
     pub keyboard_layout: u32,
     pub client_name: String,
-    /// Protocole retenu à la négociation X.224 (faite par le serveur yawrdp).
+    /// Protocole retenu à la négociation X.224 (faite par le serveur portique).
     pub selected_protocol: u32,
     pub username: String,
     pub domain: String,

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# yawrdp : serveur (Rust) + front wasm (Leptos, trunk) dans une image Debian minimale.
+# portique : serveur (Rust) + front wasm (Leptos, trunk) dans une image Debian minimale.
 
 FROM rust:1.100.0-slim-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends perl make pkg-config \
@@ -10,26 +10,26 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p yawrdp-server \
- && cp target/release/yawrdp /yawrdp \
+    cargo build --release -p portique-server \
+ && cp target/release/portique /portique \
  && cd crates/web && trunk build --release --dist /web
 
 FROM debian:trixie-slim
 ARG VERSION=dev
-LABEL org.opencontainers.image.title="yawrdp" \
+LABEL org.opencontainers.image.title="Portique" \
       org.opencontainers.image.description="Client RDP web auto-hébergé (Rust + wasm)" \
-      org.opencontainers.image.source="https://github.com/neotoxicfr/yawrdp" \
+      org.opencontainers.image.source="https://github.com/neotoxicfr/portique" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --home-dir /data yawrdp \
- && install -d -o yawrdp -g yawrdp /data
-COPY --from=build /yawrdp /usr/local/bin/yawrdp
+ && useradd --system --uid 10001 --home-dir /data portique \
+ && install -d -o portique -g portique /data
+COPY --from=build /portique /usr/local/bin/portique
 COPY --from=build /web /app/web
-USER yawrdp
-ENV YAWRDP_DATA_DIR=/data YAWRDP_STATIC_DIR=/app/web YAWRDP_LISTEN=0.0.0.0:8080
+USER portique
+ENV PORTIQUE_DATA_DIR=/data PORTIQUE_STATIC_DIR=/app/web PORTIQUE_LISTEN=0.0.0.0:8080
 VOLUME /data
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["yawrdp", "healthcheck"]
-ENTRYPOINT ["yawrdp"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["portique", "healthcheck"]
+ENTRYPOINT ["portique"]

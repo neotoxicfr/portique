@@ -2,7 +2,7 @@
 
 use totp_rs::{Algorithm, Builder, Totp};
 
-const ISSUER: &str = "yawrdp";
+const ISSUER: &str = "Portique";
 
 /// Graine de 160 bits (recommandation RFC 4226).
 pub fn new_secret() -> Vec<u8> {

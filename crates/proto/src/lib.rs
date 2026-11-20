@@ -1,4 +1,4 @@
-//! Types de l'API JSON partagés entre `yawrdp-server` et `yawrdp-web`.
+//! Types de l'API JSON partagés entre `portique-server` et `portique-web`.
 //!
 //! Les secrets (mots de passe Windows, graine TOTP) ne sortent jamais du serveur :
 //! aucun type de lecture ne les contient, seuls les types d'écriture les acceptent.

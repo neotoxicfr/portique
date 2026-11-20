@@ -9,10 +9,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use portique_proto::ApiError;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration, Webauthn};
-use yawrdp_proto::ApiError;
 
 use crate::{config::Config, crypto::Vault, ratelimit::LoginLimiter};
 

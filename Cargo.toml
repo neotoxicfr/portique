@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.90"
 
 [workspace.dependencies]
-yawrdp-proto = { path = "crates/proto" }
+portique-proto = { path = "crates/proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 uuid = { version = "1.29.2", features = ["serde"] }
@@ -27,5 +27,5 @@ debug = false
 lto = "thin"
 codegen-units = 1
 
-[profile.release.package.yawrdp-web]
+[profile.release.package.portique-web]
 opt-level = "z"

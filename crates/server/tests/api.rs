@@ -9,9 +9,9 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
+use portique_server::{CSRF_HEADER, app, bootstrap_admin, build_state, config::Config, open_db};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use yawrdp_server::{CSRF_HEADER, app, bootstrap_admin, build_state, config::Config, open_db};
 
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 const ADMIN_PW: &str = "admin-password-123";
@@ -19,14 +19,14 @@ const ADMIN_PW: &str = "admin-password-123";
 async fn setup(extra: &[(&'static str, &'static str)], peer: &str) -> Router {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let mut env = vec![
-        ("YAWRDP_PUBLIC_URL", "https://rdp.example.com"),
-        ("YAWRDP_MASTER_KEY", KEY),
-        ("YAWRDP_ADMIN_PASSWORD", ADMIN_PW),
-        ("YAWRDP_STATIC_DIR", "/nonexistent"),
+        ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+        ("PORTIQUE_MASTER_KEY", KEY),
+        ("PORTIQUE_ADMIN_PASSWORD", ADMIN_PW),
+        ("PORTIQUE_STATIC_DIR", "/nonexistent"),
     ];
     env.extend_from_slice(extra);
     struct V(Vec<(&'static str, &'static str)>);
-    impl yawrdp_server::config::Env for V {
+    impl portique_server::config::Env for V {
         fn var(&self, k: &str) -> Option<String> {
             self.0.iter().find(|(a, _)| *a == k).map(|(_, v)| v.to_string())
         }
@@ -211,15 +211,10 @@ async fn totp_enrolment_then_required() {
         .with_account_name("admin")
         .build()
         .unwrap();
-    let r = call(
-        &app,
-        "POST",
-        "/api/account/totp/confirm",
-        Some(&admin),
-        Some(json!({"code": totp.generate_current().to_string()})),
-        &[],
-    )
-    .await;
+    // Même code pour la confirmation et le rejeu : le test ne dépend pas du changement de pas de 30 s.
+    let code = totp.generate_current().to_string();
+    let r =
+        call(&app, "POST", "/api/account/totp/confirm", Some(&admin), Some(json!({"code": code})), &[]).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
 
     let r = call(
@@ -241,7 +236,7 @@ async fn totp_enrolment_then_required() {
         "/api/auth/login",
         None,
         Some(json!({
-            "username": "admin", "password": ADMIN_PW, "totp": totp.generate_current().to_string()
+            "username": "admin", "password": ADMIN_PW, "totp": code
         })),
         &[],
     )
@@ -252,9 +247,9 @@ async fn totp_enrolment_then_required() {
 #[tokio::test]
 async fn proxy_mode() {
     let extra = [
-        ("YAWRDP_AUTH_MODE", "proxy"),
-        ("YAWRDP_TRUSTED_PROXIES", "172.18.0.0/16"),
-        ("YAWRDP_PROXY_ADMIN_GROUP", "admins"),
+        ("PORTIQUE_AUTH_MODE", "proxy"),
+        ("PORTIQUE_TRUSTED_PROXIES", "172.18.0.0/16"),
+        ("PORTIQUE_PROXY_ADMIN_GROUP", "admins"),
     ];
     let app = setup(&extra, "172.18.0.4:5000").await;
 

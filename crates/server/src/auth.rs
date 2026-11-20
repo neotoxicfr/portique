@@ -14,9 +14,9 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
+use portique_proto::{AuthMode, Me};
 use sqlx::SqlitePool;
 use time::OffsetDateTime;
-use yawrdp_proto::{AuthMode, Me};
 
 use crate::{
     config::ProxyConfig,
@@ -24,7 +24,7 @@ use crate::{
     state::{AppError, AppState},
 };
 
-pub const SESSION_COOKIE: &str = "yawrdp_session";
+pub const SESSION_COOKIE: &str = "portique_session";
 const SESSION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -84,7 +84,7 @@ pub fn verify_password(pw: &str, hash: &str) -> bool {
 /// Hash factice pour que la vérification prenne le même temps quand le compte n'existe pas.
 pub fn dummy_verify(pw: &str) {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let h = DUMMY.get_or_init(|| hash_password("yawrdp-dummy").expect("argon2"));
+    let h = DUMMY.get_or_init(|| hash_password("portique-dummy").expect("argon2"));
     let _ = verify_password(pw, h);
 }
 

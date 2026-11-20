@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use yawrdp_proto::{AuthMode, UserAdmin, UserInput};
+use portique_proto::{AuthMode, UserAdmin, UserInput};
 
 use crate::{
     auth::{self, AdminUser},

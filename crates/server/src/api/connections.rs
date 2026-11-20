@@ -5,8 +5,8 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use portique_proto::{ConnectionAdmin, ConnectionInput, ConnectionSummary, Protocol};
 use sqlx::SqlitePool;
-use yawrdp_proto::{ConnectionAdmin, ConnectionInput, ConnectionSummary, Protocol};
 
 use crate::{
     auth::{AdminUser, CurrentUser},
@@ -57,7 +57,7 @@ fn protocol_str(p: Protocol) -> &'static str {
 async fn save_wol_command(
     state: &AppState,
     id: i64,
-    cmd: &Option<yawrdp_proto::WolCommandInput>,
+    cmd: &Option<portique_proto::WolCommandInput>,
 ) -> ApiResult<()> {
     let Some(r) = cmd else {
         sqlx::query(
@@ -240,7 +240,7 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
         wol_target: r.wol_target,
         allowed_users,
         cert_fingerprint: r.cert_sha256.as_deref().map(hex::encode),
-        wol_command: r.wol_ssh_host.clone().map(|host| yawrdp_proto::WolCommandAdmin {
+        wol_command: r.wol_ssh_host.clone().map(|host| portique_proto::WolCommandAdmin {
             host,
             user: r.wol_ssh_user.clone().unwrap_or_default(),
             command: r.wol_ssh_command.clone().unwrap_or_default(),

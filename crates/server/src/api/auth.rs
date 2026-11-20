@@ -2,11 +2,11 @@
 
 use axum::{Json, extract::State};
 use axum_extra::extract::CookieJar;
-use webauthn_rs::prelude::{Passkey, PublicKeyCredential, RequestChallengeResponse};
-use yawrdp_proto::{
+use portique_proto::{
     AuthMode, CeremonyChallenge, CeremonyFinish, LoginRequest, LoginResponse, Me, PasskeyLoginStart,
     ServerInfo,
 };
+use webauthn_rs::prelude::{Passkey, PublicKeyCredential, RequestChallengeResponse};
 
 use crate::{
     auth::{self, ClientIp, CurrentUser},

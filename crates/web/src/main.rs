@@ -7,7 +7,7 @@ use leptos_router::{
     components::{A, Route, Router, Routes},
     path,
 };
-use yawrdp_proto::{AuthMode, Me, ServerInfo};
+use portique_proto::{AuthMode, Me, ServerInfo};
 
 /// État d'authentification partagé par toutes les pages.
 #[derive(Clone, Copy)]
@@ -96,7 +96,7 @@ fn Shell(children: Children) -> impl IntoView {
     };
     view! {
         <header class="topbar">
-            <A href="/" attr:class="brand">"yawrdp"</A>
+            <A href="/" attr:class="brand">"Portique"</A>
             <nav>
                 <A href="/">"Connexions"</A>
                 <A href="/compte">"Compte"</A>

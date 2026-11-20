@@ -337,7 +337,7 @@ mod tests {
                 height: 720,
                 keyboard_layout: 0x040C,
                 client_build: 1,
-                client_name: "yawrdp".into(),
+                client_name: "portique".into(),
                 early_capability_flags: 0,
                 selected_protocol: 2,
             },

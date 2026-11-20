@@ -1,4 +1,4 @@
-//! Rejoue un enregistrement EGFX (`YAWRDP_PROBE_DUMP`) dans `rdp-gfx`, écrit le PNG final et
+//! Rejoue un enregistrement EGFX (`PORTIQUE_PROBE_DUMP`) dans `rdp-gfx`, écrit le PNG final et
 //! liste les commandes qui touchent un point donné (diagnostic de rendu).
 //!
 //! Usage : gfx-replay <dump> <sortie.png> [x y]

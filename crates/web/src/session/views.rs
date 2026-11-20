@@ -161,11 +161,11 @@ pub fn open_window(screen: &ScreenGeom, n: usize) -> Result<(Window, HtmlCanvasE
         screen.left, screen.top, screen.width, screen.height
     );
     let w = window
-        .open_with_url_and_target_and_features("about:blank", &format!("yawrdp-ecran-{n}"), &features)
+        .open_with_url_and_target_and_features("about:blank", &format!("portique-ecran-{n}"), &features)
         .map_err(|e| format!("{e:?}"))?
         .ok_or("fenêtre bloquée par le navigateur (autoriser les fenêtres surgissantes)")?;
     let doc = w.document().ok_or("document de la fenêtre indisponible")?;
-    doc.set_title(&format!("yawrdp — écran {}", n + 1));
+    doc.set_title(&format!("Portique — écran {}", n + 1));
     let body = doc.body().ok_or("corps de document absent")?;
     let _ = body.style().set_property("margin", "0");
     let _ = body.style().set_property("background", "#000");

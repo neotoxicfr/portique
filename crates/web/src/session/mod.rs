@@ -94,7 +94,8 @@ pub fn SessionPage() -> impl IntoView {
     let open_gen = StoredValue::new(0u64);
     // Multi-écran : 1) détecter les écrans (demande la permission), 2) ouvrir les fenêtres, une
     // par clic (un navigateur bloque une fenêtre ouverte hors d'un geste utilisateur).
-    let screens = StoredValue::new_local(None::<(Vec<ScreenGeom>, usize)>);
+    // Écrans détectés et `ScreenDetails` (tenu à jour par le navigateur), relu à chaque clic.
+    let screens = StoredValue::new_local(None::<(Vec<ScreenGeom>, JsValue)>);
     let multi_label = RwSignal::new(None::<String>);
     let multi_active = RwSignal::new(false);
     let extend_label =
@@ -236,7 +237,12 @@ pub fn SessionPage() -> impl IntoView {
     };
     let kd = window_event_listener(ev::keydown, move |e| key_handler(e, true));
     let ku = window_event_listener(ev::keyup, move |e| key_handler(e, false));
-    let blur = window_event_listener(ev::blur, move |_| with_engine(&|e| e.release_all()));
+    // Focus perdu : touches relâchées côté PC, et Ctrl+Alt+Maj désarmé (relâchées ailleurs, elles
+    // ne doivent pas ouvrir le menu au prochain relâchement de Maj).
+    let blur = window_event_listener(ev::blur, move |_| {
+        chord.set_value(false);
+        with_engine(&|e| e.release_all());
+    });
     // Retour sur la page : le presse-papier local a pu changer.
     let focus = window_event_listener(ev::focus, move |_| {
         with_engine(&|e| {
@@ -334,9 +340,10 @@ pub fn SessionPage() -> impl IntoView {
     };
     let detect = move |_| {
         spawn_local(async move {
-            match views::screens().await {
-                Ok((list, cur)) if list.len() > 1 => {
-                    screens.set_value(Some((list, cur)));
+            let found = views::screen_details().await.and_then(|d| Ok((views::screens(&d)?.0, d)));
+            match found {
+                Ok((list, details)) if list.len() > 1 => {
+                    screens.set_value(Some((list, details)));
                     multi_label.set(extend_label());
                 }
                 Ok(_) => multi_label.set(Some("Un seul écran détecté".into())),
@@ -345,7 +352,11 @@ pub fn SessionPage() -> impl IntoView {
         });
     };
     let extend = move |_| {
-        let Some((list, cur)) = screens.get_value() else { return };
+        let Some((_, details)) = screens.get_value() else { return };
+        let (list, cur) = match views::screens(&details) {
+            Ok(s) => s,
+            Err(err) => return multi_label.set(Some(err)),
+        };
         with_engine(&|e| match e.enable_multi(&list, cur) {
             Ok(Extend::Done(n)) => {
                 multi_active.set(true);

@@ -204,6 +204,12 @@ impl Clipboard {
     /// Traite un message complet reçu du serveur.
     pub fn receive(&mut self, msg: &[u8]) -> Result<Vec<ClipEvent>, Error> {
         let (Some(msg_type), Some(flags), Some(len)) = (le16(msg, 0), le16(msg, 2), le32(msg, 4)) else {
+            // Peut-être la réponse attendue, mutilée : comme une réponse tronquée, elle termine la
+            // demande en vol, sinon plus aucune demande ne partirait.
+            if self.pending.take().is_some() {
+                self.stale = false;
+                return Ok(alloc::vec![ClipEvent::RemoteData(None)]);
+            }
             return Err(Error::Truncated("en-tête cliprdr"));
         };
         let len = len as usize;

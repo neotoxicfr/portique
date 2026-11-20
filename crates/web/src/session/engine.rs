@@ -81,6 +81,8 @@ struct Inner {
     display_caps: Option<DisplayCaps>,
     /// Fenêtres secondaires ouvertes pendant une extension pas encore terminée (une par geste).
     staged: Vec<View>,
+    /// Écrans (et écran courant) sur lesquels porte l'extension en cours.
+    staged_screens: Option<(Vec<ScreenGeom>, usize)>,
     touch: Touch,
     /// Taille voulue (fenêtre) : appliquée dès que le contrôle d'affichage devient prêt.
     desired: Option<(u32, u32)>,
@@ -104,16 +106,22 @@ struct Inner {
     /// contenu sans format pris en charge (fichiers…) : le contenu local, plus ancien que cette
     /// copie, ne doit pas l'écraser au prochain Ctrl+V.
     clip_last: Option<u64>,
-    /// Notre dernière annonce sans réponse encore : empreinte et instant (ms).
-    clip_announced: Option<(u64, f64)>,
-    /// Listes de formats envoyées sans réponse (Format List Response) : Windows répond dans l'ordre.
-    clip_unacked: u32,
+    /// Nos listes de formats sans réponse et leurs attentes : Windows n'accuse une liste qu'une
+    /// fois notre contenu installé, c'est le moment de relâcher un Ctrl+V. Vidées à la fermeture.
+    clip_announces: clip::Announces,
     /// Ctrl+V en cours : les entrées attendent la synchronisation du presse-papier.
     holding: bool,
     held: Vec<Input>,
-    /// Attentes de l'accusé de notre annonce (vrai si acceptée) : Windows ne l'envoie qu'une fois
-    /// notre contenu installé, c'est le moment de relâcher un Ctrl+V. Vidées à la fermeture.
-    clip_ack: Vec<futures::channel::oneshot::Sender<bool>>,
+}
+
+impl Inner {
+    /// Session finie : plus d'accusé à attendre, ni d'écriture locale (conversion en cours,
+    /// réessai, repli) — un autre moteur a pu prendre la relève.
+    fn end_clipboard(&mut self) {
+        self.clip_announces.clear();
+        self.clip_write_gen = self.clip_write_gen.wrapping_add(1);
+        self.clip_pending_write = None;
+    }
 }
 
 /// Poignée partagée sur une session en cours.
@@ -191,6 +199,7 @@ impl Engine {
             display_channel: None,
             display_caps: None,
             staged: Vec::new(),
+            staged_screens: None,
             touch: Touch::default(),
             desired: None,
             desktop: (w, h),
@@ -205,11 +214,9 @@ impl Engine {
             clip_write_gen: 0,
             clip_pending_write: None,
             clip_last: None,
-            clip_announced: None,
-            clip_unacked: 0,
+            clip_announces: clip::Announces::default(),
             holding: false,
             held: Vec::new(),
-            clip_ack: Vec::new(),
         }));
         let engine = Engine { inner, status, on_single };
         (engine.status)(Status::Connecting("Connexion au PC…".into()));
@@ -249,7 +256,7 @@ impl Engine {
         let mut i = self.inner.borrow_mut();
         i.closing = true;
         // Une synchronisation qui attend l'accusé ne le recevra plus : elle libère le moteur.
-        i.clip_ack.clear();
+        i.end_clipboard();
         for v in i.views.iter().skip(1).chain(&i.staged) {
             v.close();
         }
@@ -291,7 +298,7 @@ impl Engine {
         }
         let mut i = self.inner.borrow_mut();
         i.connected = false;
-        i.clip_ack.clear();
+        i.end_clipboard();
     }
 
     fn control(&self, text: &str) -> Result<(), String> {
@@ -629,6 +636,7 @@ impl Engine {
     /// Étend la session sur tous les écrans, une fenêtre secondaire par appel (chaque appel dans
     /// son propre geste utilisateur : un clic suffit avec deux écrans). Les fenêtres attendent dans
     /// `staged` ; la disposition part quand toutes sont ouvertes. Un échec les ferme toutes.
+    /// `screens` : écrans relus juste avant l'appel (ils doivent rester ceux de la première étape).
     pub fn enable_multi(&self, screens: &[ScreenGeom], current: usize) -> Result<Extend, String> {
         let result = self.extend_step(screens, current);
         if result.is_err() {
@@ -651,18 +659,26 @@ impl Engine {
         let (monitors, rects) = views::layout(screens, current);
         caps.check(&monitors)?;
         let secondary: Vec<usize> = (0..screens.len()).filter(|&i| i != current).collect();
-        let (k, closed) = {
+        let (k, closed, changed) = {
             let i = self.inner.borrow();
             let closed =
                 i.staged.iter().any(|v| v.window.as_ref().is_some_and(|w| w.closed().unwrap_or(true)));
-            (i.staged.len(), closed)
+            // `screens` est relu à chaque geste : un écran branché, débranché ou redéfini depuis la
+            // première fenêtre rendrait fausses la géométrie des suivantes et la disposition.
+            let changed =
+                i.staged_screens.as_ref().is_some_and(|(l, c)| (l.as_slice(), *c) != (screens, current));
+            (i.staged.len(), closed, changed)
         };
         // Une fenêtre déjà préparée a été fermée : la disposition annoncerait un écran invisible.
         if closed {
             return Err("fenêtre d'écran fermée pendant l'extension : recommencer".into());
         }
+        if changed {
+            return Err("écrans changés pendant l'extension : recommencer".into());
+        }
         if k == 0 {
             self.disable_multi_views();
+            self.inner.borrow_mut().staged_screens = Some((screens.to_vec(), current));
         }
         let Some(&idx) = secondary.get(k) else {
             return Err("écrans changés pendant l'extension : recommencer".into());
@@ -679,6 +695,7 @@ impl Engine {
             return Ok(Extend::Next { opened: 1 + i.staged.len(), total: screens.len() });
         }
         let staged = std::mem::take(&mut i.staged);
+        i.staged_screens = None;
         i.views.extend(staged);
         i.multi = Some(std::iter::once(current).chain(secondary).map(|idx| rects[idx]).collect());
         drop(i);
@@ -687,7 +704,12 @@ impl Engine {
     }
 
     fn close_staged(&self) {
-        for v in std::mem::take(&mut self.inner.borrow_mut().staged) {
+        let staged = {
+            let mut i = self.inner.borrow_mut();
+            i.staged_screens = None;
+            std::mem::take(&mut i.staged)
+        };
+        for v in staged {
             v.close();
         }
     }
@@ -1057,10 +1079,11 @@ impl Engine {
         let le16 = |o: usize| {
             u16::from_le_bytes([msg.get(o).copied().unwrap_or(0), msg.get(o + 1).copied().unwrap_or(0)])
         };
-        let kind = le16(0);
+        // En-tête incomplet (réponse mutilée soldée par `rdp-clip`) : pas de type à interpréter.
+        let kind = if msg.len() >= 8 { le16(0) } else { 0 };
         match kind {
             // Monitor Ready : `rdp-clip` y répond par notre liste de formats, que Windows accusera.
-            1 => self.inner.borrow_mut().clip_unacked += 1,
+            1 => self.inner.borrow_mut().clip_announces.sent(None, js_sys::Date::now(), None),
             // Format List Response : CB_RESPONSE_OK (0x0001) ou CB_RESPONSE_FAIL.
             3 => self.format_list_answered(le16(2) & 0x0001 != 0),
             _ => {}
@@ -1084,11 +1107,11 @@ impl Engine {
             );
             match ev {
                 rdp_clip::ClipEvent::RemoteChanged(formats) => {
-                    // Windows a copié (liste acceptée par `rdp-clip`) : notre annonce en attente est
-                    // dépassée, son accusé ne validera rien ; une écriture locale en attente aussi.
+                    // Windows a copié (liste acceptée par `rdp-clip`) : nos annonces en attente sont
+                    // dépassées, leur accusé ne validera rien ; une écriture locale en attente aussi.
                     {
                         let mut i = self.inner.borrow_mut();
-                        i.clip_announced = None;
+                        i.clip_announces.remote_changed();
                         i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
                         i.clip_pending_write = None;
                     }
@@ -1130,23 +1153,11 @@ impl Engine {
     }
 
     /// Réponse de Windows à l'une de nos listes de formats (il répond dans l'ordre d'envoi).
+    /// Acceptée et pas remplacée : notre contenu est celui du PC.
     fn format_list_answered(&self, ok: bool) {
-        let waiters = {
-            let mut i = self.inner.borrow_mut();
-            i.clip_unacked = i.clip_unacked.saturating_sub(1);
-            if i.clip_unacked > 0 {
-                return;
-            }
-            // Acceptée : notre contenu est celui du PC. Refusée : il reste à réannoncer.
-            if let Some((fp, _)) = i.clip_announced.take()
-                && ok
-            {
-                i.clip_last = Some(fp);
-            }
-            std::mem::take(&mut i.clip_ack)
-        };
-        for tx in waiters {
-            let _ = tx.send(ok);
+        let mut i = self.inner.borrow_mut();
+        if let Some(fp) = i.clip_announces.answered(ok) {
+            i.clip_last = Some(fp);
         }
     }
 
@@ -1156,6 +1167,10 @@ impl Engine {
     fn write_remote(&self, items: Vec<rdp_clip::LocalData>) {
         let (generation, announce) = {
             let mut i = self.inner.borrow_mut();
+            // Réponse restée dans la file après la fermeture : plus rien à écrire.
+            if i.closing {
+                return;
+            }
             i.clip_last = Some(clip::fingerprint(&items));
             i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
             i.clip_pending_write = None;
@@ -1170,8 +1185,13 @@ impl Engine {
             if let Some(p) = png
                 && !clip::png_decodes(p).await
             {
-                web_sys::console::debug_1(&"presse-papier : PNG du PC illisible, repli sur le DIB".into());
-                e.fetch_step(|f, request| f.png_unusable(announce, request));
+                // Contenu dépassé ou session finie pendant le décodage : pas de repli non plus.
+                if e.inner.borrow().clip_write_gen == generation {
+                    web_sys::console::debug_1(
+                        &"presse-papier : PNG du PC illisible, repli sur le DIB".into(),
+                    );
+                    e.fetch_step(|f, request| f.png_unusable(announce, request));
+                }
                 return;
             }
             e.write_local(generation, items);
@@ -1195,12 +1215,14 @@ impl Engine {
     }
 
     /// Envoie au PC le contenu du presse-papier local s'il a changé, et attend que Windows l'ait
-    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste : il reste à réannoncer.
+    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste, ou si une liste plus
+    /// récente l'a remplacée avant sa réponse : il reste à réannoncer ou à rejoindre la suivante.
     pub async fn sync_local_clipboard(&self) -> bool {
         if !self.is_connected() {
             return true;
         }
         let t0 = js_sys::Date::now();
+        let copies = self.inner.borrow().clip_announces.remote_copies();
         let items = clip::read_local().await;
         web_sys::console::debug_1(
             &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),
@@ -1217,13 +1239,17 @@ impl Engine {
             if !i.connected || i.closing {
                 return true;
             }
+            // Windows a copié pendant la lecture : son contenu est le plus récent, le nôtre ne doit
+            // ni l'écraser ni invalider sa récupération.
+            if i.clip_announces.remote_copies() != copies {
+                return true;
+            }
             let now = js_sys::Date::now();
-            i.clip_ack.retain(|t| !t.is_canceled());
-            match i.clip_announced {
+            match i.clip_announces.latest() {
                 // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : on
                 // attend le même accusé.
                 Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => {
-                    i.clip_ack.push(tx);
+                    i.clip_announces.join(tx);
                     Vec::new()
                 }
                 None if i.clip_last == Some(fp) => return true,
@@ -1233,21 +1259,19 @@ impl Engine {
                     if events.is_empty() {
                         return true;
                     }
-                    i.clip_unacked += 1;
-                    i.clip_announced = Some((fp, now));
+                    i.clip_announces.sent(Some(fp), now, Some(tx));
                     // Copie locale plus récente : une écriture en attente du contenu du PC est dépassée,
                     // tout comme une récupération en cours (une réponse en retard ne doit rien écrire).
                     i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
                     i.clip_pending_write = None;
                     i.clip_fetch.local_published();
-                    i.clip_ack.push(tx);
                     events
                 }
             }
         };
         self.clip_send(events);
         // Attente abandonnée (session fermée) : rien de plus à tenter.
-        rx.await.unwrap_or(true)
+        matches!(rx.await, Ok(clip::Ack::Accepted) | Err(_))
     }
 
     /// Geste utilisateur : occasion de réussir une écriture locale refusée plus tôt, si son
@@ -1266,9 +1290,9 @@ impl Engine {
     }
 
     /// Ctrl+V : synchronise d'abord le presse-papier (2 s au plus), puis laisse passer les touches
-    /// retenues. Une liste refusée par Windows est réannoncée dans ce délai ; après trois refus, les
-    /// touches partent quand même (sinon Ctrl resterait enfoncé sur le PC) et Windows colle son
-    /// propre contenu.
+    /// retenues. Une liste refusée par Windows est réannoncée dans ce délai, une liste remplacée
+    /// laisse rejoindre la suivante ; après trois essais, les touches partent quand même (sinon
+    /// Ctrl resterait enfoncé sur le PC) et Windows colle son propre contenu.
     pub fn paste_guard(&self) {
         if self.inner.borrow().holding {
             return;
@@ -1294,7 +1318,7 @@ impl Engine {
             };
             futures::pin_mut!(sync, timeout);
             if let futures::future::Either::Left((false, _)) = futures::future::select(sync, timeout).await {
-                web_sys::console::warn_1(&"presse-papier : Windows refuse le contenu local".into());
+                web_sys::console::warn_1(&"presse-papier : contenu local pas accepté par Windows".into());
             }
             let held = {
                 let mut i = e.inner.borrow_mut();
@@ -1373,29 +1397,27 @@ impl Engine {
     /// `force` : envoyer même à taille égale (retour d'une extension multi-écran).
     fn send_size(&self, width: u32, height: u32, force: bool) {
         let (w, h) = clamp_size(width, height);
-        let (channel, ready, current, multi) = {
+        let (channel, caps, current, multi) = {
             let i = self.inner.borrow();
-            (i.display_channel, i.display_caps.is_some(), i.desktop, i.multi.is_some())
+            (i.display_channel, i.display_caps, i.desktop, i.multi.is_some())
         };
         // En multi-écran, la disposition vient des écrans, pas de la taille de la fenêtre.
         if multi {
             return;
         }
         self.inner.borrow_mut().desired = Some((w, h));
-        let (Some(channel), true) = (channel, ready) else { return };
+        let (Some(channel), Some(caps)) = (channel, caps) else { return };
+        // Fenêtre plus grande que la surface permise : le PC ignorerait la disposition.
+        let (w, h) = caps.fit(w, h);
+        let monitor = [(0, 0, w, h)];
+        if let Err(e) = caps.check(&monitor) {
+            web_sys::console::warn_1(&format!("contrôle d'affichage : {e}").into());
+            return;
+        }
         if !force && (w, h) == current {
             return;
         }
-        // DISPLAYCONTROL_MONITOR_LAYOUT_PDU (MS-RDPEDISP 2.2.2.2), un écran principal.
-        let mut p = Vec::with_capacity(56);
-        p.extend_from_slice(&2u32.to_le_bytes());
-        p.extend_from_slice(&56u32.to_le_bytes());
-        p.extend_from_slice(&40u32.to_le_bytes());
-        p.extend_from_slice(&1u32.to_le_bytes());
-        for v in [1u32, 0, 0, w, h, 0, 0, 0, 100, 100] {
-            p.extend_from_slice(&v.to_le_bytes());
-        }
-        self.dvc_send(channel, &p);
+        self.dvc_send(channel, &views::layout_pdu(&monitor, 0));
     }
 }
 

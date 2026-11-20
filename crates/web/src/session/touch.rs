@@ -91,10 +91,13 @@ enum State {
     },
     /// Geste terminé (appui long rendu, doigt principal levé) : on attend que tout soit levé.
     Done,
-    /// `d0`, `m0` : écart et milieu au départ ; `last` : milieu précédent ; `zoom0` : zoom au départ.
+    /// `a0`, `b0`, `d0`, `m0` : doigts, écart et milieu au départ ; `last` : milieu précédent ;
+    /// `zoom0` : zoom au départ.
     Two {
         a: Finger,
         b: Finger,
+        a0: (f64, f64),
+        b0: (f64, f64),
         d0: f64,
         m0: (f64, f64),
         last: (f64, f64),
@@ -162,6 +165,8 @@ impl Touch {
                 self.state = State::Two {
                     a,
                     b: f,
+                    a0: (a.x, a.y),
+                    b0: (x, y),
                     d0: dist((a.x, a.y), (x, y)).max(1.0),
                     m0: m,
                     last: m,
@@ -220,13 +225,20 @@ impl Touch {
     }
 
     fn two_moved(&mut self) -> Vec<Action> {
-        let State::Two { a, b, d0, m0, last, zoom0, mode } = &mut self.state else { return Vec::new() };
+        let State::Two { a, b, a0, b0, d0, m0, last, zoom0, mode } = &mut self.state else {
+            return Vec::new();
+        };
         let m = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
         let d = dist((a.x, a.y), (b.x, b.y));
         if let Mode::Undecided = mode {
+            // Défilement : les deux doigts ont bougé, dans le même sens. Un seul doigt qui part
+            // déplace aussi le milieu, mais c'est le début d'un pincement.
+            let (da, db) = ((a.x - a0.0, a.y - a0.1), (b.x - b0.0, b.y - b0.1));
+            let moved = |v: (f64, f64)| v.0.hypot(v.1) > SLOP / 2.0;
+            let together = moved(da) && moved(db) && da.0 * db.0 + da.1 * db.1 > 0.0;
             if (d - *d0).abs() > PINCH_SLOP {
                 *mode = Mode::Pinch;
-            } else if dist(m, *m0) > SLOP {
+            } else if together && dist(m, *m0) > SLOP {
                 *mode = Mode::Scroll { acc_x: 0.0, acc_y: 0.0 };
             } else {
                 return Vec::new();
@@ -428,10 +440,11 @@ mod tests {
         let mut t = touch();
         t.down(1, 100.0, 300.0);
         t.down(2, 200.0, 300.0);
-        // Les deux doigts descendent de 30 px : défilement vers le haut (positif), au milieu.
-        t.moved(1, 100.0, 330.0);
+        // Les deux doigts descendent de 30 px : défilement vers le haut (positif), au milieu, dès
+        // que le second doigt confirme le mouvement du premier.
+        assert!(t.moved(1, 100.0, 330.0).is_empty(), "un seul doigt : rien de décidé");
         let out = t.moved(2, 200.0, 330.0);
-        assert_eq!(out, vec![Action::Wheel { delta: 30, horizontal: false, x: 150.0, y: 330.0 }]);
+        assert_eq!(out, vec![Action::Wheel { delta: 60, horizontal: false, x: 150.0, y: 330.0 }]);
         // Vers la gauche : défilement vers la droite (positif).
         t.moved(1, 80.0, 330.0);
         let out = t.moved(2, 180.0, 330.0);
@@ -439,6 +452,20 @@ mod tests {
         assert!(t.up(1, 0.0, 0.0, 0.0).is_empty(), "pas de clic à la fin");
         assert!(t.up(2, 0.0, 0.0, 0.0).is_empty());
         assert_eq!(t.zoom, Zoom::default());
+    }
+
+    #[test]
+    fn pinch_started_by_one_finger_is_not_a_scroll() {
+        // Le doigt gauche part seul de 22 px (milieu déplacé de 11, écart +22), puis le droit :
+        // écart +44, milieu revenu. Dans les deux ordres, c'est un zoom, jamais une molette.
+        for (first, second) in [((1, 78.0), (2, 222.0)), ((2, 222.0), (1, 78.0))] {
+            let mut t = touch();
+            t.down(1, 100.0, 300.0);
+            t.down(2, 200.0, 300.0);
+            assert!(t.moved(first.0, first.1, 300.0).is_empty(), "un seul doigt : rien de décidé");
+            let out = t.moved(second.0, second.1, 300.0);
+            assert!(matches!(out[..], [Action::Zoom(z)] if (z.scale - 1.44).abs() < 1e-9), "{out:?}");
+        }
     }
 
     #[test]

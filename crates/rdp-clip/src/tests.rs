@@ -226,6 +226,12 @@ fn truncated_response_ends_the_request() {
         assert_eq!(c.receive(&unhex(resp)).unwrap(), [ClipEvent::RemoteData(None)]);
     }
     assert_eq!(c.request(&[ClipFormat::Text]).len(), 1, "nouvelle demande possible");
+    // En-tête incomplet (moins de 8 octets) pendant la demande : elle se termine aussi.
+    for short in ["05 00 01", ""] {
+        assert_eq!(c.receive(&unhex(short)).unwrap(), [ClipEvent::RemoteData(None)]);
+        assert!(c.receive(&unhex(short)).is_err(), "sans demande en vol : erreur");
+        assert_eq!(c.request(&[ClipFormat::Text]).len(), 1, "nouvelle demande possible");
+    }
 }
 
 #[test]

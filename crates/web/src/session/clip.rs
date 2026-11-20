@@ -4,6 +4,9 @@
 //! local au retour du focus et juste avant un Ctrl+V transmis au PC ; on écrit ce que Windows a
 //! copié dès qu'il l'annonce (et on réessaie au prochain geste si la page n'avait pas le focus).
 
+use std::collections::VecDeque;
+
+use futures::channel::oneshot;
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use rdp_clip::{ClipFormat, LocalData};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -127,6 +130,86 @@ impl Fetch {
         }
         let items = std::mem::take(&mut self.received);
         (!items.is_empty()).then_some(items)
+    }
+}
+
+/// Verdict de Windows sur l'une de nos listes de formats (Format List Response).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    /// CB_RESPONSE_OK : notre contenu est celui du PC.
+    Accepted,
+    /// CB_RESPONSE_FAIL : il reste à réannoncer.
+    Refused,
+    /// Une liste plus récente est partie avant cette réponse : le contenu du PC est le sien.
+    Replaced,
+}
+
+struct Announce {
+    /// Empreinte annoncée. `None` : inconnue (liste de Monitor Ready) ou dépassée par une copie
+    /// sur le PC ; une telle annonce n'est ni rejointe ni validée.
+    fp: Option<u64>,
+    at: f64,
+    waiters: Vec<oneshot::Sender<Ack>>,
+}
+
+/// Nos listes de formats sans réponse, dans l'ordre d'envoi. Windows répond dans l'ordre : chaque
+/// réponse solde la plus ancienne, et seules les attentes de celle-ci reçoivent son verdict.
+#[derive(Default)]
+pub struct Announces {
+    pending: VecDeque<Announce>,
+    /// Copies faites sur le PC : une lecture locale commencée avant la dernière est dépassée.
+    remote_copies: u32,
+}
+
+impl Announces {
+    /// Liste envoyée : son empreinte si elle est connue, et l'attente de l'appelant.
+    pub fn sent(&mut self, fp: Option<u64>, at: f64, waiter: Option<oneshot::Sender<Ack>>) {
+        self.pending.push_back(Announce { fp, at, waiters: waiter.into_iter().collect() });
+    }
+
+    /// Dernière liste en vol, si son contenu est connu : (empreinte, instant d'envoi).
+    pub fn latest(&self) -> Option<(u64, f64)> {
+        self.pending.back().and_then(|a| Some((a.fp?, a.at)))
+    }
+
+    /// Attend la réponse de la dernière liste en vol (même contenu, voir `latest`).
+    pub fn join(&mut self, waiter: oneshot::Sender<Ack>) {
+        if let Some(a) = self.pending.back_mut() {
+            a.waiters.push(waiter);
+        }
+    }
+
+    /// Le PC a copié : nos listes en vol ne valident plus rien et ne se rejoignent plus ; leurs
+    /// attentes recevront quand même leur propre verdict.
+    pub fn remote_changed(&mut self) {
+        self.remote_copies = self.remote_copies.wrapping_add(1);
+        for a in &mut self.pending {
+            a.fp = None;
+        }
+    }
+
+    pub fn remote_copies(&self) -> u32 {
+        self.remote_copies
+    }
+
+    /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Renvoie
+    /// l'empreinte désormais commune aux deux côtés : acceptée, connue et pas remplacée.
+    pub fn answered(&mut self, ok: bool) -> Option<u64> {
+        let a = self.pending.pop_front()?;
+        let verdict = match (self.pending.is_empty(), ok) {
+            (false, _) => Ack::Replaced,
+            (true, true) => Ack::Accepted,
+            (true, false) => Ack::Refused,
+        };
+        for w in a.waiters {
+            let _ = w.send(verdict);
+        }
+        a.fp.filter(|_| verdict == Ack::Accepted)
+    }
+
+    /// Session finie : les attentes sont abandonnées (leur récepteur voit l'annulation).
+    pub fn clear(&mut self) {
+        self.pending.clear();
     }
 }
 
@@ -283,11 +366,14 @@ pub async fn read_local() -> Option<Vec<LocalData>> {
 /// élément en font partie (« ab » + « c » ≠ « a » + « bc »), et une image compte en entier.
 pub fn fingerprint(items: &[LocalData]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    // FNV-1a par mots de 8 octets : une image de plusieurs Mo reste rapide à hacher.
+    // FNV-1a par mots de 8 octets : une image de plusieurs Mo reste rapide à hacher. Le repli des
+    // bits hauts sur les bas fait porter un écart du bit 63 sur les mots suivants : sans lui, il
+    // y resterait seul et un second écart au même bit l'annulerait.
     let mut eat = |b: &[u8]| {
         let (words, rest) = b.as_chunks::<8>();
         for w in words {
             h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0x0100_0000_01b3);
+            h ^= h >> 32;
         }
         for x in rest {
             h = (h ^ *x as u64).wrapping_mul(0x0100_0000_01b3);
@@ -332,6 +418,61 @@ mod tests {
         );
         assert_ne!(fingerprint(&[img(0, 64, 32)]), fingerprint(&[img(0, 32, 64)]), "dimensions");
         assert_eq!(fingerprint(&[t("x"), img(7, 64, 32)]), fingerprint(&[t("x"), img(7, 64, 32)]));
+        // 4×1 : seuls les bits forts des alphas 7 et 15 (bit 63 de chaque mot) diffèrent.
+        let rgba = |flip: u8| {
+            let mut rgba = vec![0x40u8; 16];
+            rgba[7] ^= flip;
+            rgba[15] ^= flip;
+            LocalData::Rgba { width: 4, height: 1, rgba }
+        };
+        assert_ne!(fingerprint(&[rgba(0)]), fingerprint(&[rgba(0x80)]), "deux écarts au bit 63");
+        assert_eq!(fingerprint(&[rgba(0x80)]), fingerprint(&[rgba(0x80)]));
+    }
+
+    #[test]
+    fn each_announce_gets_only_its_own_verdict() {
+        let wait = || oneshot::channel::<Ack>();
+        let mut a = Announces::default();
+        // Liste de Monitor Ready (contenu inconnu), puis A et B avant toute réponse.
+        a.sent(None, 0.0, None);
+        assert_eq!(a.latest(), None);
+        let (ta, mut ra) = wait();
+        a.sent(Some(1), 10.0, Some(ta));
+        let (ta2, mut ra2) = wait();
+        assert_eq!(a.latest(), Some((1, 10.0)));
+        a.join(ta2);
+        let (tb, mut rb) = wait();
+        a.sent(Some(2), 20.0, Some(tb));
+        // Monitor Ready, A refusée, B acceptée : A est remplacée, pas créditée du succès de B.
+        assert_eq!(a.answered(true), None);
+        assert_eq!(ra.try_recv(), Ok(None));
+        assert_eq!(a.answered(false), None);
+        assert_eq!(ra.try_recv(), Ok(Some(Ack::Replaced)));
+        assert_eq!(ra2.try_recv(), Ok(Some(Ack::Replaced)), "attente jointe à A");
+        assert_eq!(rb.try_recv(), Ok(None));
+        assert_eq!(a.answered(true), Some(2));
+        assert_eq!(rb.try_recv(), Ok(Some(Ack::Accepted)));
+        assert_eq!(a.latest(), None);
+        // Seule en vol : son propre verdict, refus compris.
+        let (tc, mut rc) = wait();
+        a.sent(Some(3), 30.0, Some(tc));
+        assert_eq!(a.answered(false), None);
+        assert_eq!(rc.try_recv(), Ok(Some(Ack::Refused)));
+        // Copie sur le PC pendant l'attente : plus rien à rejoindre ni à valider, verdict remis.
+        let (td, mut rd) = wait();
+        a.sent(Some(4), 40.0, Some(td));
+        let copies = a.remote_copies();
+        a.remote_changed();
+        assert_ne!(a.remote_copies(), copies);
+        assert_eq!(a.latest(), None);
+        assert_eq!(a.answered(true), None);
+        assert_eq!(rd.try_recv(), Ok(Some(Ack::Accepted)));
+        // Réponse sans liste en vol : ignorée ; fin de session : attentes annulées.
+        assert_eq!(a.answered(true), None);
+        let (te, mut re) = wait();
+        a.sent(Some(5), 50.0, Some(te));
+        a.clear();
+        assert!(re.try_recv().is_err());
     }
 
     #[test]

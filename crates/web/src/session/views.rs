@@ -94,17 +94,22 @@ fn num(v: &JsValue, key: &str) -> f64 {
     Reflect::get(v, &key.into()).ok().and_then(|x| x.as_f64()).unwrap_or(0.0)
 }
 
-/// Écrans du poste (demande la permission « gestion des fenêtres ») et index de l'écran courant.
-pub async fn screens() -> Result<(Vec<ScreenGeom>, usize), String> {
+/// `ScreenDetails` du poste (demande la permission « gestion des fenêtres ») : le navigateur le
+/// tient à jour quand un écran est branché, débranché ou change de définition.
+pub async fn screen_details() -> Result<JsValue, String> {
     let window = web_sys::window().ok_or("pas de fenêtre")?;
     let f = Reflect::get(&window, &"getScreenDetails".into()).map_err(|_| "API indisponible")?;
     let f: js_sys::Function = f.dyn_into().map_err(|_| "multi-écran non pris en charge par ce navigateur")?;
-    let details = JsFuture::from(js_sys::Promise::from(f.call0(&window).map_err(|e| format!("{e:?}"))?))
+    JsFuture::from(js_sys::Promise::from(f.call0(&window).map_err(|e| format!("{e:?}"))?))
         .await
-        .map_err(|_| "permission refusée")?;
+        .map_err(|_| "permission refusée".into())
+}
+
+/// Écrans décrits par `details` à cet instant, et index de l'écran courant.
+pub fn screens(details: &JsValue) -> Result<(Vec<ScreenGeom>, usize), String> {
     let list: js_sys::Array =
-        Reflect::get(&details, &"screens".into()).map_err(|e| format!("{e:?}"))?.unchecked_into();
-    let current = Reflect::get(&details, &"currentScreen".into()).unwrap_or(JsValue::NULL);
+        Reflect::get(details, &"screens".into()).map_err(|e| format!("{e:?}"))?.unchecked_into();
+    let current = Reflect::get(details, &"currentScreen".into()).unwrap_or(JsValue::NULL);
     let mut out = Vec::new();
     let mut cur = 0;
     for (i, s) in list.iter().enumerate() {
@@ -151,10 +156,11 @@ pub struct DisplayCaps {
 }
 
 impl DisplayCaps {
-    /// `None` si `pdu` n'est pas une DISPLAYCONTROL_CAPS_PDU complète.
+    /// `None` si `pdu` n'est pas une DISPLAYCONTROL_CAPS_PDU complète (`Length` : la PDU entière).
     pub fn parse(pdu: &[u8]) -> Option<Self> {
         let u = |i: usize| pdu.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        if u(0)? != 5 || (u(4)? as usize) < 20 {
+        let len = u(4)? as usize;
+        if u(0)? != 5 || len < 20 || len > pdu.len() {
             return None;
         }
         let (n, a, b) = (u(8)?, u(12)?, u(16)?);
@@ -174,6 +180,20 @@ impl DisplayCaps {
             return Err("surface des écrans trop grande pour le PC".into());
         }
         Ok(())
+    }
+
+    /// Taille d'un écran seul ramenée dans la surface permise, proportions gardées (largeur paire,
+    /// bornes du protocole). Un PC trop limité pour 200×200 reste refusé par `check`.
+    pub fn fit(&self, w: u32, h: u32) -> (u32, u32) {
+        let area = u64::from(w) * u64::from(h);
+        if area <= self.max_area {
+            return (w, h);
+        }
+        let k = (self.max_area as f64 / area as f64).sqrt();
+        let (w, h) = crate::session::engine::clamp_size((f64::from(w) * k) as u32, (f64::from(h) * k) as u32);
+        // L'arrondi flottant ne doit pas faire déborder d'un pixel : hauteur recalculée en entiers.
+        let h = h.min(u32::try_from(self.max_area / u64::from(w)).unwrap_or(u32::MAX)).max(200);
+        (w, h)
     }
 }
 
@@ -274,11 +294,28 @@ mod tests {
         assert!(small.check(&[(0, 0, 3840, 2160), (3840, 0, 1920, 1080)]).is_err(), "surface");
         assert_eq!(DisplayCaps::parse(&le([2, 20, 1, 1, 1])), None, "pas une CAPS PDU");
         assert_eq!(DisplayCaps::parse(&le([5, 20, 1, 1, 1])[..16]), None, "tronquée");
+        assert_eq!(DisplayCaps::parse(&le([5, 40, 1, 1, 1])), None, "Length au-delà des 20 octets reçus");
+        assert!(DisplayCaps::parse(&[le([5, 20, 1, 1, 1]), vec![0; 4]].concat()).is_some(), "octets en plus");
         // 16 × 2^30 × 2^30 = 2^64 : plafonné, pas de débordement silencieux.
         assert_eq!(
             DisplayCaps::parse(&le([5, 20, 16, 1 << 30, 1 << 30])).map(|c| c.max_area),
             Some(u64::MAX)
         );
+    }
+
+    #[test]
+    fn single_monitor_size_fits_the_caps() {
+        let caps = DisplayCaps { max_monitors: 1, max_area: 1920 * 1080 };
+        assert_eq!(caps.fit(1920, 1080), (1920, 1080), "dans la limite : inchangé");
+        let (w, h) = caps.fit(2560, 1440);
+        assert!(caps.check(&[(0, 0, w, h)]).is_ok(), "{w}×{h}");
+        assert_eq!((w, h), (1920, 1080), "même rapport 16:9");
+        let (w, h) = caps.fit(3001, 1999);
+        assert!(w % 2 == 0 && caps.check(&[(0, 0, w, h)]).is_ok(), "{w}×{h}");
+        assert!(u64::from(w) * u64::from(h) > 1920 * 1080 * 99 / 100, "pas de réduction excessive");
+        let tiny = DisplayCaps { max_monitors: 1, max_area: 100 * 100 };
+        let (w, h) = tiny.fit(1920, 1080);
+        assert!(w >= 200 && h >= 200 && tiny.check(&[(0, 0, w, h)]).is_err(), "bornes du protocole");
     }
 
     #[test]

@@ -32,7 +32,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 
 argon2 = "0.6.0"
 totp-rs = { version = "6.0.0", features = ["otpauth"] }
-qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+qrcode = { version = "0.15.0", default-features = false, features = ["svg"] }
 webauthn-rs = "0.6.2"
 # webauthn-rs passe par OpenSSL : compilé depuis les sources pour ne dépendre d'aucun paquet système.
 openssl = { version = "0.10.82", features = ["vendored"] }

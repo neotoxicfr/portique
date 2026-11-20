@@ -1,0 +1,9 @@
+# Revues CodeRabbit en français, profil standard ; les PR vers dev et main sont relues.
+language: fr-FR
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    base_branches:
+      - "^dev$"
+      - "^main$"

@@ -4,9 +4,10 @@ Merci de ton intérêt ! Ce guide tient en une page.
 
 ## Préparer l'environnement
 
-- Rust stable 1.90 ou plus, avec `rustfmt` et `clippy`
+- Rust stable, avec `rustfmt` et `clippy`
 - cible wasm : `rustup target add wasm32-unknown-unknown`
 - [trunk](https://trunkrs.dev) pour le front : `cargo install --locked trunk`
+- `curl` et `openssl` : `scripts/vendor-xterm.sh` télécharge xterm.js et vérifie son empreinte
 
 ```sh
 cargo test --workspace --exclude portique-web

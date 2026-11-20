@@ -219,6 +219,7 @@ pub fn SshPage() -> impl IntoView {
     let term_ref = NodeRef::<Div>::new();
     let status = RwSignal::new(Status::Loading("Chargement du terminal…".into()));
     let combos = RwSignal::new(Vec::<String>::new());
+    let host_name = RwSignal::new(String::new());
     let ctrl = RwSignal::new(false);
     let alt = RwSignal::new(false);
     let touch = window().match_media("(pointer: coarse)").ok().flatten().is_some_and(|m| m.matches());
@@ -244,7 +245,8 @@ pub fn SshPage() -> impl IntoView {
             let data = e.data();
             if let Some(text) = data.as_string() {
                 match serde_json::from_str::<SshMessage>(&text) {
-                    Ok(SshMessage::Ready { theme, combos: c }) => {
+                    Ok(SshMessage::Ready { name, theme, combos: c }) => {
+                        host_name.set(name);
                         if let Ok(t) = js_sys::JSON::parse(theme_json(&theme)) {
                             let _ = Reflect::set(&lm.term.options(), &"theme".into(), &t);
                         }
@@ -373,6 +375,7 @@ pub fn SshPage() -> impl IntoView {
             style:top=move || frame.get().map(|(_, t)| format!("{t}px"))>
             <div class="ssh-top">
                 <a href="/" class="ssh-back" title="Retour aux connexions" aria-label="Retour aux connexions">"←"</a>
+                <span class="ssh-name">{move || host_name.get()}</span>
                 <button class="ssh-toggle" title="Afficher ou masquer la barre de touches" aria-label="Barre de touches" on:click=move |_| {
                     show_bar.update(|s| *s = !*s);
                     let cb = Closure::once_into_js(move || if let Some(l) = live.get_value() { l.refit() });

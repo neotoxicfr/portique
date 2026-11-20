@@ -30,7 +30,7 @@ IronRDP et FreeRDP ne servent que de référence légère.
 - Client annoncé en RDP 10.7, avec les drapeaux précoces qui ouvrent EGFX, 32 bpp, heartbeat et
   disposition des écrans.
 
-## Mesuré sur le PC cible (16/10/2026, via wireguard)
+## Mesuré sur un PC Windows 11 Pro (joint par un tunnel WireGuard)
 
 - Protocole retenu : HYBRID_EX ; drapeaux de négociation `0x2f` (EGFX supporté, restricted admin,
   redirected auth).
@@ -45,15 +45,15 @@ IronRDP et FreeRDP ne servent que de référence légère.
 `PORTIQUE_PROBE_PASSWORD_FILE` et n'est jamais affiché.
 
 ```sh
-docker run --rm --network container:wireguard \
-  -v /srv/portique/probe/rdp-probe:/rdp-probe:ro \
-  -v /srv/portique/secrets/rdp_password:/run/secrets/rdp_password:ro \
+docker run --rm --network container:<tunnel> \
+  -v ./rdp-probe:/rdp-probe:ro \
+  -v ./secrets/rdp_password:/run/secrets/rdp_password:ro \
   -e PORTIQUE_PROBE_HOST=192.0.2.50 -e PORTIQUE_PROBE_USER=alice \
   -e PORTIQUE_PROBE_PASSWORD_FILE=/run/secrets/rdp_password \
   debian:bookworm-slim /rdp-probe
 ```
 
-## Session et EGFX : comportements de Windows mesurés (16/10/2026)
+## Session et EGFX : comportements de Windows mesurés
 
 - Capacités EGFX 8.1 : seules certaines combinaisons de drapeaux sont admises ; AVC420 seul (0x10) fait
   fermer le canal graphique, il faut SMALL_CACHE | AVC420 (0x12).
@@ -69,5 +69,7 @@ docker run --rm --network container:wireguard \
   rejouée à l'arrivée de ses capacités.
 - Presse-papier : un Ctrl+V transmis trop tôt colle l'ancien contenu ; attendre l'accusé (Format List
   Response) de notre liste de formats, que Windows n'envoie qu'une fois notre contenu installé.
-- Le Wake-on-LAN en broadcast ne traverse pas un tunnel IP ; la commande `/tool wol` du routeur MikroTik
-  du réseau du PC, envoyée par SSH, fonctionne.
+- Le Wake-on-LAN en broadcast ne traverse pas un tunnel IP ; une commande envoyée par SSH à un hôte du
+  réseau du PC (par exemple `/tool wol` sur un routeur MikroTik) fonctionne.
+- Sur un lien lointain, chaque aller-retour compte : les jointures de canaux MCS (une par canal) se sautent
+  quand Windows annonce `SKIP_CHANNELJOIN_SUPPORTED`, ce qu'il fait.

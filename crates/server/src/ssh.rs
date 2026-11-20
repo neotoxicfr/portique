@@ -136,6 +136,10 @@ pub async fn open(
         .request_pty(false, "xterm-256color", u32::from(cols), u32::from(rows), 0, 0, &[])
         .await
         .context("demande de terminal")?;
+    // Comme le client OpenSSH (SendEnv), annoncer un jeu de caractères UTF-8 : xterm.js parle UTF-8, et un
+    // serveur en locale C perdrait les caractères accentués à la saisie. LC_CTYPE seul : la langue des
+    // messages reste celle du serveur. Ignoré sans erreur si le serveur ne l'accepte pas (AcceptEnv).
+    let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
     channel.request_shell(false).await.context("lancement du shell")?;
     Ok(Opened { sessions, channel, pinned })
 }

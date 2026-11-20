@@ -225,8 +225,15 @@ async fn run(
         theme: portique_proto::TERMINAL_THEMES[0].into(),
         combos: portique_proto::DEFAULT_COMBOS.iter().map(|c| (*c).into()).collect(),
     });
-    send(&mut socket, &SshMessage::Ready { theme: host_theme.unwrap_or(prefs.theme), combos: prefs.combos })
-        .await;
+    send(
+        &mut socket,
+        &SshMessage::Ready {
+            name: target.1.clone(),
+            theme: host_theme.unwrap_or(prefs.theme),
+            combos: prefs.combos,
+        },
+    )
+    .await;
 
     let _sessions = opened.sessions;
     let (mut from_host, to_host) = opened.channel.split();

@@ -266,8 +266,8 @@ async fn proxy_mode() {
     assert_eq!(r.body["is_admin"], true);
     assert_eq!(r.body["external"], true);
 
-    let r =
-        call(&app, "GET", "/api/me", None, None, &[("Remote-User", "alice"), ("Remote-Groups", "users")]).await;
+    let r = call(&app, "GET", "/api/me", None, None, &[("Remote-User", "alice"), ("Remote-Groups", "users")])
+        .await;
     assert_eq!(r.body["is_admin"], false, "rôle resynchronisé depuis le proxy");
 
     let r = call(

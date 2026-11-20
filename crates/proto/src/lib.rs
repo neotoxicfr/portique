@@ -370,6 +370,8 @@ pub enum SshMessage {
     },
     /// Shell ouvert : thème et combinaisons à appliquer.
     Ready {
+        /// Nom de l'hôte, pour la barre de titre.
+        name: String,
         theme: String,
         combos: Vec<String>,
     },

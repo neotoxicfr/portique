@@ -29,6 +29,21 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 - Les connexions deviennent des hôtes : le champ `protocol` de l'API est remplacé par `rdp` et `ssh`. La
   migration garde le RDP des connexions existantes.
 
+### Performances
+
+- Ouverture d'une session RDP plus rapide sur un lien lointain : les jointures de canaux MCS sont sautées quand
+  Windows le permet (mesuré sur un aller-retour de 162 ms : première image à 1,94 s au lieu de 2,59 s).
+- Le front est servi compressé (gzip ou brotli) : le wasm passe de 1,3 Mo à 0,5 Mo même sans proxy compressant.
+- Le journal du serveur détaille les phases d'ouverture RDP ; la console du navigateur les résume.
+
+### Corrigé
+
+- Une session refusée (double authentification manquante, hôte sans SSH, accès retiré) affiche la raison au
+  lieu de « session terminée ».
+- Terminal : caractères accentués perdus sur un serveur en locale C (LC_CTYPE=C.UTF-8 demandé, comme OpenSSH).
+- Administration utilisable sur téléphone (tableaux en cartes), clé du service lisible en entier, indicateur et
+  bouton « Retour » pendant les connexions, barre de titre du terminal qui ne masque plus le texte.
+
 ## [v0.2.0] - 2026-11-20
 
 ### Modifié

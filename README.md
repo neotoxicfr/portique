@@ -1,115 +1,105 @@
 <div align="center">
 
+<img src="crates/web/pwa/icon.svg" width="88" alt="">
+
 # Portique
 
 **Tes machines dans un navigateur** : bureau Windows en RDP et terminal SSH, sans Java, sans guacd, sans plugin.
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
+![Images](https://img.shields.io/badge/images-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
 ![Version](https://img.shields.io/badge/version-v0.3.0-green)
 
 </div>
 
-Portique est un accès web auto-hébergé à tes machines, écrit en Rust de bout en bout : bureau Windows en
-RDP, terminal en SSH, une tuile par machine. En RDP, le serveur établit la connexion authentifiée avec le
-PC, puis ne fait que relayer les octets : c'est le navigateur qui décode l'image (wasm et WebCodecs). La
-pile RDP est **écrite à partir des spécifications Microsoft**, sans aucune crate RDP tierce.
+<p align="center">
+  <img src="docs/images/accueil.png" width="49%" alt="Accueil : une tuile par machine, RDP, SSH ou les deux">
+  <img src="docs/images/terminal.png" width="49%" alt="Terminal SSH dans le navigateur">
+</p>
 
-Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de léger :
+Portique est un accès web auto-hébergé à tes machines, écrit en Rust de bout en bout. Une tuile par machine :
+le bureau Windows en RDP, un terminal en SSH, ou les deux au choix. Un seul petit binaire côté serveur, et un
+navigateur côté client, ordinateur ou téléphone.
 
-|  | Guacamole | Portique |
+- **RDP sans compromis** : la pile RDP est **écrite à partir des spécifications Microsoft**, sans crate RDP tierce.
+  Le serveur fait la connexion authentifiée puis ne fait que relayer les octets. Le navigateur décode l'image,
+  H.264 compris, par WebCodecs : le GPU du client fait le travail.
+- **SSH sans clé à distribuer** : une clé du service, posée une fois sur chaque hôte, des rebonds en chaîne, et
+  une barre de touches pensée pour le téléphone.
+- **Sûr par défaut** : identifiants jamais envoyés au navigateur, certificats et clés d'hôte épinglés après
+  approbation, double authentification, CSP stricte.
+
+## Pourquoi pas Guacamole ?
+
+|  | Apache Guacamole | Portique |
 |---|---|---|
-| Côté serveur | Tomcat (Java) + guacd (C) | un binaire Rust, image de 103 Mo |
-| Décodage de l'image | sur le serveur, réencodée en PNG/JPEG | dans le navigateur ; H.264 décodé par le GPU du client |
-| Identifiants Windows | envoyés à guacd | ne quittent jamais le serveur (NLA faite côté serveur) |
+| Côté serveur | Tomcat (Java) + guacd (C) + base de données | un binaire Rust, image d'environ 100 Mo (amd64, arm64) |
+| Image du bureau | décodée sur le serveur, réencodée en PNG/JPEG | décodée dans le navigateur ; H.264 par le GPU du client |
+| Identifiants Windows | transmis à guacd | ne quittent jamais le serveur (NLA faite côté serveur) |
 | Presse-papier | texte | texte, HTML et images, dans les deux sens |
-| SSH | clé ou mot de passe par connexion | une clé du service, rebonds enchaînés, barre de touches mobile |
+| SSH | clé ou mot de passe par connexion | clé du service, rebonds enchaînés, barre de touches mobile |
 
 ## Fonctions
 
-- **Affichage EGFX** : ClearCodec, Planar, RemoteFX Progressive, **H.264 AVC420 et AVC444** (v1/v2) décodés
-  par WebCodecs (accélération matérielle quand le navigateur la propose). Conversion BT.709 pleine plage
-  faite dans le wasm.
-- **Presse-papier synchronisé** : texte Unicode, HTML et images, dans les deux sens.
-- **Affichage adaptatif** : résolution dynamique (la session suit la fenêtre), multi-écran (une fenêtre par
-  écran), plein écran avec capture du clavier (Alt+Tab, touche Windows…), Ctrl+Alt+Suppr depuis le menu de
-  session.
-- **Terminal SSH** (xterm.js, servi par Portique) :
-  - une machine peut offrir le RDP, le SSH ou les deux : avec les deux, la tuile propose le choix ;
-  - une **clé ed25519 du service**, chiffrée en base, posée sur chaque hôte (`from=` facultatif), puis le
-    mot de passe de l'hôte s'il y en a un ;
-  - **rebonds** : un hôte peut passer par un autre hôte SSH, en chaîne (comme `ProxyJump`) ;
-  - clé d'hôte approuvée par un admin à chaque saut, puis épinglée ;
-  - **barre de touches** sur téléphone et tablette, juste au-dessus du clavier virtuel : Échap, Tab, Ctrl
-    et Alt collants, flèches, combinaisons enregistrées par compte (Ctrl+C, Ctrl+R…) ;
-  - **thèmes** de couleur par compte, remplaçables par hôte (ex. rouge sombre pour la production).
-- **Fiabilité** : reconnexion automatique, appli installable (PWA), images amd64 et arm64 : une seconde
-  instance peut tourner sur une petite machine ARM et servir de secours derrière le reverse proxy.
-- **Wake-on-LAN** : paquet magique UDP direct, ou commande SSH sur un hôte du réseau du PC (par exemple un
-  routeur MikroTik : `/tool wol interface=ether1 mac={mac}`), indispensable à travers un VPN.
-- **Comptes** : mot de passe Argon2id, TOTP, passkeys (WebAuthn), rôles admin et utilisateur, accès par
-  connexion. Ou **mode proxy** : Authelia, Authentik… devant, avec login intégré désactivé.
-- **Préparation du PC sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
-  tout-en-un) qui activent le RDP, la NLA, le pare-feu, le H.264 4:4:4 et l'encodage matériel. Ils
-  s'annulent en un clic.
+**Bureau à distance (RDP)**
 
-## Architecture
+- Affichage EGFX : ClearCodec, Planar, RemoteFX Progressive, **H.264 AVC420 et AVC444** (4:4:4) décodés par
+  WebCodecs, conversion des couleurs BT.709 pleine plage faite dans le wasm. Les navigateurs qui ne rendent que
+  du RGB (Firefox) affichent le H.264 en 4:2:0, sans repasser par un autre codec.
+- Presse-papier texte, HTML et images dans les deux sens ; résolution qui suit la fenêtre ; multi-écran (une
+  fenêtre par écran) ; plein écran avec capture du clavier (Alt+Tab, touche Windows) ; Ctrl+Alt+Suppr.
+- Reconnexion automatique ; ouverture rapide même sur un lien lointain (jointure des canaux évitée quand
+  Windows le permet).
+- **Wake-on-LAN** : paquet magique direct, ou commande lancée par un hôte SSH du réseau du PC (un routeur, par
+  exemple), indispensable à travers un VPN.
+- Préparation du PC **sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
+  tout-en-un) qui activent RDP, NLA, le pare-feu, le H.264 4:4:4 et l'encodage matériel, et qui s'annulent.
 
-```mermaid
-flowchart LR
-    B["Navigateur<br/>Leptos + pile RDP en wasm<br/>WebCodecs"] -- "WSS<br/>(flux RDP chiffré)" --> S["Serveur portique<br/>axum, SQLite"]
-    S -- "TCP 3389<br/>TLS + CredSSP/NLA" --> P["PC Windows"]
-    S -. "Wake-on-LAN<br/>UDP ou SSH" .-> P
-    S -- "SSH (clé du service)<br/>rebonds éventuels" --> H["Hôtes SSH"]
-```
+**Terminal (SSH)**
 
-Le serveur négocie X.224, TLS (certificat épinglé) et CredSSP/NTLMv2 avec les identifiants stockés
-chiffrés. Il passe ensuite la session au navigateur, qui gère tout le reste : canaux, graphismes,
-presse-papier, entrées. La même pile compile en natif et en wasm.
+- xterm.js servi par Portique (aucun CDN), redimensionnement, thèmes de couleur par compte et par hôte.
+- Une **clé ed25519 du service** à poser dans `authorized_keys` (restriction `from=` facultative), puis le
+  mot de passe de l'hôte s'il y en a un.
+- **Rebonds** : un hôte peut passer par un autre, en chaîne, comme `ProxyJump`.
+- **Barre de touches** sur téléphone et tablette, au-dessus du clavier virtuel : Échap, Tab, Ctrl et Alt
+  collants, flèches, combinaisons enregistrées (Ctrl+C, Ctrl+R…).
 
-En SSH, c'est l'inverse : le serveur **termine** la session (russh, avec terminal et redimensionnement) et
-relaie le texte du terminal au navigateur, sous WSS.
+**Accès**
 
-| Crate | Rôle |
-|---|---|
-| `rdp-pdu` | PDU RDP sans I/O : X.224, MCS/GCC, slow-path, fast-path, canaux statiques et dynamiques |
-| `rdp-auth` | NTLMv2 et CredSSP, liés au canal TLS (la cryptographie vient de RustCrypto, rien de maison) |
-| `rdp-connect` | côté serveur : TCP, négociation, TLS épinglé, NLA |
-| `rdp-session` | machine à états de la session, wasm et natif |
-| `rdp-gfx` | pipeline EGFX : surfaces, cache, composition, AVC444 |
-| `rdp-codecs` | ZGFX, Planar, ClearCodec, NSCodec, RemoteFX Progressive |
-| `rdp-clip` | presse-papier (MS-RDPECLIP) |
-| `proto` | types partagés entre l'API et le front |
-| `server` | API, comptes, relais WebSocket, Wake-on-LAN, fichiers statiques |
-| `web` | front Leptos (CSR) : pages, moteur de session, WebCodecs |
-| `rdp-probe` | sonde de diagnostic contre un vrai PC (capture, enregistrement et rejeu EGFX) |
+- Comptes intégrés : mot de passe Argon2id, TOTP, passkeys ; rôles admin et utilisateur ; accès par machine.
+- Ou **mode proxy** : Authelia, Authentik… devant, connexion intégrée désactivée, comptes créés à la volée.
+- Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur.
 
-Spécifications suivies : MS-RDPBCGR, MS-RDPEGFX, MS-RDPECLIP, MS-RDPEDISP, MS-RDPEDYC, MS-CSSP, MS-NLMP.
-La séquence de connexion et les comportements mesurés sur Windows sont décrits dans
-[`docs/rdp-connexion.md`](docs/rdp-connexion.md).
+<p align="center">
+  <img src="docs/images/accueil-mobile.png" width="24%" alt="Accueil sur téléphone">
+  <img src="docs/images/terminal-mobile.png" width="24%" alt="Terminal et barre de touches sur téléphone">
+  <img src="docs/images/connexion.png" width="49%" alt="Écran de connexion">
+</p>
 
-## Démarrage
+## Démarrer
 
-### 1. Construire l'image
+### 1. Lancer le conteneur
 
 ```sh
-docker build -t portique:0.2.0 .     # ou l'image publiée ghcr.io/neotoxicfr/portique (amd64 et arm64)
-openssl rand -base64 32 > secrets/master_key   # clé de chiffrement de la base
+mkdir -p portique/secrets && cd portique
+openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
+printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password
 ```
 
-### 2. Lancer
-
 ```yaml
+# docker-compose.yml
 services:
   portique:
-    image: portique:0.2.0
+    image: ghcr.io/neotoxicfr/portique:latest
     environment:
-      PORTIQUE_PUBLIC_URL: https://rdp.example.net
+      PORTIQUE_PUBLIC_URL: https://portique.example.net
       PORTIQUE_MASTER_KEY_FILE: /run/secrets/master_key
       PORTIQUE_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
     secrets: [master_key, admin_password]
     volumes: ["./data:/data"]
+    ports: ["8080:8080"]
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges=true"]
@@ -119,27 +109,36 @@ secrets:
   admin_password: { file: ./secrets/admin_password }
 ```
 
-L'appli s'utilise derrière un reverse proxy HTTPS : les passkeys, le presse-papier et WebCodecs exigent un
-contexte sécurisé. L'exemple complet, avec Traefik, Authelia et un conteneur placé dans le réseau d'un
-tunnel WireGuard, est dans [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml).
+Place-le derrière un reverse proxy HTTPS : passkeys, presse-papier et WebCodecs exigent un contexte sécurisé.
+Un exemple complet (Traefik, Authelia, conteneur dans le réseau d'un tunnel WireGuard) est dans
+[`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml). Pour construire l'image toi-même :
+`docker build -t portique .`
 
-### 3. Préparer le PC
+### 2. Ajouter des machines
 
-Sur le PC Windows (Pro ou Entreprise), ouvre `https://<ton-domaine>/setup/` et lance au choix le `.ps1`, ou
-le `.reg` puis le `.cmd`. Le script affiche l'empreinte SHA-256 du certificat RDP. À la première connexion,
-un admin la compare à celle affichée par Portique, puis l'approuve.
+Connecte-toi en `admin`, active un TOTP ou une passkey dans **Compte** (le SSH l'exige), puis ajoute tes
+machines dans **Admin** : RDP, SSH ou les deux. Pour le SSH, la page Admin donne la ligne `authorized_keys` de
+la clé du service, à ajouter sur chaque hôte.
+
+### 3. Préparer un PC Windows
+
+Sur le PC (Windows Pro ou Entreprise), ouvre `https://<ton-domaine>/setup/` et lance le `.ps1`, ou le `.reg`
+puis le `.cmd`. Le script affiche l'empreinte du certificat RDP : à la première connexion, un admin la compare
+à celle que montre Portique, puis l'approuve.
+
+<p align="center"><img src="docs/images/admin.png" width="80%" alt="Administration : machines, clé SSH du service, comptes"></p>
 
 ## Configuration
 
-Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets). Définir les deux à la fois est refusé.
+Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets) ; définir les deux à la fois est refusé.
 
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `PORTIQUE_PUBLIC_URL` | requis | URL publique : origine des passkeys et du WebSocket |
-| `PORTIQUE_MASTER_KEY(_FILE)` | requis | 32 octets en base64, chiffre les secrets en base |
+| `PORTIQUE_MASTER_KEY(_FILE)` | requis | 32 octets en base64 ; chiffre mots de passe, TOTP et clé SSH du service |
 | `PORTIQUE_ADMIN_PASSWORD(_FILE)` | aucun | crée le compte `admin` au premier démarrage (mode intégré, 12 caractères minimum) |
 | `PORTIQUE_AUTH_MODE` | `builtin` | `builtin` (mot de passe, TOTP, passkeys) ou `proxy` |
-| `PORTIQUE_TRUSTED_PROXIES` | aucun | IP, CIDR ou nom d'hôte (ex. `traefik`) des proxys de confiance |
+| `PORTIQUE_TRUSTED_PROXIES` | aucun | IP, CIDR ou nom d'hôte (ex. `traefik`, résolu régulièrement) des proxys de confiance |
 | `PORTIQUE_PROXY_USER_HEADER` | `Remote-User` | en-tête de l'identifiant en mode proxy |
 | `PORTIQUE_PROXY_GROUPS_HEADER` | `Remote-Groups` | en-tête des groupes |
 | `PORTIQUE_PROXY_ADMIN_GROUP` | aucun | groupe qui donne le rôle admin |
@@ -148,62 +147,92 @@ Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets). Définir les deux à
 | `PORTIQUE_STATIC_DIR` | `/app/web` | front compilé |
 | `PORTIQUE_INSECURE_COOKIES` | aucun | `1` = cookies sans `Secure` (développement en HTTP seulement) |
 
-**Mode proxy.** Le login intégré est désactivé. Les comptes sont créés à la volée à partir de `Remote-User`,
-et le rôle admin est resynchronisé à chaque requête. Seuls les proxys de confiance peuvent fournir ces
-en-têtes. Le proxy doit authentifier **toutes** les requêtes vers Portique : une règle `bypass`, par exemple
-pour le réseau local, laisse passer les requêtes sans `Remote-User`, et l'API répond alors 401.
+**Mode proxy.** La connexion intégrée est désactivée ; les comptes sont créés à partir de `Remote-User` et le
+rôle admin suit le groupe à chaque requête. Seuls les proxys de confiance peuvent fournir ces en-têtes. Le proxy
+doit authentifier **toutes** les requêtes : une règle de contournement, pour le réseau local par exemple, laisse
+passer des requêtes sans `Remote-User`, que l'API refuse. Il doit aussi exiger la double authentification si
+tu utilises le SSH.
+
+**Haute disponibilité.** Portique ne gère pas plusieurs instances : chacune a sa base. Pour une instance de
+secours, laisse le reverse proxy basculer (par exemple un service `failover` de Traefik, healthcheck sur
+`/api/info`).
 
 ## Sécurité
 
-- NLA obligatoire, CredSSP v5 ou plus (CVE-2018-0886), NTLMv2 avec MIC et liaison au canal TLS.
-- Certificat du PC épinglé après approbation par un admin.
-- Identifiants Windows chiffrés en base (XChaCha20-Poly1305) ; ils ne sont jamais envoyés au navigateur.
-- CSP stricte : seul le script d'amorce du wasm est autorisé, par son empreinte.
-- Cookies `SameSite=Strict`, en-tête anti-CSRF et contrôle d'origine du WebSocket.
-- Limitation des tentatives de connexion, réauthentification pour modifier la 2FA.
-- Session RDP ou SSH coupée dès que la session web est révoquée ou que l'accès est retiré.
-- La clé SSH du service ouvre toutes les machines où elle est posée : en mode intégré, ouvrir un terminal
-  exige un TOTP ou une passkey ; en mode proxy, le proxy doit imposer la double authentification.
-- En SSH, le serveur voit le texte du terminal (il termine la session) : il ne le conserve pas.
+- RDP : NLA obligatoire, CredSSP v5 ou plus (CVE-2018-0886), NTLMv2 avec MIC et liaison au canal TLS ;
+  certificat du PC épinglé après approbation par un admin.
+- SSH : clé d'hôte de chaque saut approuvée par un admin puis épinglée ; en mode intégré, un terminal ne
+  s'ouvre que si la **session** a été ouverte avec un second facteur (TOTP ou passkey). Le serveur termine la
+  session SSH et voit donc le texte du terminal, sans le conserver.
+- Secrets chiffrés en base (XChaCha20-Poly1305) ; aucun n'est jamais envoyé au navigateur.
+- CSP stricte (seul le script d'amorce du wasm est autorisé, par son empreinte) ; cookies `SameSite=Strict` ;
+  en-tête anti-CSRF ; contrôle d'origine du WebSocket ; limitation des tentatives de connexion.
+- Sessions RDP et SSH coupées dès que la session web est révoquée ou l'accès retiré.
 - Budgets de mémoire et de CPU sur tout ce qui vient du PC (surfaces, cache, régions H.264).
 
-Pour signaler une faille, voir [SECURITY.md](SECURITY.md).
+Pour signaler une faille : [SECURITY.md](SECURITY.md).
 
-## Feuille de route
+## Comment c'est fait
 
-La V1 (`v0.1.0`) couvre l'usage bureau quotidien, la `v0.3.0` ajoute le SSH. Pour la suite :
+```mermaid
+flowchart LR
+    B["Navigateur<br/>Leptos + pile RDP en wasm<br/>WebCodecs, xterm.js"] -- "WSS" --> S["Serveur Portique<br/>axum, SQLite"]
+    S -- "TCP 3389<br/>TLS + CredSSP/NLA" --> P["PC Windows"]
+    S -- "SSH (clé du service)<br/>rebonds éventuels" --> H["Hôtes SSH"]
+    S -. "Wake-on-LAN<br/>UDP ou SSH" .-> P
+```
 
-- transcodage HEVC/AV1 sur le serveur (NVENC, QSV, VAAPI, SVT-AV1), au choix comme un réglage de qualité ;
-- son, micro, transfert et copier-coller de fichiers ;
-- confort mobile en RDP (trackpad, barre de touches, multi-touch), HiDPI et zoom ;
-- partage et enregistrement de session.
+En **RDP**, le serveur négocie X.224, TLS et CredSSP/NTLMv2 avec les identifiants chiffrés, puis passe la
+session au navigateur, qui gère tout le reste : canaux, graphismes, presse-papier, entrées. La même pile compile
+en natif et en wasm. En **SSH**, c'est l'inverse : le serveur termine la session (russh, terminal et
+redimensionnement) et relaie le texte du terminal au navigateur.
 
-## Développement
+| Crate | Rôle |
+|---|---|
+| `rdp-pdu` | PDU RDP sans I/O : X.224, MCS/GCC, slow-path, fast-path, canaux statiques et dynamiques |
+| `rdp-auth` | NTLMv2 et CredSSP liés au canal TLS (cryptographie de RustCrypto, rien de maison) |
+| `rdp-connect` | côté serveur : TCP, négociation, TLS épinglé, NLA |
+| `rdp-session` | machine à états de la session, wasm et natif |
+| `rdp-gfx` | pipeline EGFX : surfaces, cache, composition, AVC444 |
+| `rdp-codecs` | ZGFX, Planar, ClearCodec, NSCodec, RemoteFX Progressive |
+| `rdp-clip` | presse-papier (MS-RDPECLIP) |
+| `proto` | types partagés entre l'API et le front |
+| `server` | API, comptes, relais RDP, sessions SSH, Wake-on-LAN, fichiers statiques |
+| `web` | front Leptos (CSR) : pages, moteur de session RDP, terminal |
+| `rdp-probe` | sonde de diagnostic contre un vrai PC (capture, enregistrement et rejeu EGFX) |
 
-Prérequis : Rust stable (1.90 ou plus), cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev).
-`./scripts/ci.sh` lance toutes les vérifications ; `./scripts/release.sh X.Y.Z` publie une version
-(images amd64 + arm64, archives, release GitHub) depuis le poste, sans CI ; `./scripts/publish-dev.sh`
-republie l'image de branche `ghcr.io/neotoxicfr/portique:dev` après chaque livraison sur `dev`. Les hôtes
-de construction se règlent dans `.env` (modèle : `.env.exemple`).
+Spécifications suivies : MS-RDPBCGR, MS-RDPEGFX, MS-RDPECLIP, MS-RDPEDISP, MS-RDPEDYC, MS-CSSP, MS-NLMP. La
+séquence de connexion et les comportements mesurés sur Windows : [`docs/rdp-connexion.md`](docs/rdp-connexion.md).
+
+## Développer
+
+Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl` et `openssl`
+(xterm.js est téléchargé et vérifié au build).
 
 ```sh
-cargo test --workspace --exclude portique-web
-cargo clippy --workspace --exclude portique-web --all-targets
-cargo clippy -p portique-web --target wasm32-unknown-unknown
+./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
 (cd crates/web && trunk build --release --dist ../../dist)
 PORTIQUE_PUBLIC_URL=http://localhost:18431 PORTIQUE_LISTEN=127.0.0.1:18431 PORTIQUE_DATA_DIR=./data \
 PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY=$(openssl rand -base64 32) \
 PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 
-Les contributions sont bienvenues : voir [CONTRIBUTING.md](CONTRIBUTING.md) et le
+Les images amd64 et arm64 se construisent en natif (`scripts/build-image.sh`, sans émulation) ; les versions se
+publient par `scripts/release.sh X.Y.Z`. Les contributions sont bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md),
 [code de conduite](CODE_OF_CONDUCT.md).
+
+## Feuille de route
+
+- transcodage HEVC/AV1 côté serveur, au choix comme un réglage de qualité ;
+- son, micro, transfert et copier-coller de fichiers ;
+- confort mobile en RDP (trackpad, barre de touches, multi-touch), HiDPI et zoom ;
+- partage et enregistrement de session.
 
 ## Remerciements
 
 Les spécifications ouvertes de Microsoft (Open Specifications) font foi. [IronRDP](https://github.com/Devolutions/IronRDP)
-et [FreeRDP](https://github.com/FreeRDP/FreeRDP) ont servi de référence pour lever des ambiguïtés. Aucun code
-n'en est repris.
+et [FreeRDP](https://github.com/FreeRDP/FreeRDP) ont servi de référence pour lever des ambiguïtés ; aucun code
+n'en est repris. Le terminal est [xterm.js](https://xtermjs.org) (MIT), le SSH [russh](https://github.com/Eugeny/russh).
 
 ## Licence
 

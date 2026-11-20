@@ -149,11 +149,16 @@ a.button.secondary { background: transparent; color: var(--accent); }
 
 /* Terminal SSH : plein cadre ; la hauteur suit la partie visible (clavier virtuel exclu). */
 .ssh { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; display: flex; flex-direction: column; background: #111317; }
-.ssh-top { position: absolute; top: 4px; right: 8px; z-index: 2; display: flex; gap: 6px; }
+/* Barre de titre fine : ne recouvre jamais le texte du terminal (téléphone compris). */
+.ssh-top {
+  display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 4px 6px;
+  background: #1c1f26; border-bottom: 1px solid #2c313c; color: #e7e9ed;
+}
+.ssh-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 0.95rem; }
 .ssh-top a, .ssh-top button {
-  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px;
-  padding: 0 10px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.18); text-decoration: none;
-  background: rgba(30, 32, 38, 0.85); color: #fff; opacity: 0.8; font-size: 1.05rem;
+  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 36px;
+  padding: 0 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.14); text-decoration: none;
+  background: transparent; color: #e7e9ed; opacity: 0.85; font-size: 1.05rem;
 }
 .ssh-top a:hover, .ssh-top button:hover, .ssh-top a:focus-visible, .ssh-top button:focus-visible { opacity: 1; }
 .ssh-term { flex: 1; min-height: 0; padding: 4px 0 0 4px; }

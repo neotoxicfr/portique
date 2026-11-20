@@ -469,6 +469,6 @@ mod tests {
     fn client_info_lengths() {
         let p = client_info("", "alice", info_flags::UNICODE, 0);
         assert_eq!(u16::from_le_bytes([p[0], p[1]]), SEC_INFO_PKT);
-        assert_eq!(u16::from_le_bytes([p[14], p[15]]), 6, "cbUserName sans le zéro final");
+        assert_eq!(u16::from_le_bytes([p[14], p[15]]), 10, "cbUserName (UTF-16) sans le zéro final");
     }
 }

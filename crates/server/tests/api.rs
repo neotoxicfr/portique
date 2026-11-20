@@ -148,6 +148,16 @@ async fn builtin_login_and_admin_flow() {
     call(&app, "POST", "/api/auth/logout", Some(&alice), None, &[]).await;
     let r = call(&app, "GET", "/api/me", Some(&alice), None, &[]).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    // 2FA remise à zéro par un admin (facteur perdu ou volé) : les sessions ouvertes tombent.
+    let alice = login(&app, "alice", "alice-password-1").await;
+    let path = format!("/api/admin/users/{alice_id}");
+    let r =
+        call(&app, "PUT", &path, Some(&admin), Some(json!({"username": "alice", "reset_2fa": true})), &[])
+            .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
+    let r = call(&app, "GET", "/api/me", Some(&alice), None, &[]).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

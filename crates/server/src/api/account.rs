@@ -5,6 +5,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use axum_extra::extract::CookieJar;
 use portique_proto::{
     CeremonyChallenge, CeremonyFinish, ChangePassword, Combo, DEFAULT_COMBOS, PasskeyInfo, ReAuth,
     TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
@@ -18,6 +19,23 @@ use crate::{
     state::{ApiResult, AppError, AppState, Ceremony, bad},
     totp,
 };
+
+/// Un compte qui a déjà un second facteur n'en ajoute un autre que depuis une session ouverte avec lui.
+/// Sinon, un compte à passkey seule (connexion au mot de passe encore possible) se ferait enrôler un
+/// facteur par quiconque a son mot de passe, et le SSH s'ouvrirait.
+pub(crate) async fn second_factor_gate(state: &AppState, u: &UserRow, jar: &CookieJar) -> ApiResult<()> {
+    let passkey: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM passkeys WHERE user_id = ?)")
+        .bind(u.id)
+        .fetch_one(&state.db)
+        .await?;
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
+    if (passkey || u.totp_secret.is_some())
+        && !crate::api::ssh::session_has_mfa(state, u, token.as_deref()).await?
+    {
+        return Err(bad("reconnecte-toi avec ta passkey ou ton TOTP pour ajouter un facteur"));
+    }
+    Ok(())
+}
 
 fn local(u: &UserRow) -> ApiResult<()> {
     if u.external { Err(bad("compte géré par le proxy d'authentification")) } else { Ok(()) }
@@ -78,6 +96,7 @@ pub async fn totp_setup(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Json(proof): Json<ReAuth>,
 ) -> ApiResult<Json<TotpSetup>> {
     // Remplacer une graine existante passe par une désactivation (mot de passe + code).
@@ -85,6 +104,7 @@ pub async fn totp_setup(
         return Err(bad("TOTP déjà actif : désactive-le d'abord"));
     }
     reauth(&state, ip, &u, &proof).await?;
+    second_factor_gate(&state, &u, &jar).await?;
     let secret = totp::new_secret();
     sqlx::query("UPDATE users SET totp_pending = ? WHERE id = ?")
         .bind(state.vault.seal(&format!("totp-pending:{}", u.id), &secret))
@@ -99,12 +119,14 @@ pub async fn totp_setup(
 pub async fn totp_confirm(
     State(state): State<AppState>,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Json(req): Json<TotpConfirm>,
 ) -> ApiResult<StatusCode> {
     local(&u)?;
     if u.totp_secret.is_some() {
         return Err(bad("TOTP déjà actif"));
     }
+    second_factor_gate(&state, &u, &jar).await?;
     let pending: Option<Vec<u8>> = sqlx::query_scalar("SELECT totp_pending FROM users WHERE id = ?")
         .bind(u.id)
         .fetch_one(&state.db)
@@ -155,10 +177,12 @@ pub async fn passkey_register_start(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Json(proof): Json<ReAuth>,
 ) -> ApiResult<Json<CeremonyChallenge<CreationChallengeResponse>>> {
     // Une passkey donne un accès durable : on exige la même preuve qu'à la connexion.
     reauth(&state, ip, &u, &proof).await?;
+    second_factor_gate(&state, &u, &jar).await?;
     let existing = load_passkeys(&state, u.id).await?;
     let exclude = existing.iter().map(|(_, k)| k.cred_id().clone()).collect();
     let user_uuid = Uuid::parse_str(&u.webauthn_id).map_err(anyhow::Error::from)?;

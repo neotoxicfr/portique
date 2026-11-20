@@ -2,6 +2,15 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Sécurité
+
+- Un compte qui a déjà un second facteur n'en ajoute un autre (TOTP ou passkey) que depuis une session
+  ouverte avec lui. Un compte à passkey seule se connecte encore au mot de passe, et ce mot de passe
+  suffisait à enrôler un nouveau facteur, puis à ouvrir le SSH.
+- La remise à zéro de la double authentification par un admin coupe les sessions du compte.
+
 ## [v0.3.0] - 2026-11-20
 
 ### Ajouté

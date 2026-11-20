@@ -97,6 +97,8 @@ pub async fn update(
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM passkeys WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
+        // Facteur perdu ou volé : les sessions ouvertes avec lui ne doivent plus ouvrir le SSH.
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)

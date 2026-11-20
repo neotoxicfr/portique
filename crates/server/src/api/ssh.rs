@@ -45,7 +45,11 @@ pub async fn service_key(State(state): State<AppState>, _: AdminUser) -> ApiResu
 /// La clé du service ouvre toutes les machines : en mode intégré, la session doit avoir été ouverte
 /// avec un second facteur (TOTP ou passkey) ; avoir une 2FA enregistrée ne suffit pas (un mot de passe
 /// volé permettrait d'en enregistrer une). En mode proxy, c'est au proxy d'exiger la 2FA.
-async fn session_has_mfa(state: &AppState, user: &UserRow, token: Option<&[u8]>) -> ApiResult<bool> {
+pub(crate) async fn session_has_mfa(
+    state: &AppState,
+    user: &UserRow,
+    token: Option<&[u8]>,
+) -> ApiResult<bool> {
     if state.cfg.auth_mode == AuthMode::Proxy {
         return Ok(true);
     }
@@ -347,5 +351,37 @@ mod tests {
         // Mode proxy : la 2FA est l'affaire du proxy.
         let p = state("proxy").await;
         assert!(session_has_mfa(&p, &user, None).await.unwrap());
+    }
+
+    /// Un compte à passkey seule se connecte encore au mot de passe : cette session-là ne doit pas
+    /// enrôler un autre facteur, sinon un mot de passe volé suffit à ouvrir le SSH.
+    #[tokio::test]
+    async fn a_password_only_session_cannot_add_a_factor_to_a_protected_account() {
+        use crate::{api::account::second_factor_gate, auth::SESSION_COOKIE, crypto::token_hash};
+        use axum_extra::extract::{CookieJar, cookie::Cookie};
+        let s = state("builtin").await;
+        let user = crate::auth::user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        for (token, mfa) in [("sans", false), ("avec", true)] {
+            sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, unixepoch() + 60, ?)")
+                .bind(token_hash(token))
+                .bind(user.id)
+                .bind(mfa)
+                .execute(&s.db)
+                .await
+                .unwrap();
+        }
+        let jar = |t: &'static str| CookieJar::new().add(Cookie::new(SESSION_COOKIE, t));
+        assert!(second_factor_gate(&s, &user, &jar("sans")).await.is_ok(), "premier facteur : libre");
+        sqlx::query("INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'clé', '{}')")
+            .bind(user.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        assert!(second_factor_gate(&s, &user, &jar("sans")).await.is_err(), "mot de passe seul : refusé");
+        assert!(second_factor_gate(&s, &user, &jar("avec")).await.is_ok());
+        let mut totp = user.clone();
+        sqlx::query("DELETE FROM passkeys").execute(&s.db).await.unwrap();
+        totp.totp_secret = Some(vec![1]);
+        assert!(second_factor_gate(&s, &totp, &jar("sans")).await.is_err(), "TOTP actif : refusé aussi");
     }
 }

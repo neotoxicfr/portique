@@ -2,39 +2,86 @@ use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 use portique_proto::{
     ConnectionAdmin, ConnectionInput, ServiceKey, SshInput, TERMINAL_THEMES, UserAdmin, UserInput,
 };
+use wasm_bindgen::JsCast;
 
-use crate::{Session, api};
+use crate::{Session, api, glyph, icon, sentence};
 
 /// Commande de réveil proposée pour un routeur MikroTik (RouterOS).
 const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
+
+const CHECK: &str = r#"<path d="M5 12l5 5 9-10"/>"#;
+const RESET: &str = r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#;
+const STAR: &str = r#"<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>"#;
+const SHIELD_OK: &str = r#"<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/>"#;
+const SHIELD_NO: &str =
+    r#"<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M12 9v4M12 16v.5"/>"#;
 
 #[component]
 pub fn Admin() -> impl IntoView {
     let session = Session::get();
     let users = RwSignal::new(Vec::<UserAdmin>::new());
     let conns = RwSignal::new(Vec::<ConnectionAdmin>::new());
+    let load_err = RwSignal::new(None::<String>);
     let reload = move || {
         spawn_local(async move {
+            let mut failure = None;
             match api::get("/api/admin/users").await {
                 Ok(u) => users.set(u),
-                Err(e) => session.handle(&e),
+                Err(e) => {
+                    session.handle(&e);
+                    failure = Some(e.to_string());
+                }
             }
-            if let Ok(c) = api::get("/api/admin/connections").await {
-                conns.set(c);
+            match api::get("/api/admin/connections").await {
+                Ok(c) => conns.set(c),
+                Err(e) => {
+                    session.handle(&e);
+                    failure = Some(e.to_string());
+                }
             }
+            load_err.set(failure);
         })
     };
     reload();
+    let f = Form::default();
+    f.fill(None);
+    let open = RwSignal::new(false);
     view! {
-        <h1>"Administration"</h1>
-        <Connections conns users reload/>
-        <ServiceKeyPanel/>
-        <Users users reload/>
+        <h1 class="sr-only">"Administration"</h1>
+        {move || load_err.get().map(|m| view! {
+            <div class="banner error" role="alert">
+                <span>{sentence(&m)}</span>
+                <button type="button" on:click=move |_| reload()>"Réessayer"</button>
+            </div>
+        })}
+        <div class="admin">
+            <div>
+                <Machines conns f open/>
+                <Users users reload/>
+                <ServiceKeyPanel/>
+            </div>
+            <Editor conns users f open reload/>
+        </div>
     }
 }
 
 fn input(sig: RwSignal<String>) -> impl Fn(leptos::ev::Event) + Copy {
     move |ev| sig.set(event_target_value(&ev))
+}
+
+/// Interrupteur dont le vrai contrôle (`role="switch"`) est sous l'habillage.
+fn switch(sig: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <span class="switch">
+            <input type="checkbox" role="switch" prop:checked=move || sig.get()
+                on:change=move |ev| sig.set(event_target_checked(&ev))/>
+            <span class="track"></span>
+        </span>
+    }
+}
+
+fn confirm(msg: &str) -> bool {
+    window().confirm_with_message(msg).unwrap_or(false)
 }
 
 #[component]
@@ -43,6 +90,7 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
     let name = RwSignal::new(String::new());
     let pw = RwSignal::new(String::new());
     let admin = RwSignal::new(false);
+    let adding = RwSignal::new(false);
     let err = RwSignal::new(None::<String>);
     let me_id = move || session.me.with(|m| m.as_ref().map(|m| m.id));
 
@@ -60,6 +108,7 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
                     name.set(String::new());
                     pw.set(String::new());
                     admin.set(false);
+                    adding.set(false);
                     err.set(None);
                     reload();
                 }
@@ -76,85 +125,116 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
             }
         });
     };
-    let confirm = |msg: &str| web_sys_confirm(msg);
+    // Le serveur réécrit le rôle à chaque modification : on le relit juste avant, pour qu'une
+    // liste périmée ne rende pas ses droits à un compte dont un autre admin vient de les retirer.
+    let reset_2fa = move |u: UserAdmin| {
+        if !confirm(&format!("Supprimer TOTP et passkeys de {} ?", u.username)) {
+            return;
+        }
+        spawn_local(async move {
+            let current = match api::get::<Vec<UserAdmin>>("/api/admin/users").await {
+                Ok(l) => l.into_iter().find(|x| x.id == u.id),
+                Err(e) => {
+                    err.set(Some(e.to_string()));
+                    return;
+                }
+            };
+            let Some(cur) = current else {
+                reload();
+                return;
+            };
+            let body =
+                UserInput { username: cur.username, password: None, is_admin: cur.is_admin, reset_2fa: true };
+            match api::send_empty("PUT", &format!("/api/admin/users/{}", u.id), Some(&body)).await {
+                Ok(()) => reload(),
+                Err(e) => err.set(Some(e.to_string())),
+            }
+        });
+    };
 
     view! {
-        <section class="card">
-            <h2>"Comptes"</h2>
-            <div class="table-wrap"><table>
-                <thead><tr><th>"Identifiant"</th><th>"Rôle"</th><th>"2FA"</th><th></th></tr></thead>
-                <tbody>
-                    <For each=move || users.get() key=|u| (u.id, u.is_admin, u.totp_enabled, u.passkeys) let(u)>
-                        {
-                            let is_me = me_id() == Some(u.id);
-                            let u_toggle = u.clone();
-                            let u_reset = u.clone();
-                            let u_del = u.clone();
-                            let twofa = match (u.totp_enabled, u.passkeys) {
-                                (false, 0) => "—".to_string(),
-                                (t, p) => [t.then(|| "TOTP".to_string()), (p > 0).then(|| format!("{p} passkey(s)"))]
-                                    .into_iter().flatten().collect::<Vec<_>>().join(" + "),
-                            };
-                            view! {
-                                <tr>
-                                    <td>{u.username.clone()} {u.external.then_some(view! { <span class="badge">"proxy"</span> })}</td>
-                                    <td>{if u.is_admin { "admin" } else { "utilisateur" }}</td>
-                                    <td>{twofa}</td>
-                                    <td class="cell-actions">
-                                        <Show when=move || !is_me && !u.external>
-                                            {
-                                                let u = u_toggle.clone();
-                                                view! { <button class="link" on:click=move |_| act("PUT", &u, Some(UserInput {
-                                                    username: u.username.clone(), password: None, is_admin: !u.is_admin, reset_2fa: false,
-                                                }))>{if u_toggle.is_admin { "Retirer admin" } else { "Rendre admin" }}</button> }
-                                            }
-                                        </Show>
-                                        <Show when=move || !u_reset.external && (u_reset.totp_enabled || u_reset.passkeys > 0)>
-                                            {
-                                                let u = u_reset.clone();
-                                                view! { <button class="link" on:click=move |_| {
-                                                    if confirm(&format!("Supprimer TOTP et passkeys de {} ?", u.username)) {
-                                                        act("PUT", &u, Some(UserInput { username: u.username.clone(), password: None, is_admin: u.is_admin, reset_2fa: true }));
-                                                    }
-                                                }>"Réinitialiser 2FA"</button> }
-                                            }
-                                        </Show>
-                                        <Show when=move || !is_me>
-                                            {
-                                                let u = u_del.clone();
-                                                view! { <button class="link danger" on:click=move |_| {
-                                                    if confirm(&format!("Supprimer le compte {} ?", u.username)) { act("DELETE", &u, None) }
-                                                }>"Supprimer"</button> }
-                                            }
-                                        </Show>
-                                    </td>
-                                </tr>
-                            }
-                        }
-                    </For>
-                </tbody>
-            </table></div>
-            <Show when=move || !session.is_proxy()>
-                <form on:submit=create class="row wrap">
-                    <input type="text" placeholder="Identifiant" required prop:value=move || name.get() on:input=input(name)/>
-                    <input type="password" placeholder="Mot de passe (12+)" minlength="12" required autocomplete="new-password"
-                        prop:value=move || pw.get() on:input=input(pw)/>
-                    <label class="check"><input type="checkbox" prop:checked=move || admin.get()
-                        on:change=move |ev| admin.set(event_target_checked(&ev))/>"admin"</label>
-                    <button type="submit">"Créer"</button>
+        <section>
+            <div class="group-head">
+                <h2 class="group-title">"Comptes"</h2>
+                <Show when=move || !session.is_proxy()>
+                    <button type="button" class="iconbtn" aria-label="Créer un compte" title="Créer un compte"
+                        aria-expanded=move || adding.get().to_string() on:click=move |_| adding.update(|a| *a = !*a)>
+                        {icon(glyph::PLUS)}
+                    </button>
+                </Show>
+            </div>
+            <Show when=move || adding.get() && !session.is_proxy()>
+                <form on:submit=create>
+                    <div class="group">
+                        <label class="line"><span class="line-label">"Identifiant"</span>
+                            <input type="text" required autocomplete="off" prop:value=move || name.get() on:input=input(name)/></label>
+                        <label class="line"><span class="line-label">"Mot de passe"</span>
+                            <input type="password" required minlength="12" autocomplete="new-password" placeholder="12 caractères minimum"
+                                prop:value=move || pw.get() on:input=input(pw)/></label>
+                        <label class="line"><span class="line-label grow">"Administrateur"</span>{switch(admin)}</label>
+                    </div>
+                    <div class="actions">
+                        <button type="button" class="secondary" on:click=move |_| adding.set(false)>"Annuler"</button>
+                        <button type="submit">"Créer"</button>
+                    </div>
                 </form>
             </Show>
-            {move || err.get().map(|e| view! { <p class="error">{e}</p> })}
+            <div class="group">
+                <For each=move || users.get() key=|u| (u.id, u.is_admin, u.totp_enabled, u.passkeys) let(u)>
+                    {
+                        let is_me = me_id() == Some(u.id);
+                        let initial = u.username.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                        let twofa = match (u.totp_enabled, u.passkeys) {
+                            (false, 0) => "Pas de double authentification".to_string(),
+                            (t, p) => [t.then(|| "TOTP".to_string()), (p > 0).then(|| format!("{p} passkey(s)"))]
+                                .into_iter().flatten().collect::<Vec<_>>().join(" + "),
+                        };
+                        let has_2fa = u.totp_enabled || u.passkeys > 0;
+                        let editable = !is_me && !u.external;
+                        let (u_toggle, u_reset, u_del) = (u.clone(), u.clone(), u.clone());
+                        let toggle_label = if u.is_admin {
+                            format!("Retirer les droits admin de {}", u.username)
+                        } else {
+                            format!("Rendre {} admin", u.username)
+                        };
+                        let reset_label = format!("Réinitialiser la double authentification de {}", u.username);
+                        let del_label = format!("Supprimer le compte {}", u.username);
+                        view! {
+                            <div class="line urow">
+                                <span class="avatar" aria-hidden="true">{initial}</span>
+                                <span class="name">{u.username.clone()} {u.external.then_some(view! { <span class="badge">" proxy"</span> })}</span>
+                                <span class="role">{if u.is_admin { "admin" } else { "utilisateur" }}</span>
+                                <span class=if has_2fa { "mfa on" } else { "mfa" } role="img" aria-label=twofa.clone() title=twofa>
+                                    {icon(if has_2fa { SHIELD_OK } else { SHIELD_NO })}
+                                </span>
+                                {editable.then(|| view! {
+                                    <button type="button" class="iconbtn ghost" aria-label=toggle_label.clone() title=toggle_label
+                                        on:click=move |_| act("PUT", &u_toggle, Some(UserInput {
+                                            username: u_toggle.username.clone(), password: None, is_admin: !u_toggle.is_admin, reset_2fa: false,
+                                        }))>{icon(STAR)}</button>
+                                })}
+                                {(!u.external && has_2fa).then(|| view! {
+                                    <button type="button" class="iconbtn ghost" aria-label=reset_label.clone() title="Réinitialiser la double authentification"
+                                        on:click=move |_| reset_2fa(u_reset.clone())>{icon(RESET)}</button>
+                                })}
+                                {(!is_me).then(|| view! {
+                                    <button type="button" class="iconbtn ghost danger" aria-label=del_label title="Supprimer le compte"
+                                        on:click=move |_| if confirm(&format!("Supprimer le compte {} ?", u_del.username)) { act("DELETE", &u_del, None) }>
+                                        {icon(glyph::TRASH)}
+                                    </button>
+                                })}
+                            </div>
+                        }
+                    }
+                </For>
+            </div>
+            {move || err.get().map(|e| view! { <p class="alert" role="alert">{e}</p> })}
         </section>
     }
 }
 
-fn web_sys_confirm(msg: &str) -> bool {
-    leptos::prelude::window().confirm_with_message(msg).unwrap_or(false)
-}
-
 /// Formulaire de connexion : `editing = None` pour une création.
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct Form {
     name: RwSignal<String>,
     rdp: RwSignal<bool>,
@@ -167,6 +247,12 @@ struct Form {
     wol_target: RwSignal<String>,
     allowed: RwSignal<Vec<i64>>,
     editing: RwSignal<Option<i64>>,
+    /// Compteur d'ouvertures : une réponse tardive ne touche pas le formulaire d'une autre machine.
+    serial: RwSignal<u32>,
+    /// Erreur de l'enregistrement ou de la suppression en cours.
+    err: RwSignal<Option<String>>,
+    /// Réveil activé (adresse MAC et mode).
+    wol: RwSignal<bool>,
     has_password: RwSignal<bool>,
     fingerprint: RwSignal<Option<String>>,
     forget_cert: RwSignal<bool>,
@@ -198,6 +284,8 @@ struct Form {
 impl Form {
     fn fill(&self, c: Option<&ConnectionAdmin>) {
         let s = |v: Option<&str>| v.unwrap_or_default().to_owned();
+        self.serial.update(|n| *n += 1);
+        self.err.set(None);
         self.name.set(s(c.map(|c| c.name.as_str())));
         self.rdp.set(c.is_none_or(|c| c.rdp));
         self.host.set(s(c.map(|c| c.host.as_str())));
@@ -213,6 +301,7 @@ impl Form {
         self.fingerprint.set(c.and_then(|c| c.cert_fingerprint.clone()));
         self.forget_cert.set(false);
         let w = c.and_then(|c| c.wol_command.as_ref());
+        self.wol.set(c.is_some_and(|c| c.wol_mac.is_some()) || w.is_some());
         self.wol_by_command.set(w.is_some());
         self.cmd_host.set(s(w.map(|w| w.host.as_str())));
         self.cmd_user.set(s(w.map(|w| w.user.as_str())));
@@ -237,6 +326,7 @@ impl Form {
 
     fn input(&self) -> ConnectionInput {
         let opt = |s: RwSignal<String>| Some(s.get_untracked()).filter(|v| !v.trim().is_empty());
+        let wol = self.wol.get_untracked();
         ConnectionInput {
             name: self.name.get_untracked(),
             rdp: self.rdp.get_untracked(),
@@ -246,21 +336,23 @@ impl Form {
             domain: self.domain.get_untracked(),
             // Champ vide en modification = garder l'ancien mot de passe.
             password: opt(self.password),
-            wol_mac: opt(self.wol_mac),
-            wol_target: opt(self.wol_target),
+            wol_mac: opt(self.wol_mac).filter(|_| wol),
+            wol_target: opt(self.wol_target).filter(|_| wol),
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
-            wol_command: self.wol_by_command.get_untracked().then(|| portique_proto::WolCommandInput {
-                via_id: self.cmd_via.get_untracked().parse().ok(),
-                host: self.cmd_host.get_untracked(),
-                user: self.cmd_user.get_untracked(),
-                command: self.cmd_command.get_untracked(),
-                password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
-                approve_hostkey: self
-                    .cmd_approve
-                    .get_untracked()
-                    .then(|| self.cmd_pending.get_untracked())
-                    .flatten(),
+            wol_command: (wol && self.wol_by_command.get_untracked()).then(|| {
+                portique_proto::WolCommandInput {
+                    via_id: self.cmd_via.get_untracked().parse().ok(),
+                    host: self.cmd_host.get_untracked(),
+                    user: self.cmd_user.get_untracked(),
+                    command: self.cmd_command.get_untracked(),
+                    password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
+                    approve_hostkey: self
+                        .cmd_approve
+                        .get_untracked()
+                        .then(|| self.cmd_pending.get_untracked())
+                        .flatten(),
+                }
             }),
             ssh: self.ssh.get_untracked().then(|| SshInput {
                 port: self.ssh_port.get_untracked().trim().parse().ok(),
@@ -275,294 +367,354 @@ impl Form {
 }
 
 #[component]
-fn Connections(
+fn Machines(conns: RwSignal<Vec<ConnectionAdmin>>, f: Form, open: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <section>
+            <div class="group-head">
+                <h2 class="group-title">"Machines"</h2>
+                <button type="button" class="iconbtn" aria-label="Ajouter une machine" title="Ajouter une machine"
+                    on:click=move |_| { f.fill(None); open.set(true); }>{icon(glyph::PLUS)}</button>
+            </div>
+            <ul class="mlist">
+                <For each=move || conns.get() key=|c| format!("{c:?}") let(c)>
+                    {
+                        let id = c.id;
+                        let caps = [("SSH", c.ssh.is_some()), ("bureau", c.rdp), ("réveil", c.wol_mac.is_some())]
+                            .iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>().join(", ");
+                        let alert = c.ssh.as_ref().and_then(|s| s.theme.as_deref()) == Some("alerte");
+                        let (tone, glyph_d) = super::home::pastille(alert, c.rdp, c.ssh.is_some());
+                        let tint = format!("pastille {tone}");
+                        let (ssh, rdp, wol) = (c.ssh.is_some(), c.rdp, c.wol_mac.is_some());
+                        let c_edit = c.clone();
+                        view! {
+                            <li>
+                                <button type="button" class="mrow"
+                                    aria-current=move || (open.get() && f.editing.get() == Some(id)).then_some("true")
+                                    on:click=move |_| {
+                                        if !(open.get_untracked() && f.editing.get_untracked() == Some(id)) {
+                                            f.fill(Some(&c_edit));
+                                            open.set(true);
+                                        }
+                                    }>
+                                    <span class=tint>{icon(glyph_d)}</span>
+                                    <span class="who"><b>{c.name.clone()}</b><span>{c.host.clone()}</span></span>
+                                    <span class="caps" role="img" aria-label=caps>
+                                        <span class=if ssh { "" } else { "off" }>{icon(glyph::TERMINAL)}</span>
+                                        <span class=if rdp { "" } else { "off" }>{icon(glyph::SCREEN)}</span>
+                                        <span class=if wol { "" } else { "off" }>{icon(glyph::POWER)}</span>
+                                    </span>
+                                    {icon(glyph::CHEVRON)}
+                                </button>
+                            </li>
+                        }
+                    }
+                </For>
+            </ul>
+        </section>
+    }
+}
+
+/// Éditeur de la machine sélectionnée (ou nouvelle).
+#[component]
+fn Editor(
     conns: RwSignal<Vec<ConnectionAdmin>>,
     users: RwSignal<Vec<UserAdmin>>,
+    f: Form,
+    open: RwSignal<bool>,
     reload: impl Fn() + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
-    let f = Form::default();
-    f.fill(None);
-    let err = RwSignal::new(None::<String>);
-    let open = RwSignal::new(false);
-
-    let f2 = f.clone();
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();
-        let body = f2.input();
-        let (method, url) = match f2.editing.get_untracked() {
+        let body = f.input();
+        let (method, url) = match f.editing.get_untracked() {
             Some(id) => ("PUT", format!("/api/admin/connections/{id}")),
             None => ("POST", "/api/admin/connections".to_string()),
         };
+        let mine = f.serial.get_untracked();
         spawn_local(async move {
-            match api::send::<_, ConnectionAdmin>(method, &url, &body).await {
-                Ok(_) => {
+            let r = api::send::<_, ConnectionAdmin>(method, &url, &body).await;
+            // Le formulaire n'est touché que s'il est encore celui qui a lancé la requête.
+            let same = f.serial.get_untracked() == mine;
+            match r {
+                Ok(_) if same => {
                     open.set(false);
-                    err.set(None);
-                    reload();
+                    f.err.set(None);
                 }
-                Err(e) => err.set(Some(e.to_string())),
+                Err(e) if same => f.err.set(Some(e.to_string())),
+                _ => {}
             }
+            // Même en cas de refus : le serveur a pu écrire avant de refuser.
+            reload();
         });
     };
-    let remove = move |c: &ConnectionAdmin| {
-        if !web_sys_confirm(&format!("Supprimer la connexion « {} » ?", c.name)) {
+    let remove = move |_| {
+        let Some(id) = f.editing.get_untracked() else { return };
+        let name = conns
+            .with_untracked(|l| l.iter().find(|c| c.id == id).map(|c| c.name.clone()))
+            .unwrap_or_else(|| f.name.get_untracked());
+        if !confirm(&format!("Supprimer la connexion « {name} » ?")) {
             return;
         }
-        let url = format!("/api/admin/connections/{}", c.id);
+        let mine = f.serial.get_untracked();
         spawn_local(async move {
-            match api::send_empty::<()>("DELETE", &url, None).await {
-                Ok(()) => reload(),
-                Err(e) => err.set(Some(e.to_string())),
+            let r = api::send_empty::<()>("DELETE", &format!("/api/admin/connections/{id}"), None).await;
+            let same = f.serial.get_untracked() == mine;
+            match r {
+                Ok(()) if same => open.set(false),
+                Err(e) if same => f.err.set(Some(e.to_string())),
+                _ => {}
             }
+            reload();
         });
     };
 
     let non_admins = move || users.get().into_iter().filter(|u| !u.is_admin).collect::<Vec<_>>();
-    let fe = f.clone();
-    let fn_new = f.clone();
-    let ff = f.clone();
+    // Hôtes SSH proposables comme rebond ou comme relais de réveil (jamais la machine elle-même).
+    let ssh_hosts = move || {
+        conns
+            .get()
+            .into_iter()
+            .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
+            .collect::<Vec<_>>()
+    };
+
     view! {
-        <section class="card">
-            <div class="row spread">
-                <h2>"Connexions"</h2>
-                <button on:click=move |_| { fn_new.fill(None); open.set(true); }>"Ajouter"</button>
-            </div>
-            <div class="table-wrap"><table>
-                <thead><tr><th>"Nom"</th><th>"Cible"</th><th>"Compte"</th><th>"WoL"</th><th></th></tr></thead>
-                <tbody>
-                    <For each=move || conns.get() key=|c| format!("{c:?}") let(c)>
-                        {
-                            let fe = fe.clone();
-                            let c_edit = c.clone();
-                            let c_del = c.clone();
-                            view! {
-                                <tr>
-                                    <td>{c.name.clone()}</td>
-                                    <td class="mono">{c.host.clone()}
-                                        {c.rdp.then(|| view! { <span class="badge">{format!("RDP {}", c.port)}</span> })}
-                                        {c.ssh.as_ref().map(|h| view! { <span class="badge">{format!("SSH {}", h.port)}</span> })}</td>
-                                    <td>{if c.domain.is_empty() { c.username.clone() } else { format!("{}\\{}", c.domain, c.username) }}
-                                        {(!c.has_password).then_some(view! { <span class="badge">"sans mot de passe"</span> })}</td>
-                                    <td class="mono">{c.wol_mac.clone().unwrap_or_else(|| "—".into())}</td>
-                                    <td class="cell-actions">
-                                        <button class="link" on:click=move |_| { fe.fill(Some(&c_edit)); open.set(true); }>"Modifier"</button>
-                                        <button class="link danger" on:click=move |_| remove(&c_del)>"Supprimer"</button>
-                                    </td>
-                                </tr>
+        <Show when=move || open.get()>
+            <form class="editor" on:submit=save>
+                <div class="group">
+                    <label class="line"><span class="line-label">"Nom"</span>
+                        <input type="text" required prop:value=move || f.name.get() on:input=input(f.name)/></label>
+                    <label class="line"><span class="line-label">"Hôte"</span>
+                        <input type="text" class="mono" required placeholder="192.0.2.11" prop:value=move || f.host.get() on:input=input(f.host)/></label>
+                </div>
+
+                <div class="group">
+                    <label class="line sect">
+                        <span class="pastille green">{icon(glyph::TERMINAL)}</span>
+                        <span class="line-label grow">"Terminal SSH"</span>{switch(f.ssh)}
+                    </label>
+                    <Show when=move || f.ssh.get()>
+                        <label class="line"><span class="line-label">"Port"</span>
+                            <input type="number" min="1" max="65535" placeholder="22" prop:value=move || f.ssh_port.get() on:input=input(f.ssh_port)/></label>
+                        <label class="line"><span class="line-label">"Utilisateur"</span>
+                            <input type="text" autocomplete="off" prop:value=move || f.ssh_user.get() on:input=input(f.ssh_user)/></label>
+                        <label class="line"><span class="line-label">"Mot de passe"</span>
+                            <input type="password" autocomplete="new-password"
+                                placeholder=move || if f.ssh_has_password.get() { "inchangé" } else { "facultatif : clé du service" }
+                                prop:value=move || f.ssh_password.get() on:input=input(f.ssh_password)/></label>
+                        <label class="line"><span class="line-label">"Rebond"</span>
+                            <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
+                                <option value="">"direct"</option>
+                                {move || ssh_hosts().into_iter()
+                                    .map(|c| view! { <option value=c.id.to_string()>{format!("par {}", c.name)}</option> })
+                                    .collect_view()}
+                            </select></label>
+                        <label class="line"><span class="line-label">"Thème"</span>
+                            <select prop:value=move || f.ssh_theme.get() on:change=input(f.ssh_theme)>
+                                <option value="">"celui du compte"</option>
+                                {TERMINAL_THEMES.iter().map(|t| view! { <option value=*t>{*t}</option> }).collect_view()}
+                            </select></label>
+                        {move || f.ssh_hostkey.get().map(|k| view! {
+                            <div class="line col"><span>"Clé d'hôte approuvée"</span><span class="val">{k}</span></div>
+                            <label class="line"><span class="line-label grow">"Oublier la clé (machine réinstallée : à réapprouver)"</span>{switch(f.ssh_forget)}</label>
+                        })}
+                    </Show>
+                </div>
+
+                <div class="group">
+                    <label class="line sect">
+                        <span class="pastille orange">{icon(glyph::SCREEN)}</span>
+                        <span class="line-label grow">"Bureau à distance"</span>{switch(f.rdp)}
+                    </label>
+                    <Show when=move || f.rdp.get()>
+                        <label class="line"><span class="line-label">"Port"</span>
+                            <input type="number" min="1" max="65535" placeholder="3389" prop:value=move || f.port.get() on:input=input(f.port)/></label>
+                        <label class="line"><span class="line-label">"Utilisateur Windows"</span>
+                            <input type="text" autocomplete="off" prop:value=move || f.username.get() on:input=input(f.username)/></label>
+                        <label class="line"><span class="line-label">"Domaine"</span>
+                            <input type="text" autocomplete="off" prop:value=move || f.domain.get() on:input=input(f.domain)/></label>
+                        <label class="line"><span class="line-label">"Mot de passe"</span>
+                            <input type="password" autocomplete="new-password"
+                                placeholder=move || if f.has_password.get() { "inchangé" } else { "" }
+                                prop:value=move || f.password.get() on:input=input(f.password)/></label>
+                    </Show>
+                </div>
+
+                <div class="group">
+                    <label class="line sect">
+                        <span class="pastille gray">{icon(glyph::POWER)}</span>
+                        <span class="line-label grow">"Réveil"</span>{switch(f.wol)}
+                    </label>
+                    <Show when=move || f.wol.get()>
+                        <label class="line"><span class="line-label">"Adresse MAC"</span>
+                            <input type="text" class="mono" placeholder="00:11:22:33:44:55" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
+                        <div class="line"><span class="line-label grow">"Mode"</span>
+                            <div class="seg" role="group" aria-label="Mode de réveil">
+                                <button type="button" aria-pressed=move || (!f.wol_by_command.get()).to_string()
+                                    title="Paquet magique UDP : même réseau, ou broadcast dirigé"
+                                    on:click=move |_| f.wol_by_command.set(false)>"UDP direct"</button>
+                                <button type="button" aria-pressed=move || f.wol_by_command.get().to_string()
+                                    title="Commande SSH sur un hôte du réseau du PC (routeur MikroTik…) : indispensable à travers un VPN"
+                                    on:click=move |_| f.wol_by_command.set(true)>"Commande SSH"</button>
+                            </div></div>
+                        <Show
+                            when=move || f.wol_by_command.get()
+                            fallback=move || view! {
+                                <label class="line"><span class="line-label">"Cible UDP"</span>
+                                    <input type="text" class="mono" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
                             }
-                        }
-                    </For>
-                </tbody>
-            </table></div>
-            <Show when=move || open.get()>
-                {
-                    let f = ff.clone();
-                    let save = save.clone();
-                    view! {
-                        <form on:submit=save class="grid">
-                            <label>"Nom"<input type="text" required prop:value=move || f.name.get() on:input=input(f.name)/></label>
-                            <label>"Hôte"<input type="text" required placeholder="10.8.0.2" prop:value=move || f.host.get() on:input=input(f.host)/></label>
-                            <fieldset class="full">
-                                <legend>"Protocoles (au moins un)"</legend>
-                                <label class="check">
-                                    <input type="checkbox" prop:checked=move || f.rdp.get() on:change=move |ev| f.rdp.set(event_target_checked(&ev))/>
-                                    "RDP (bureau Windows)"
-                                </label>
-                                <label class="check">
-                                    <input type="checkbox" prop:checked=move || f.ssh.get() on:change=move |ev| f.ssh.set(event_target_checked(&ev))/>
-                                    "SSH (terminal)"
-                                </label>
-                            </fieldset>
-                            <Show when=move || f.rdp.get()>
-                                <fieldset class="full grid">
-                                    <legend>"RDP"</legend>
-                                    <label>"Port"<input type="number" min="1" max="65535" placeholder="3389" prop:value=move || f.port.get() on:input=input(f.port)/></label>
-                                    <label>"Utilisateur Windows"<input type="text" autocomplete="off" prop:value=move || f.username.get() on:input=input(f.username)/></label>
-                                    <label>"Domaine"<input type="text" autocomplete="off" prop:value=move || f.domain.get() on:input=input(f.domain)/></label>
-                                    <label>"Mot de passe"
-                                        <input type="password" autocomplete="new-password"
-                                            placeholder=move || if f.has_password.get() { "inchangé" } else { "" }
-                                            prop:value=move || f.password.get() on:input=input(f.password)/>
-                                    </label>
-                                </fieldset>
+                        >
+                            <label class="line"><span class="line-label">"Passer par"</span>
+                                <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
+                                    <option value="">"une adresse saisie ci-dessous"</option>
+                                    {move || ssh_hosts().into_iter()
+                                        .map(|c| view! { <option value=c.id.to_string()>{format!("l'hôte SSH « {} »", c.name)}</option> })
+                                        .collect_view()}
+                                </select></label>
+                            <Show when=move || f.cmd_via.get().is_empty()>
+                                <label class="line"><span class="line-label">"Hôte SSH"</span>
+                                    <input type="text" class="mono" placeholder="192.0.2.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
+                                <label class="line"><span class="line-label">"Utilisateur"</span>
+                                    <input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
+                                <label class="line"><span class="line-label">"Mot de passe"</span>
+                                    <input type="password" autocomplete="new-password"
+                                        placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "facultatif : clé du service" }
+                                        prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/></label>
                             </Show>
-                            <Show when=move || f.ssh.get()>
-                                <fieldset class="full grid">
-                                    <legend>"SSH (clé du service d'abord, puis le mot de passe s'il y en a un)"</legend>
-                                    <label>"Port"<input type="number" min="1" max="65535" placeholder="22" prop:value=move || f.ssh_port.get() on:input=input(f.ssh_port)/></label>
-                                    <label>"Utilisateur"<input type="text" autocomplete="off" prop:value=move || f.ssh_user.get() on:input=input(f.ssh_user)/></label>
-                                    <label>"Mot de passe (facultatif)"
-                                        <input type="password" autocomplete="new-password"
-                                            placeholder=move || if f.ssh_has_password.get() { "inchangé" } else { "clé du service seulement" }
-                                            prop:value=move || f.ssh_password.get() on:input=input(f.ssh_password)/>
-                                    </label>
-                                    <label>"Rebond"
-                                        <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
-                                            <option value="">"direct"</option>
-                                            {move || conns.get().into_iter()
-                                                .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
-                                                .map(|c| view! { <option value=c.id.to_string()>{format!("par {}", c.name)}</option> })
-                                                .collect_view()}
-                                        </select>
-                                    </label>
-                                    <label>"Thème du terminal"
-                                        <select prop:value=move || f.ssh_theme.get() on:change=input(f.ssh_theme)>
-                                            <option value="">"celui du compte"</option>
-                                            {TERMINAL_THEMES.iter().map(|t| view! { <option value=*t>{*t}</option> }).collect_view()}
-                                        </select>
-                                    </label>
-                                    {move || f.ssh_hostkey.get().map(|k| view! {
-                                        <div class="full">
-                                            <p class="muted mono">"Clé d'hôte approuvée : " {k}</p>
-                                            <label class="check">
-                                                <input type="checkbox" prop:checked=move || f.ssh_forget.get()
-                                                    on:change=move |ev| f.ssh_forget.set(event_target_checked(&ev))/>
-                                                "Oublier (machine réinstallée : il faudra réapprouver)"
-                                            </label>
-                                        </div>
-                                    })}
-                                </fieldset>
-                            </Show>
-                            <fieldset class="full column">
-                                <legend>"Réveil (Wake-on-LAN, facultatif)"</legend>
-                                <label>"Adresse MAC de la machine"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
-                                <label class="check">
-                                    <input type="radio" name="wolmode" prop:checked=move || !f.wol_by_command.get()
-                                        on:change=move |_| f.wol_by_command.set(false)/>
-                                    "Direct : paquet magique UDP (même réseau, ou broadcast dirigé)"
-                                </label>
-                                <label class="check">
-                                    <input type="radio" name="wolmode" prop:checked=move || f.wol_by_command.get()
-                                        on:change=move |_| f.wol_by_command.set(true)/>
-                                    "Par commande SSH sur un hôte du réseau du PC (routeur MikroTik…), indispensable à travers un VPN"
-                                </label>
-                                <Show
-                                    when=move || f.wol_by_command.get()
-                                    fallback=move || view! {
-                                        <label class="full">"Cible UDP"<input type="text" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
-                                    }
-                                >
-                                    <label class="full">"Passer par"
-                                        <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
-                                            <option value="">"une adresse saisie ci-dessous"</option>
-                                            {move || conns.get().into_iter()
-                                                .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
-                                                .map(|c| view! { <option value=c.id.to_string()>{format!("l'hôte SSH « {} » (sa clé, ses rebonds)", c.name)}</option> })
-                                                .collect_view()}
-                                        </select>
-                                    </label>
-                                    <Show when=move || f.cmd_via.get().is_empty()>
-                                    <div class="grid full">
-                                        <label>"Hôte SSH"<input type="text" placeholder="10.0.0.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
-                                        <label>"Utilisateur SSH"<input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
-                                        <label>"Mot de passe SSH (facultatif)"
-                                            <input type="password" autocomplete="new-password"
-                                                placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "clé du service seulement" }
-                                                prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/>
-                                        </label>
-                                    </div>
-                                    </Show>
-                                    <label class="full">"Commande ({mac} est remplacé)"
-                                        <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/>
-                                    </label>
-                                    {move || f.cmd_hostkey.get().map(|k| view! { <p class="muted mono">"Clé SSH approuvée : " {k}</p> })}
-                                    {move || f.cmd_pending.get().map(|k| view! {
-                                        <div class="full">
-                                            <p>"Clé présentée par l'hôte, à comparer avec la sienne (MikroTik : " <code>"/ip ssh print"</code> ") :"</p>
-                                            <p class="mono">{k}</p>
-                                            <label class="check">
-                                                <input type="checkbox" prop:checked=move || f.cmd_approve.get()
-                                                    on:change=move |ev| f.cmd_approve.set(event_target_checked(&ev))/>
-                                                "Elle est identique : approuver"
-                                            </label>
-                                        </div>
-                                    })}
-                                </Show>
-                            </fieldset>
-                            <Show when=move || f.fingerprint.with(Option::is_some)>
-                                <fieldset class="full">
-                                    <legend>"Certificat du PC (épinglé)"</legend>
-                                    <span class="mono">{move || f.fingerprint.get().unwrap_or_default()}</span>
-                                    <label class="check">
-                                        <input type="checkbox" prop:checked=move || f.forget_cert.get()
-                                            on:change=move |ev| f.forget_cert.set(event_target_checked(&ev))/>
-                                        "Oublier (PC réinstallé ou certificat renouvelé : il faudra réapprouver)"
-                                    </label>
-                                </fieldset>
-                            </Show>
-                            <fieldset class="full">
-                                <legend>"Comptes autorisés (les admins voient tout)"</legend>
-                                <For each=non_admins key=|u| u.id let(u)>
-                                    <label class="check">
-                                        <input type="checkbox"
-                                            prop:checked=move || f.allowed.with(|a| a.contains(&u.id))
-                                            on:change=move |ev| {
-                                                let on = event_target_checked(&ev);
-                                                f.allowed.update(|a| { a.retain(|x| *x != u.id); if on { a.push(u.id) } });
-                                            }/>
-                                        {u.username.clone()}
-                                    </label>
-                                </For>
-                            </fieldset>
-                            {move || err.get().map(|e| view! { <p class="error full">{e}</p> })}
-                            <div class="row full">
-                                <button type="submit">"Enregistrer"</button>
-                                <button type="button" class="secondary" on:click=move |_| open.set(false)>"Annuler"</button>
-                            </div>
-                        </form>
-                    }
-                }
-            </Show>
-        </section>
+                            <label class="line col"><span>"Commande ({mac} est remplacé)"</span>
+                                <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/></label>
+                            {move || f.cmd_hostkey.get().map(|k| view! {
+                                <div class="line col"><span>"Clé SSH approuvée"</span><span class="val">{k}</span></div>
+                            })}
+                            {move || f.cmd_pending.get().map(|k| view! {
+                                <div class="line col">
+                                    <span>"Clé présentée par l'hôte, à comparer avec la sienne (MikroTik : " <code>"/ip ssh print"</code> ")"</span>
+                                    <span class="val">{k}</span>
+                                </div>
+                                <label class="line"><span class="line-label grow">"Elle est identique : approuver"</span>{switch(f.cmd_approve)}</label>
+                            })}
+                        </Show>
+                    </Show>
+                </div>
+
+                <Show when=move || f.fingerprint.with(Option::is_some)>
+                    <div class="group">
+                        <div class="line sect">
+                            <span class="pastille gray">{icon(glyph::SHIELD)}</span>
+                            <span class="line-label grow">"Certificat épinglé"</span>
+                        </div>
+                        <div class="line col"><span class="val">{move || f.fingerprint.get().unwrap_or_default()}</span></div>
+                        <label class="line"><span class="line-label grow">"Oublier (PC réinstallé ou certificat renouvelé : à réapprouver)"</span>{switch(f.forget_cert)}</label>
+                    </div>
+                </Show>
+
+                <Show when=move || !non_admins().is_empty()>
+                    <div class="group">
+                        <div class="line sect"><span class="line-label">"Comptes autorisés"</span><span class="sub">"(les admins voient tout)"</span></div>
+                        <For each=non_admins key=|u| u.id let(u)>
+                            <label class="line">
+                                <span class="line-label grow">{u.username.clone()}</span>
+                                <input type="checkbox"
+                                    prop:checked=move || f.allowed.with(|a| a.contains(&u.id))
+                                    on:change=move |ev| {
+                                        let on = event_target_checked(&ev);
+                                        f.allowed.update(|a| { a.retain(|x| *x != u.id); if on { a.push(u.id) } });
+                                    }/>
+                            </label>
+                        </For>
+                    </div>
+                </Show>
+
+                {move || f.err.get().map(|e| view! { <p class="alert" role="alert">{e}</p> })}
+                <div class="actions">
+                    <Show when=move || f.editing.get().is_some()>
+                        <button type="button" class="link danger" on:click=remove>"Supprimer"</button>
+                    </Show>
+                    <span class="spacer"></span>
+                    <button type="button" class="secondary" on:click=move |_| open.set(false)>"Annuler"</button>
+                    <button type="submit">"Enregistrer"</button>
+                </div>
+            </form>
+        </Show>
     }
+}
+
+/// Copie dans le presse-papier ; faux s'il est indisponible (hors HTTPS) ou refusé.
+async fn copy_text(text: &str) -> bool {
+    let nav = window().navigator();
+    let Ok(cb) = js_sys::Reflect::get(&nav, &"clipboard".into()) else { return false };
+    if cb.is_undefined() {
+        return false;
+    }
+    let cb: web_sys::Clipboard = cb.unchecked_into();
+    wasm_bindgen_futures::JsFuture::from(cb.write_text(text)).await.is_ok()
+}
+
+/// Adresse, réseau ou nom acceptable dans `from="…"` d'authorized_keys (jamais de guillemet).
+fn valid_from(a: &str) -> bool {
+    a.chars().all(|c| c.is_ascii_alphanumeric() || ".:/*?!_-".contains(c))
 }
 
 /// Clé publique du service, à poser dans `authorized_keys` ; `from="…"` facultatif.
 #[component]
 fn ServiceKeyPanel() -> impl IntoView {
     let key = RwSignal::new(None::<String>);
-    let restrict = RwSignal::new(false);
     let from = RwSignal::new(String::new());
-    let copied = RwSignal::new(false);
+    let copied = RwSignal::new(None::<String>);
+    let refused = RwSignal::new(false);
     spawn_local(async move {
         if let Ok(k) = api::get::<ServiceKey>("/api/admin/ssh-key").await {
             key.set(Some(k.public));
         }
     });
+    // Une restriction saisie doit être valide en entier : une adresse mal écrite ne doit jamais
+    // retomber sur la clé nue, qui s'ouvre depuis n'importe où.
+    let problem = move || {
+        let f = from.get();
+        f.split([',', ' '])
+            .find(|a| !a.is_empty() && !valid_from(a))
+            .map(|a| format!("Adresse ou réseau invalide : « {a} »."))
+    };
     let line = move || {
         let k = key.get()?;
+        if problem().is_some() {
+            return None;
+        }
         let f = from.get();
         let addrs: Vec<&str> = f.split([',', ' ']).filter(|a| !a.is_empty()).collect();
-        Some(if restrict.get() && !addrs.is_empty() {
-            format!("from=\"{}\" {k}", addrs.join(","))
-        } else {
-            k
-        })
+        Some(if addrs.is_empty() { k } else { format!("from=\"{}\" {k}", addrs.join(",")) })
     };
     let copy = move |_| {
-        if let Some(l) = line() {
-            let _ = leptos::prelude::window().navigator().clipboard().write_text(&l);
-            copied.set(true);
-        }
+        let Some(l) = line() else { return };
+        spawn_local(async move {
+            let ok = copy_text(&l).await;
+            refused.set(!ok);
+            copied.set(ok.then_some(l));
+        });
     };
+    let done = move || line().is_some() && copied.get() == line();
     view! {
-        <section class="card">
-            <h2>"Clé SSH du service"</h2>
-            <p class="muted">"Ligne à ajouter dans ~/.ssh/authorized_keys de chaque hôte SSH (Windows : C:\\ProgramData\\ssh\\administrators_authorized_keys pour un compte administrateur). Elle ouvre toutes ces machines : le SSH exige donc la double authentification."</p>
-            <label class="check">
-                <input type="checkbox" prop:checked=move || restrict.get() on:change=move |ev| restrict.set(event_target_checked(&ev))/>
-                "Limiter aux adresses du service (from=)"
-            </label>
-            <Show when=move || restrict.get()>
-                <label>"Adresses ou réseaux, séparés par des virgules"
-                    <input type="text" class="mono" placeholder="192.0.2.10,198.51.100.0/24" prop:value=move || from.get() on:input=input(from)/>
+        <section>
+            <h2 class="group-title">"Clé SSH du service"</h2>
+            <div class="group">
+                <div class="line keyline">
+                    <code title="Ligne à ajouter dans ~/.ssh/authorized_keys de chaque hôte SSH (Windows, compte administrateur : C:\\ProgramData\\ssh\\administrators_authorized_keys)">
+                        {move || line().unwrap_or_else(|| "—".into())}
+                    </code>
+                    <button type="button" class="iconbtn" aria-label="Copier la ligne authorized_keys" title="Copier"
+                        disabled=move || line().is_none() on:click=copy>
+                        {move || icon(if done() { CHECK } else { glyph::COPY })}
+                    </button>
+                </div>
+                <label class="line">
+                    <span class="line-label">"Restreindre à"</span>
+                    <input type="text" class="mono" placeholder="192.0.2.10, 198.51.100.0/24" autocomplete="off"
+                        prop:value=move || from.get() on:input=input(from)/>
                 </label>
-            </Show>
-            <textarea class="mono key" readonly rows="3" prop:value=move || line().unwrap_or_else(|| "chargement…".into())></textarea>
-            <div class="row">
-                <button type="button" on:click=copy>"Copier"</button>
-                {move || copied.get().then_some(view! { <span class="muted">"Copiée."</span> })}
             </div>
+            <span class="sr-only" role="status">{move || done().then_some("Ligne copiée")}</span>
+            {move || problem().map(|m| view! { <p class="alert" role="alert">{m}</p> })}
+            {move || refused.get().then(|| view! { <p class="alert" role="alert">"Le navigateur a refusé la copie : sélectionne la ligne et copie-la à la main."</p> })}
         </section>
     }
 }

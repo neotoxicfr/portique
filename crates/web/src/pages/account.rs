@@ -1,94 +1,59 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 use portique_proto::{
-    ChangePassword, PasskeyInfo, ReAuth, TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
+    ChangePassword, Combo, PasskeyInfo, ReAuth, TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
 };
 
-use crate::{Session, api};
+use crate::{Session, api, glyph, icon};
+
+const KEY: &str = r#"<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M15 8l2 2"/>"#;
+const LOCK: &str = r#"<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>"#;
+const CROSS: &str = r#"<path d="M6 6l12 12M18 6L6 18"/>"#;
+
+/// Nombre maximal de combinaisons de la barre de touches (limite du serveur).
+const MAX_COMBOS: usize = 12;
+
+type Status = RwSignal<Option<Result<String, String>>>;
 
 #[component]
 pub fn Account() -> impl IntoView {
     let session = Session::get();
     let external = move || session.me.with(|m| m.as_ref().is_some_and(|m| m.external));
     view! {
-        <h1>"Mon compte"</h1>
-        <Show
-            when=move || !external()
-            fallback=|| view! { <p class="muted">"Compte géré par le proxy d'authentification : mot de passe et double authentification se règlent là-bas."</p> }
-        >
-            <Password/>
-            <Totp/>
-            <Passkeys/>
-        </Show>
-        <Terminal/>
+        <h1 class="sr-only">"Mon compte"</h1>
+        <div class="cols">
+            <div>
+                <Show
+                    when=move || !external()
+                    fallback=|| view! { <p class="muted">"Compte géré par le proxy d'authentification : mot de passe et double authentification se règlent là-bas."</p> }
+                >
+                    <Password/>
+                    <Security/>
+                </Show>
+            </div>
+            <Terminal/>
+        </div>
     }
 }
 
-/// Thème par défaut du terminal SSH (un hôte peut avoir le sien) et combinaisons de la barre de touches.
-#[component]
-fn Terminal() -> impl IntoView {
-    let theme = RwSignal::new(String::new());
-    let combos = RwSignal::new(String::new());
-    let st = status();
-    spawn_local(async move {
-        if let Ok(p) = api::get::<TerminalPrefs>("/api/account/terminal").await {
-            theme.set(p.theme);
-            combos.set(p.combos.join(", "));
-        }
-    });
-    let submit = move |ev: SubmitEvent| {
-        ev.prevent_default();
-        let body = TerminalPrefs {
-            theme: theme.get_untracked(),
-            combos: combos
-                .get_untracked()
-                .split(',')
-                .map(|c| c.trim().to_owned())
-                .filter(|c| !c.is_empty())
-                .collect(),
-        };
-        spawn_local(async move {
-            let r = api::send::<_, TerminalPrefs>("PUT", "/api/account/terminal", &body).await;
-            st.set(Some(
-                r.map(|_| "Préférences du terminal enregistrées.".into()).map_err(|e| e.to_string()),
-            ));
-        });
-    };
-    view! {
-        <section class="card">
-            <h2>"Terminal SSH"</h2>
-            <form on:submit=submit class="stack">
-                <label>"Thème par défaut"
-                    <select prop:value=move || theme.get() on:change=move |ev| theme.set(event_target_value(&ev))>
-                        {TERMINAL_THEMES.iter().map(|t| view! { <option value=*t>{*t}</option> }).collect_view()}
-                    </select>
-                </label>
-                <label>"Combinaisons de la barre de touches (séparées par des virgules)"
-                    <input type="text" class="mono" placeholder="Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+R, Ctrl+L"
-                        prop:value=move || combos.get() on:input=move |ev| combos.set(event_target_value(&ev))/>
-                </label>
-                <p class="muted">"Ctrl+lettre, Alt+lettre ou Ctrl+Alt+lettre, 12 au plus. La barre apparaît en bas de l'écran sur téléphone et tablette, au-dessus du clavier."</p>
-                <button type="submit">"Enregistrer"</button>
-            </form>
-            {show_status(st)}
-        </section>
-    }
-}
-
-fn status() -> RwSignal<Option<Result<String, String>>> {
+fn status() -> Status {
     RwSignal::new(None)
 }
 
-fn show_status(s: RwSignal<Option<Result<String, String>>>) -> impl IntoView {
+fn show_status(s: Status) -> impl IntoView {
     move || {
         s.get().map(|r| match r {
-            Ok(m) => view! { <p class="notice">{m}</p> }.into_any(),
-            Err(m) => view! { <p class="error">{m}</p> }.into_any(),
+            Ok(m) => view! { <p class="alert ok" role="status">{m}</p> }.into_any(),
+            Err(m) => view! { <p class="alert" role="alert">{m}</p> }.into_any(),
         })
     }
 }
 
 fn totp_enabled() -> bool {
     Session::get().me.with(|m| m.as_ref().is_some_and(|m| m.totp_enabled))
+}
+
+fn confirm(msg: &str) -> bool {
+    window().confirm_with_message(msg).unwrap_or(false)
 }
 
 /// Champs de réauthentification : mot de passe actuel, et code TOTP s'il est actif.
@@ -114,17 +79,23 @@ impl Proof {
         proof
     }
 
-    fn view(self, label: &'static str) -> impl IntoView {
-        let p = self;
+    fn password_line(self, label: &'static str) -> impl IntoView {
         view! {
-            <label>{label}
+            <label class="line">
+                <span class="line-label">{label}</span>
                 <input type="password" autocomplete="current-password" required
-                    prop:value=move || p.password.get() on:input=move |ev| p.password.set(event_target_value(&ev))/>
+                    prop:value=move || self.password.get() on:input=move |ev| self.password.set(event_target_value(&ev))/>
             </label>
+        }
+    }
+
+    fn totp_line(self) -> impl IntoView {
+        view! {
             <Show when=totp_enabled>
-                <label>"Code TOTP"
-                    <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required
-                        prop:value=move || p.totp.get() on:input=move |ev| p.totp.set(event_target_value(&ev))/>
+                <label class="line">
+                    <span class="line-label">"Code TOTP"</span>
+                    <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" required
+                        prop:value=move || self.totp.get() on:input=move |ev| self.totp.set(event_target_value(&ev))/>
                 </label>
             </Show>
         }
@@ -133,42 +104,88 @@ impl Proof {
 
 #[component]
 fn Password() -> impl IntoView {
+    let session = Session::get();
     let proof = Proof::new();
     let new = RwSignal::new(String::new());
     let st = status();
+    let busy = RwSignal::new(false);
+    let done = RwSignal::new(false);
     let submit = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
         let body = ChangePassword { auth: proof.take(), new: new.get_untracked() };
         new.set(String::new());
         spawn_local(async move {
-            let r = api::send_empty("POST", "/api/account/password", Some(&body)).await;
-            st.set(Some(
-                r.map(|_| "Mot de passe changé, les autres sessions sont fermées.".into())
-                    .map_err(|e| e.to_string()),
-            ));
+            // Le serveur ferme toutes les sessions du compte, celle-ci comprise.
+            match api::send_empty("POST", "/api/account/password", Some(&body)).await {
+                Ok(()) => {
+                    st.set(None);
+                    done.set(true);
+                }
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
+            }
+            busy.set(false);
         });
     };
     view! {
-        <section class="card">
-            <h2>"Mot de passe"</h2>
-            <form on:submit=submit class="stack">
-                {proof.view("Actuel")}
-                <label>"Nouveau (12 caractères minimum)"<input type="password" autocomplete="new-password" minlength="12" required
-                    prop:value=move || new.get() on:input=move |ev| new.set(event_target_value(&ev))/></label>
-                {show_status(st)}
-                <button type="submit">"Changer"</button>
-            </form>
+        <section>
+            <h2 class="group-title">"Mot de passe"</h2>
+            <Show
+                when=move || !done.get()
+                fallback=move || view! {
+                    <p class="alert ok" role="status">"Mot de passe changé : toutes les sessions sont fermées, celle-ci comprise."</p>
+                    <div class="actions"><button on:click=move |_| session.me.set(None)>"Se reconnecter"</button></div>
+                }
+            >
+                <form on:submit=submit>
+                    <div class="group">
+                        {proof.password_line("Actuel")}
+                        {proof.totp_line()}
+                        <label class="line">
+                            <span class="line-label">"Nouveau"</span>
+                            <input type="password" autocomplete="new-password" minlength="12" required placeholder="12 caractères minimum"
+                                prop:value=move || new.get() on:input=move |ev| new.set(event_target_value(&ev))/>
+                        </label>
+                    </div>
+                    {show_status(st)}
+                    <div class="actions"><button type="submit" disabled=move || busy.get()>"Changer"</button></div>
+                </form>
+            </Show>
+        </section>
+    }
+}
+
+/// Double authentification : le TOTP (interrupteur) et les passkeys partagent un groupe et un message.
+#[component]
+fn Security() -> impl IntoView {
+    let st = status();
+    view! {
+        <section>
+            <h2 class="group-title">"Double authentification"</h2>
+            <div class="group">
+                <Totp st/>
+                <Passkeys st/>
+            </div>
+            {show_status(st)}
         </section>
     }
 }
 
 #[component]
-fn Totp() -> impl IntoView {
+fn Totp(st: Status) -> impl IntoView {
     let session = Session::get();
     let setup = RwSignal::new(None::<TotpSetup>);
+    // Some(true) : l'utilisateur veut activer ; Some(false) : désactiver ; None : rien en cours.
+    let intent = RwSignal::new(None::<bool>);
+    let busy = RwSignal::new(false);
     let proof = Proof::new();
     let code = RwSignal::new(String::new());
-    let st = status();
 
     let set_enabled = move |on: bool| {
         session.me.update(|m| {
@@ -177,10 +194,28 @@ fn Totp() -> impl IntoView {
             }
         })
     };
+    let reset = move || {
+        let _ = proof.take();
+        code.set(String::new());
+        setup.set(None);
+        intent.set(None);
+    };
+    let toggle = move |ev| {
+        let on = event_target_checked(&ev);
+        let now = session.me.with_untracked(|m| m.as_ref().is_some_and(|m| m.totp_enabled));
+        st.set(None);
+        setup.set(None);
+        intent.set((on != now).then_some(on));
+    };
 
-    // Étape 1 : mot de passe → graine et QR code.
+    // Étape 1 : mot de passe → graine et QR code. Un seul envoi à la fois : deux graines
+    // en vol, et le QR affiché pourrait ne pas être celle que le serveur retient.
     let start = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
         let body = proof.take();
         spawn_local(async move {
             match api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &body).await {
@@ -188,86 +223,126 @@ fn Totp() -> impl IntoView {
                     setup.set(Some(s));
                     st.set(None);
                 }
-                Err(e) => st.set(Some(Err(e.to_string()))),
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
             }
+            busy.set(false);
         });
     };
     // Étape 2 : premier code de l'appli → activation.
-    let confirm = move |ev: SubmitEvent| {
+    let confirm_code = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
         let body = TotpConfirm { code: code.get_untracked() };
         code.set(String::new());
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/confirm", Some(&body)).await {
                 Ok(()) => {
                     set_enabled(true);
-                    setup.set(None);
+                    reset();
                     st.set(Some(Ok("TOTP activé.".into())));
                 }
-                Err(e) => st.set(Some(Err(e.to_string()))),
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
             }
+            busy.set(false);
         });
     };
     let disable = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
         let body = proof.take();
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/disable", Some(&body)).await {
                 Ok(()) => {
                     set_enabled(false);
+                    reset();
                     st.set(Some(Ok("TOTP désactivé.".into())));
                 }
-                Err(e) => st.set(Some(Err(e.to_string()))),
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
             }
+            busy.set(false);
         });
     };
 
     view! {
-        <section class="card">
-            <h2>"Double authentification (TOTP)"</h2>
-            {move || if totp_enabled() {
-                view! {
-                    <p>"Activée."</p>
-                    <form on:submit=disable class="stack">
-                        {proof.view("Mot de passe")}
-                        <button type="submit" class="secondary">"Désactiver"</button>
-                    </form>
-                }.into_any()
-            } else if let Some(s) = setup.get() {
-                view! {
-                    <p>"Scanne ce QR code avec ton appli d'authentification, puis saisis le code affiché."</p>
-                    <div class="qr" inner_html=s.qr_svg></div>
-                    <p class="muted mono">{s.secret_base32}</p>
-                    <form on:submit=confirm class="row">
-                        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required
+        <label class="line">
+            <span class="pastille green">{icon(LOCK)}</span>
+            <span class="line-label grow">"Code TOTP"</span>
+            <span class="switch">
+                <input type="checkbox" role="switch" disabled=move || busy.get()
+                    prop:checked=move || intent.get().unwrap_or_else(totp_enabled) on:change=toggle/>
+                <span class="track"></span>
+            </span>
+        </label>
+        {move || match (intent.get(), totp_enabled(), setup.get()) {
+            (Some(true), false, None) => view! {
+                <form on:submit=start>
+                    {proof.password_line("Mot de passe")}
+                    <div class="line end">
+                        <button type="button" class="secondary" on:click=move |_| reset()>"Annuler"</button>
+                        <button type="submit" disabled=move || busy.get()>"Configurer"</button>
+                    </div>
+                </form>
+            }.into_any(),
+            (Some(true), false, Some(s)) => view! {
+                <form on:submit=confirm_code>
+                    <div class="line col qr-line">
+                        <div class="qr" inner_html=s.qr_svg></div>
+                        <span class="val">{s.secret_base32}</span>
+                    </div>
+                    <label class="line">
+                        <span class="line-label">"Code de l'appli"</span>
+                        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" required
                             prop:value=move || code.get() on:input=move |ev| code.set(event_target_value(&ev))/>
-                        <button type="submit">"Activer"</button>
-                    </form>
-                }.into_any()
-            } else {
-                view! {
-                    <p>"Non activée."</p>
-                    <form on:submit=start class="stack">
-                        {proof.view("Mot de passe")}
-                        <button type="submit">"Configurer"</button>
-                    </form>
-                }.into_any()
-            }}
-            {show_status(st)}
-        </section>
+                    </label>
+                    <div class="line end">
+                        <button type="button" class="secondary" on:click=move |_| { st.set(None); reset(); intent.set(Some(true)); }>"Recommencer"</button>
+                        <button type="submit" disabled=move || busy.get()>"Activer"</button>
+                    </div>
+                </form>
+            }.into_any(),
+            (Some(false), true, _) => view! {
+                <form on:submit=disable>
+                    {proof.password_line("Mot de passe")}
+                    {proof.totp_line()}
+                    <div class="line end">
+                        <button type="button" class="secondary" on:click=move |_| reset()>"Annuler"</button>
+                        <button type="submit" class="danger" disabled=move || busy.get()>"Désactiver"</button>
+                    </div>
+                </form>
+            }.into_any(),
+            _ => ().into_any(),
+        }}
     }
 }
 
 #[component]
-fn Passkeys() -> impl IntoView {
+fn Passkeys(st: Status) -> impl IntoView {
+    let session = Session::get();
     let list = RwSignal::new(Vec::<PasskeyInfo>::new());
     let name = RwSignal::new(String::new());
+    let adding = RwSignal::new(false);
+    let busy = RwSignal::new(false);
     let proof = Proof::new();
-    let st = status();
     let reload = move || {
         spawn_local(async move {
-            if let Ok(l) = api::get("/api/account/passkeys").await {
-                list.set(l);
+            match api::get("/api/account/passkeys").await {
+                Ok(l) => list.set(l),
+                Err(e) => session.handle(&e),
             }
         })
     };
@@ -275,6 +350,10 @@ fn Passkeys() -> impl IntoView {
 
     let add = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
         let n = name.get_untracked();
         let body = proof.take();
         spawn_local(async move {
@@ -282,42 +361,223 @@ fn Passkeys() -> impl IntoView {
                 Ok(()) => {
                     st.set(Some(Ok("Passkey ajoutée.".into())));
                     name.set(String::new());
+                    adding.set(false);
                     reload();
                 }
-                Err(e) => st.set(Some(Err(e.to_string()))),
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
             }
+            busy.set(false);
         });
     };
-    let remove = move |id: i64| {
+    let remove = move |id: i64, label: String| {
+        if !confirm(&format!("Supprimer la passkey « {label} » ?")) {
+            return;
+        }
         spawn_local(async move {
             match api::send_empty::<()>("DELETE", &format!("/api/account/passkeys/{id}"), None).await {
                 Ok(()) => reload(),
-                Err(e) => st.set(Some(Err(e.to_string()))),
+                Err(e) => {
+                    session.handle(&e);
+                    st.set(Some(Err(e.to_string())));
+                }
             }
         });
     };
 
     view! {
-        <section class="card">
-            <h2>"Passkeys"</h2>
-            <p class="muted">"Connexion par empreinte, visage ou clé de sécurité, sans mot de passe."</p>
-            <ul class="list">
-                <For each=move || list.get() key=|p| p.id let(p)>
-                    <li class="row spread">
-                        <span>{p.name.clone()} <span class="muted">" · " {p.created_at.get(..10).unwrap_or_default().to_owned()}</span></span>
-                        <button class="link danger" on:click=move |_| remove(p.id)>"Supprimer"</button>
-                    </li>
-                </For>
-            </ul>
-            <form on:submit=add class="stack">
-                <label>"Nom"
-                    <input type="text" placeholder="ex. Téléphone" maxlength="64"
+        <For each=move || list.get() key=|p| p.id let(p)>
+            {
+                let label = p.name.clone();
+                let aria = format!("Supprimer la passkey {}", p.name);
+                view! {
+                    <div class="line">
+                        <span class="pastille gray">{icon(KEY)}</span>
+                        <span class="line-label grow">{p.name.clone()}
+                            <span class="sub">{p.created_at.get(..10).unwrap_or_default().to_owned()}</span></span>
+                        <button type="button" class="iconbtn ghost danger" aria-label=aria title="Supprimer"
+                            on:click=move |_| remove(p.id, label.clone())>{icon(glyph::TRASH)}</button>
+                    </div>
+                }
+            }
+        </For>
+        <button type="button" class="line" aria-expanded=move || adding.get().to_string()
+            on:click=move |_| { adding.update(|a| *a = !*a); st.set(None); }>
+            <span class="pick">{icon(glyph::PLUS)}</span>
+            "Ajouter une passkey"
+        </button>
+        <Show when=move || adding.get()>
+            <form on:submit=add>
+                <label class="line">
+                    <span class="line-label">"Nom"</span>
+                    <input type="text" placeholder="Téléphone" maxlength="64"
                         prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev))/>
                 </label>
-                {proof.view("Mot de passe")}
-                <button type="submit">"Ajouter une passkey"</button>
+                {proof.password_line("Mot de passe")}
+                {proof.totp_line()}
+                <div class="line end">
+                    <button type="button" class="secondary" on:click=move |_| { let _ = proof.take(); adding.set(false); }>"Annuler"</button>
+                    <button type="submit" disabled=move || busy.get()>"Ajouter"</button>
+                </div>
             </form>
-            {show_status(st)}
+        </Show>
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum Load {
+    Pending,
+    Failed(String),
+    Ready,
+}
+
+fn theme_label(t: &str) -> &str {
+    match t {
+        "sombre" => "Sombre",
+        "clair" => "Clair",
+        "solarise" => "Solarisé",
+        "dracula" => "Dracula",
+        "nord" => "Nord",
+        "alerte" => "Alerte",
+        other => other,
+    }
+}
+
+/// Thème par défaut du terminal SSH (un hôte peut avoir le sien) et combinaisons de la barre de touches.
+#[component]
+fn Terminal() -> impl IntoView {
+    let session = Session::get();
+    let theme = RwSignal::new(String::new());
+    let combos = RwSignal::new(Vec::<String>::new());
+    let draft = RwSignal::new(String::new());
+    let combo_err = RwSignal::new(None::<String>);
+    let load = RwSignal::new(Load::Pending);
+    let busy = RwSignal::new(false);
+    let st = status();
+
+    // Le formulaire reste fermé tant que les préférences ne sont pas là : sinon la réponse
+    // écraserait la saisie, ou un envoi partirait avec un thème vide.
+    let fetch = move || {
+        load.set(Load::Pending);
+        spawn_local(async move {
+            match api::get::<TerminalPrefs>("/api/account/terminal").await {
+                Ok(p) => {
+                    theme.set(p.theme);
+                    combos.set(p.combos);
+                    load.set(Load::Ready);
+                }
+                Err(e) => {
+                    session.handle(&e);
+                    load.set(Load::Failed(e.to_string()));
+                }
+            }
+        });
+    };
+    fetch();
+    let locked = move || load.get() != Load::Ready;
+
+    // Ajoute la combinaison saisie ; faux si elle est refusée (message affiché).
+    let add = move || -> bool {
+        let c = draft.get_untracked().trim().to_owned();
+        if c.is_empty() {
+            return true;
+        }
+        if Combo::parse(&c).is_none() {
+            combo_err.set(Some(format!(
+                "« {c} » n'est pas une combinaison valide : Ctrl+C, Alt+B ou Ctrl+Alt+D."
+            )));
+            return false;
+        }
+        if !combos.with_untracked(|v| v.contains(&c)) {
+            if combos.with_untracked(Vec::len) >= MAX_COMBOS {
+                combo_err.set(Some(format!("{MAX_COMBOS} combinaisons au plus.")));
+                return false;
+            }
+            combos.update(|v| v.push(c));
+        }
+        draft.set(String::new());
+        combo_err.set(None);
+        true
+    };
+    let submit = move |ev: SubmitEvent| {
+        ev.prevent_default();
+        if busy.get_untracked() || locked() || !add() {
+            return;
+        }
+        busy.set(true);
+        let body = TerminalPrefs { theme: theme.get_untracked(), combos: combos.get_untracked() };
+        spawn_local(async move {
+            let r = api::send::<_, TerminalPrefs>("PUT", "/api/account/terminal", &body).await;
+            if let Err(e) = &r {
+                session.handle(e);
+            }
+            st.set(Some(
+                r.map(|_| "Préférences du terminal enregistrées.".into()).map_err(|e| e.to_string()),
+            ));
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <section>
+            <h2 class="group-title">"Terminal"</h2>
+            {move || match load.get() {
+                Load::Failed(m) => Some(view! {
+                    <div class="banner error" role="alert">
+                        <span>{crate::sentence(&m)}</span>
+                        <button type="button" on:click=move |_| fetch()>"Réessayer"</button>
+                    </div>
+                }),
+                _ => None,
+            }}
+            <form on:submit=submit aria-busy=move || (load.get() == Load::Pending).to_string()>
+                <div class="group">
+                    <fieldset>
+                        <legend>"Thème par défaut"</legend>
+                        <div class="themes">
+                            {TERMINAL_THEMES.iter().map(|t| {
+                                let t: &'static str = t;
+                                view! {
+                                    <label class="theme">
+                                        <input type="radio" name="theme" value=t disabled=locked
+                                            prop:checked=move || theme.get() == t
+                                            on:change=move |_| theme.set(t.to_owned())/>
+                                        <span class=format!("prev t-{t}") aria-hidden="true">"$ ls"<br/><b>"srv/"</b>" app.js"</span>
+                                        <span class="nm">{theme_label(t)}</span>
+                                    </label>
+                                }
+                            }).collect_view()}
+                        </div>
+                    </fieldset>
+                    <fieldset>
+                        <legend>"Barre de touches"</legend>
+                        <div class="tags">
+                            <For each=move || combos.get() key=|c| c.clone() let(c)>
+                                {
+                                    let label = c.clone();
+                                    let aria = format!("Retirer {c}");
+                                    view! {
+                                        <span class="tag">{c}
+                                            <button type="button" aria-label=aria title="Retirer" disabled=locked
+                                                on:click=move |_| combos.update(|v| v.retain(|x| *x != label))>{icon(CROSS)}</button>
+                                        </span>
+                                    }
+                                }
+                            </For>
+                            <label class="sr-only" for="combo-new">"Nouvelle combinaison"</label>
+                            <input id="combo-new" type="text" placeholder="Ctrl+…" disabled=locked autocomplete="off" autocapitalize="off"
+                                prop:value=move || draft.get()
+                                on:input=move |ev| draft.set(event_target_value(&ev))
+                                on:keydown=move |ev| if ev.key() == "Enter" { ev.prevent_default(); add(); }/>
+                        </div>
+                        {move || combo_err.get().map(|m| view! { <p class="alert" role="alert">{m}</p> })}
+                    </fieldset>
+                </div>
+                {show_status(st)}
+                <div class="actions"><button type="submit" disabled=move || locked() || busy.get()>"Enregistrer"</button></div>
+            </form>
         </section>
     }
 }

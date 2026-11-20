@@ -2,7 +2,11 @@
 //! `/api/connections/{id}/ssh`. Sur écran tactile, une barre de touches (Échap, Tab, Ctrl et Alt
 //! collants, flèches, combinaisons du compte) se tient juste au-dessus du clavier virtuel.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use js_sys::{Promise, Reflect, Uint8Array};
 use leptos::{html::Div, prelude::*, task::spawn_local};
@@ -144,8 +148,15 @@ struct Live {
     term: Terminal,
     fit: FitAddon,
     ws: RefCell<Option<WebSocket>>,
+    /// Dernière taille connue du serveur (celle de l'URL d'ouverture, puis des `Resize` envoyés).
     size: RefCell<(u16, u16)>,
-    closures: RefCell<Vec<JsValue>>,
+    /// Gestionnaires du terminal (saisie) : libérés avec lui.
+    closures: RefCell<Vec<Box<dyn Any>>>,
+    /// Gestionnaires du WebSocket courant : remplacés à chaque reconnexion.
+    ws_closures: RefCell<Vec<Box<dyn Any>>>,
+    /// Écouteur `resize`/`scroll` de la fenêtre et de la VisualViewport, à retirer au nettoyage.
+    on_view: RefCell<Option<Closure<dyn FnMut()>>>,
+    disposed: Cell<bool>,
 }
 
 impl Live {
@@ -159,17 +170,22 @@ impl Live {
 
     /// Ajuste le terminal à son cadre et prévient le serveur si la taille change.
     fn refit(&self) {
+        if self.disposed.get() {
+            return;
+        }
         self.fit.fit();
         let size = (self.term.cols(), self.term.rows());
-        if *self.size.borrow() != size {
-            *self.size.borrow_mut() = size;
-            if let (Some(ws), Ok(msg)) = (
+        // La taille n'est mémorisée qu'une fois envoyée : un changement pendant la connexion
+        // part à `Ready`.
+        if *self.size.borrow() != size
+            && let (Some(ws), Ok(msg)) = (
                 self.ws.borrow().as_ref(),
                 serde_json::to_string(&SshControl::Resize { cols: size.0, rows: size.1 }),
-            ) && ws.ready_state() == WebSocket::OPEN
-            {
-                let _ = ws.send_with_str(&msg);
-            }
+            )
+            && ws.ready_state() == WebSocket::OPEN
+            && ws.send_with_str(&msg).is_ok()
+        {
+            *self.size.borrow_mut() = size;
         }
     }
 
@@ -179,7 +195,31 @@ impl Live {
             ws.set_onclose(None);
             let _ = ws.close();
         }
+        self.ws_closures.borrow_mut().clear();
     }
+
+    /// Fin de vie : socket, écouteurs de la fenêtre, terminal et gestionnaires.
+    fn dispose(&self) {
+        self.disposed.set(true);
+        self.close();
+        if let Some(cb) = self.on_view.borrow_mut().take() {
+            let f = cb.as_ref().unchecked_ref();
+            let w = window();
+            let _ = w.remove_event_listener_with_callback("resize", f);
+            if let Some(vv) = w.visual_viewport() {
+                let _ = vv.remove_event_listener_with_callback("resize", f);
+                let _ = vv.remove_event_listener_with_callback("scroll", f);
+            }
+        }
+        self.term.dispose();
+        self.closures.borrow_mut().clear();
+    }
+}
+
+/// Icônes propres au terminal (le reste vient de `crate::glyph`).
+mod glyphs {
+    pub const BACK: &str = r#"<path d="M15 5l-7 7 7 7"/>"#;
+    pub const KEYBOARD: &str = r#"<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7 14h10"/>"#;
 }
 
 fn ws_url(id: i64, (cols, rows): (u16, u16), trust: Option<&(i64, String)>) -> String {
@@ -248,6 +288,16 @@ pub fn SshPage() -> impl IntoView {
                     Ok(SshMessage::Ready { name, theme, combos: c }) => {
                         host_name.set(name);
                         if let Ok(t) = js_sys::JSON::parse(theme_json(&theme)) {
+                            // Le cadre autour du terminal prend le fond du thème : pas de liseré sombre.
+                            let bg = Reflect::get(&t, &"background".into()).ok().and_then(|v| v.as_string());
+                            let frame = Reflect::get(lm.term.as_ref(), &"element".into())
+                                .ok()
+                                .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
+                                .and_then(|e| e.parent_element())
+                                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+                            if let (Some(bg), Some(frame)) = (bg, frame) {
+                                let _ = frame.style().set_property("background", &bg);
+                            }
                             let _ = Reflect::set(&lm.term.options(), &"theme".into(), &t);
                         }
                         combos.set(c);
@@ -274,14 +324,21 @@ pub fn SshPage() -> impl IntoView {
         });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
-        l.closures.borrow_mut().extend([onmessage.into_js_value(), onclose.into_js_value()]);
+        l.ws_closures.borrow_mut().extend([Box::new(onmessage) as Box<dyn Any>, Box::new(onclose)]);
         *l.ws.borrow_mut() = Some(ws);
     };
 
-    Effect::new(move |_| {
-        let Some(el) = term_ref.get() else { return };
+    // Faux dès que la page est quittée : la tâche d'initialisation ne doit plus rien créer.
+    let alive = StoredValue::new(true);
+    let init = move || {
+        let Some(el) = term_ref.get_untracked() else { return };
+        status.set(Status::Loading("Chargement du terminal…".into()));
         spawn_local(async move {
-            if let Err(e) = load_xterm().await {
+            let loaded = load_xterm().await;
+            if alive.try_get_value() != Some(true) {
+                return;
+            }
+            if let Err(e) = loaded {
                 status.set(Status::Closed(e));
                 return;
             }
@@ -303,6 +360,9 @@ pub fn SshPage() -> impl IntoView {
                 ws: RefCell::new(None),
                 size: RefCell::new((80, 24)),
                 closures: RefCell::new(Vec::new()),
+                ws_closures: RefCell::new(Vec::new()),
+                on_view: RefCell::new(None),
+                disposed: Cell::new(false),
             });
             l.fit.fit();
             let ld = l.clone();
@@ -315,7 +375,7 @@ pub fn SshPage() -> impl IntoView {
                 }
             });
             l.term.on_data(on_data.as_ref().unchecked_ref());
-            l.closures.borrow_mut().push(on_data.into_js_value());
+            l.closures.borrow_mut().push(Box::new(on_data));
             // Taille : fenêtre redimensionnée, rotation, clavier virtuel qui s'ouvre ou se ferme.
             let lr = l.clone();
             let on_view = Closure::<dyn FnMut()>::new(move || {
@@ -333,16 +393,29 @@ pub fn SshPage() -> impl IntoView {
                 let _ = vv.add_event_listener_with_callback("scroll", on_view.as_ref().unchecked_ref());
                 frame.set(Some((vv.height(), vv.offset_top())));
             }
-            l.closures.borrow_mut().push(on_view.into_js_value());
+            *l.on_view.borrow_mut() = Some(on_view);
             live.set_value(Some(l));
             connect(None);
         });
+    };
+    Effect::new(move |_| {
+        if term_ref.get().is_some() {
+            init();
+        }
     });
+    // « Reconnecter » : sans terminal (chargement de xterm en échec), c'est l'initialisation qu'on relance.
+    let reconnect = move || {
+        if live.get_value().is_some() {
+            connect(None);
+        } else {
+            init();
+        }
+    };
 
     on_cleanup(move || {
+        alive.set_value(false);
         if let Some(l) = live.get_value() {
-            l.close();
-            l.term.dispose();
+            l.dispose();
         }
     });
 
@@ -353,16 +426,19 @@ pub fn SshPage() -> impl IntoView {
         }
     };
     // Bouton de la barre : pointerdown sans défaut, pour garder le focus (et le clavier virtuel).
-    let key = move |label: &'static str, bytes: &'static [u8]| {
+    // L'action part sur `click` (clavier et lecteurs d'écran compris), une seule fois.
+    let key = move |label: &'static str, name: &'static str, bytes: &'static [u8]| {
         view! {
-            <button class="key" on:pointerdown=move |e| { e.prevent_default(); send(bytes.to_vec()); }>{label}</button>
+            <button class="key" aria-label=name
+                on:pointerdown=|e| e.prevent_default()
+                on:click=move |_| send(bytes.to_vec())>{label}</button>
         }
     };
     let sticky = move |label: &'static str, flag: RwSignal<bool>| {
         view! {
-            <button class="key" class:on=move || flag.get()
-                on:pointerdown=move |e| {
-                    e.prevent_default();
+            <button class="key" class:on=move || flag.get() aria-pressed=move || flag.get().to_string()
+                on:pointerdown=|e| e.prevent_default()
+                on:click=move |_| {
                     flag.update(|f| *f = !*f);
                     if let Some(l) = live.get_value() { l.term.focus(); }
                 }>{label}</button>
@@ -374,29 +450,34 @@ pub fn SshPage() -> impl IntoView {
             style:height=move || frame.get().map(|(h, _)| format!("{h}px"))
             style:top=move || frame.get().map(|(_, t)| format!("{t}px"))>
             <div class="ssh-top">
-                <a href="/" class="ssh-back" title="Retour aux connexions" aria-label="Retour aux connexions">"←"</a>
+                <a href="/" class="ssh-back" title="Retour aux connexions" aria-label="Retour aux connexions">{crate::icon(glyphs::BACK)}</a>
                 <span class="ssh-name">{move || host_name.get()}</span>
-                <button class="ssh-toggle" title="Afficher ou masquer la barre de touches" aria-label="Barre de touches" on:click=move |_| {
+                <button class="ssh-toggle" title="Afficher ou masquer la barre de touches" aria-label="Barre de touches" aria-pressed=move || show_bar.get().to_string() on:click=move |_| {
                     show_bar.update(|s| *s = !*s);
-                    let cb = Closure::once_into_js(move || if let Some(l) = live.get_value() { l.refit() });
+                    let cb = Closure::once_into_js(move || {
+                        if let Some(Some(l)) = live.try_get_value() {
+                            l.refit()
+                        }
+                    });
                     let _ = window().request_animation_frame(cb.unchecked_ref());
-                }>"⌨"</button>
+                }>{crate::icon(glyphs::KEYBOARD)}</button>
             </div>
             <div class="ssh-term" node_ref=term_ref></div>
             <Show when=move || show_bar.get()>
                 <div class="keybar">
-                    {key("Échap", b"\x1b")}
-                    {key("Tab", b"\t")}
+                    {key("Échap", "Échap", b"\x1b")}
+                    {key("Tab", "Tabulation", b"\t")}
                     {sticky("Ctrl", ctrl)}
                     {sticky("Alt", alt)}
-                    {key("←", b"\x1b[D")}
-                    {key("↑", b"\x1b[A")}
-                    {key("↓", b"\x1b[B")}
-                    {key("→", b"\x1b[C")}
+                    {key("←", "Flèche gauche", b"\x1b[D")}
+                    {key("↑", "Flèche haut", b"\x1b[A")}
+                    {key("↓", "Flèche bas", b"\x1b[B")}
+                    {key("→", "Flèche droite", b"\x1b[C")}
                     {move || combos.get().into_iter().filter_map(|c| {
                         let bytes = Combo::parse(&c)?.bytes();
                         Some(view! {
-                            <button class="key combo" on:pointerdown=move |e| { e.prevent_default(); send(bytes.clone()); }>{c}</button>
+                            <button class="key combo" on:pointerdown=|e| e.prevent_default()
+                                on:click=move |_| send(bytes.clone())>{c}</button>
                         })
                     }).collect_view()}
                 </div>
@@ -414,7 +495,7 @@ pub fn SshPage() -> impl IntoView {
                     <div class="session-overlay">
                         <p class="error" role="alert">{crate::sentence(&reason)}</p>
                         <div class="row">
-                            <button on:click=move |_| connect(None)>"Reconnecter"</button>
+                            <button on:click=move |_| reconnect()>"Reconnecter"</button>
                             <a href="/" class="button secondary">"Retour"</a>
                         </div>
                     </div>
@@ -424,10 +505,11 @@ pub fn SshPage() -> impl IntoView {
                     Some(view! {
                         <div class="session-overlay">
                             <h2>"Nouvelle clé d'hôte"</h2>
-                            <p>{format!("« {name} » présente une clé SSH jamais vue. Compare-la avec celle de la machine (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) :")}</p>
+                            <p>{format!("« {name} » présente une clé SSH jamais vue. Compare son empreinte avec celle de la machine :")}</p>
                             <p class="mono">{fingerprint}</p>
+                            <p class="mono">"ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"</p>
                             {if can_approve {
-                                view! { <button on:click=move |_| connect(Some((connection_id, fp.clone())))>"Elle est identique : approuver"</button> }.into_any()
+                                view! { <button on:click=move |_| connect(Some((connection_id, fp.clone())))>"Approuver"</button> }.into_any()
                             } else {
                                 view! { <p class="muted">"Seul un admin peut approuver cette clé."</p> }.into_any()
                             }}

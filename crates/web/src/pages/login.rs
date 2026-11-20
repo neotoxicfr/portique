@@ -21,6 +21,9 @@ pub fn Login() -> impl IntoView {
                 need_totp.set(true);
                 error.set(None);
             }
+            Err(api::Error::Unauthorized) if need_totp.get_untracked() => {
+                error.set(Some("code incorrect".into()))
+            }
             Err(api::Error::Unauthorized) => error.set(Some("identifiant ou mot de passe incorrect".into())),
             Err(e) => error.set(Some(e.to_string())),
         }
@@ -47,34 +50,53 @@ pub fn Login() -> impl IntoView {
         spawn_local(async move { done(api::passkey_login(&name).await) });
     };
 
+    // Retour au choix du compte : le défi TOTP et les secrets saisis sont effacés.
+    let change_account = move |_| {
+        need_totp.set(false);
+        password.set(String::new());
+        totp.set(String::new());
+        error.set(None);
+    };
+
     view! {
         <main class="center">
-            <form class="card login" on:submit=submit>
+            <form class="login" on:submit=submit>
                 <img class="login-icon" src="/icon.svg" alt=""/>
                 <h1>"Portique"</h1>
-                <label>"Identifiant"
-                    <input type="text" autocomplete="username webauthn" required
-                        prop:value=move || username.get()
-                        on:input=move |ev| username.set(event_target_value(&ev))/>
-                </label>
-                <Show when=move || !need_totp.get()>
-                    <label>"Mot de passe"
-                        <input type="password" autocomplete="current-password"
-                            prop:value=move || password.get()
-                            on:input=move |ev| password.set(event_target_value(&ev))/>
+                <div class="group">
+                    <label class="line">
+                        <span class="line-label">"Identifiant"</span>
+                        <input type="text" autocomplete="username webauthn" required
+                            readonly=move || need_totp.get()
+                            prop:value=move || username.get()
+                            on:input=move |ev| username.set(event_target_value(&ev))/>
                     </label>
-                </Show>
-                <Show when=move || need_totp.get()>
-                    <label>"Code à 6 chiffres"
-                        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus
-                            prop:value=move || totp.get()
-                            on:input=move |ev| totp.set(event_target_value(&ev))/>
-                    </label>
-                </Show>
-                {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-                <button type="submit" disabled=move || busy.get()>"Se connecter"</button>
-                <Show when=move || !need_totp.get()>
-                    <button type="button" class="secondary" disabled=move || busy.get() on:click=passkey>
+                    <Show when=move || !need_totp.get()>
+                        <label class="line">
+                            <span class="line-label">"Mot de passe"</span>
+                            <input type="password" autocomplete="current-password"
+                                prop:value=move || password.get()
+                                on:input=move |ev| password.set(event_target_value(&ev))/>
+                        </label>
+                    </Show>
+                    <Show when=move || need_totp.get()>
+                        <label class="line">
+                            <span class="line-label">"Code à 6 chiffres"</span>
+                            <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" autofocus
+                                prop:value=move || totp.get()
+                                on:input=move |ev| totp.set(event_target_value(&ev))/>
+                        </label>
+                    </Show>
+                </div>
+                {move || error.get().map(|e| view! { <p class="alert" role="alert">{crate::sentence(&e)}</p> })}
+                <button type="submit" class="block" disabled=move || busy.get()>"Se connecter"</button>
+                <Show
+                    when=move || !need_totp.get()
+                    fallback=move || view! {
+                        <button type="button" class="secondary block" on:click=change_account>"Changer de compte"</button>
+                    }
+                >
+                    <button type="button" class="secondary block" disabled=move || busy.get() on:click=passkey>
                         "Utiliser une passkey"
                     </button>
                 </Show>

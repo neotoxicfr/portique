@@ -47,6 +47,32 @@ pub fn sentence(s: &str) -> String {
     out
 }
 
+/// Icône en ligne (trait 2, bouts ronds, couleur du texte : voir `.ico` dans style.css).
+/// `d` : éléments SVG de la grille 24x24.
+pub fn icon(d: &'static str) -> impl IntoView {
+    view! { <svg class="ico" viewBox="0 0 24 24" aria-hidden="true" inner_html=d></svg> }
+}
+
+/// Glyphes partagés par les pages (certains ne servent qu'aux pages de compte, d'admin et de terminal).
+#[allow(dead_code)]
+pub mod glyph {
+    pub const HOUSE: &str = r#"<path d="M4 20V9l8-5 8 5v11"/><path d="M9 20v-6h6v6"/>"#;
+    pub const SCREEN: &str =
+        r#"<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>"#;
+    pub const TERMINAL: &str = r#"<path d="M5 8l4 4-4 4M12 16h7"/>"#;
+    pub const POWER: &str = r#"<path d="M12 3v9"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/>"#;
+    pub const LOGOUT: &str = r#"<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>"#;
+    pub const SEARCH: &str = r#"<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>"#;
+    pub const WARN: &str = r#"<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>"#;
+    pub const SHIELD: &str = r#"<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>"#;
+    pub const PERSON: &str = r#"<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>"#;
+    pub const TRASH: &str = r#"<path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13M9 7V4h6v3"/>"#;
+    pub const PLUS: &str = r#"<path d="M12 5v14M5 12h14"/>"#;
+    pub const COPY: &str =
+        r#"<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>"#;
+    pub const CHEVRON: &str = r#"<path d="M9 5l7 7-7 7"/>"#;
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     // PWA : appli installable (le service worker ne met jamais l'API ni la session en cache).
@@ -65,21 +91,49 @@ fn App() -> impl IntoView {
     let session =
         Session { info: RwSignal::new(None), me: RwSignal::new(None), checked: RwSignal::new(false) };
     provide_context(session);
-    spawn_local(async move {
-        if let Ok(info) = api::get::<ServerInfo>("/api/info").await {
-            session.info.set(Some(info));
-        }
-        session.me.set(api::get::<Me>("/api/me").await.ok());
-        session.checked.set(true);
-    });
+    // Panne réseau ou serveur (hors 401) : on le dit et on propose de réessayer.
+    let failure = RwSignal::new(None::<String>);
+    let load = move || {
+        failure.set(None);
+        spawn_local(async move {
+            if let Ok(info) = api::get::<ServerInfo>("/api/info").await {
+                session.info.set(Some(info));
+            }
+            match api::get::<Me>("/api/me").await {
+                Ok(me) => {
+                    session.me.set(Some(me));
+                    session.checked.set(true);
+                }
+                Err(api::Error::Unauthorized) => {
+                    session.me.set(None);
+                    session.checked.set(true);
+                }
+                Err(e) => failure.set(Some(e.to_string())),
+            }
+        });
+    };
+    load();
 
     view! {
         <Router>
-            <Show when=move || session.checked.get() fallback=|| view! { <main class="center muted">"Chargement…"</main> }>
+            <Show
+                when=move || session.checked.get()
+                fallback=move || view! {
+                    <main class="center">
+                        {move || match failure.get() {
+                            Some(m) => view! {
+                                <p class="alert" role="alert">{sentence(&m)}</p>
+                                <button on:click=move |_| load()>"Réessayer"</button>
+                            }.into_any(),
+                            None => view! { <div class="spinner" role="status"><span class="sr-only">"Chargement"</span></div> }.into_any(),
+                        }}
+                    </main>
+                }
+            >
                 <Show
                     when=move || session.me.with(Option::is_some)
                     fallback=move || if session.is_proxy() {
-                        view! { <main class="center"><p>"Accès refusé : passe par le proxy d'authentification."</p></main> }.into_any()
+                        view! { <main class="center"><p class="alert" role="alert">"Accès refusé : passe par le proxy d'authentification."</p></main> }.into_any()
                     } else {
                         view! { <pages::login::Login/> }.into_any()
                     }
@@ -101,29 +155,47 @@ fn App() -> impl IntoView {
 fn Shell(children: Children) -> impl IntoView {
     let session = Session::get();
     let is_admin = move || session.me.with(|m| m.as_ref().is_some_and(|m| m.is_admin));
-    let logout = move |_| {
+    // Échec de déconnexion : la session reste ouverte côté serveur, on le dit et on laisse réessayer.
+    let logout_error = RwSignal::new(None::<String>);
+    let logout = move || {
+        logout_error.set(None);
         spawn_local(async move {
-            let _ = api::send_empty::<()>("POST", "/api/auth/logout", None).await;
-            session.me.set(None);
+            match api::send_empty::<()>("POST", "/api/auth/logout", None).await {
+                Ok(()) | Err(api::Error::Unauthorized) => session.me.set(None),
+                Err(e) => logout_error.set(Some(e.to_string())),
+            }
         });
     };
     view! {
         <header class="topbar">
-            <A href="/" attr:class="brand">"Portique"</A>
-            <nav>
-                <A href="/">"Connexions"</A>
-                <A href="/compte">"Compte"</A>
-                <Show when=is_admin><A href="/admin">"Admin"</A></Show>
-                <Show when=move || !session.is_proxy()>
-                    <button class="link" on:click=logout>"Déconnexion"</button>
-                </Show>
+            <A href="/" attr:class="brand">
+                <span class="pastille blue">{icon(glyph::HOUSE)}</span>
+                "Portique"
+            </A>
+            <nav class="seg" aria-label="Navigation">
+                <A href="/" exact=true>{icon(glyph::SCREEN)}<span>"Connexions"</span></A>
+                <Show when=is_admin><A href="/admin">{icon(glyph::SHIELD)}<span>"Admin"</span></A></Show>
+                <A href="/compte">{icon(glyph::PERSON)}<span>"Compte"</span></A>
             </nav>
+            <Show when=move || !session.is_proxy()>
+                <button class="iconbtn" aria-label="Déconnexion" title="Déconnexion" on:click=move |_| logout()>
+                    {icon(glyph::LOGOUT)}
+                </button>
+            </Show>
         </header>
-        <main>{children()}</main>
+        <main>
+            {move || logout_error.get().map(|m| view! {
+                <div class="banner error" role="alert">
+                    <span>{sentence(&m)}</span>
+                    <button on:click=move |_| logout()>"Réessayer"</button>
+                </div>
+            })}
+            {children()}
+        </main>
         <footer class="footer">
             // Lien volontairement discret vers les réglages Windows (étape 7).
             // rel="external" : page statique, le routeur ne doit pas intercepter le lien.
-            <a href="/setup/" rel="external" class="muted">"Préparer un PC"</a>
+            <a href="/setup/" rel="external">"Préparer un PC"</a>
         </footer>
     }
 }

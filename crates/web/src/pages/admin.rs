@@ -100,7 +100,6 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
             username: name.get_untracked(),
             password: Some(pw.get_untracked()),
             is_admin: admin.get_untracked(),
-            reset_2fa: false,
         };
         spawn_local(async move {
             match api::send_empty("POST", "/api/admin/users", Some(&body)).await {
@@ -125,27 +124,13 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
             }
         });
     };
-    // Le serveur réécrit le rôle à chaque modification : on le relit juste avant, pour qu'une
-    // liste périmée ne rende pas ses droits à un compte dont un autre admin vient de les retirer.
     let reset_2fa = move |u: UserAdmin| {
         if !confirm(&format!("Supprimer TOTP et passkeys de {} ?", u.username)) {
             return;
         }
         spawn_local(async move {
-            let current = match api::get::<Vec<UserAdmin>>("/api/admin/users").await {
-                Ok(l) => l.into_iter().find(|x| x.id == u.id),
-                Err(e) => {
-                    err.set(Some(e.to_string()));
-                    return;
-                }
-            };
-            let Some(cur) = current else {
-                reload();
-                return;
-            };
-            let body =
-                UserInput { username: cur.username, password: None, is_admin: cur.is_admin, reset_2fa: true };
-            match api::send_empty("PUT", &format!("/api/admin/users/{}", u.id), Some(&body)).await {
+            let url = format!("/api/admin/users/{}/reset-2fa", u.id);
+            match api::send_empty::<()>("POST", &url, None).await {
                 Ok(()) => reload(),
                 Err(e) => err.set(Some(e.to_string())),
             }
@@ -210,7 +195,7 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
                                 {editable.then(|| view! {
                                     <button type="button" class="iconbtn ghost" aria-label=toggle_label.clone() title=toggle_label
                                         on:click=move |_| act("PUT", &u_toggle, Some(UserInput {
-                                            username: u_toggle.username.clone(), password: None, is_admin: !u_toggle.is_admin, reset_2fa: false,
+                                            username: u_toggle.username.clone(), password: None, is_admin: !u_toggle.is_admin,
                                         }))>{icon(STAR)}</button>
                                 })}
                                 {(!u.external && has_2fa).then(|| view! {

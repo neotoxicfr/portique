@@ -17,6 +17,9 @@ pub struct Session {
     pub me: RwSignal<Option<Me>>,
     /// Vrai une fois le premier `/api/me` revenu (succès ou 401).
     pub checked: RwSignal<bool>,
+    /// Échec de déconnexion : gardé ici et non dans `Shell`, recréé à chaque page, pour qu'une réponse
+    /// arrivée après un changement de page reste affichée.
+    pub logout_error: RwSignal<Option<String>>,
 }
 
 impl Session {
@@ -45,6 +48,17 @@ pub fn sentence(s: &str) -> String {
         out.push('.');
     }
     out
+}
+
+/// `fut`, ou `None` s'il n'aboutit pas en `ms` millisecondes.
+pub async fn within<F: std::future::Future>(ms: i32, fut: F) -> Option<F::Output> {
+    let timer = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+        let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    }));
+    match futures::future::select(std::pin::pin!(fut), timer).await {
+        futures::future::Either::Left((v, _)) => Some(v),
+        futures::future::Either::Right(_) => None,
+    }
 }
 
 /// Icône en ligne (trait 2, bouts ronds, couleur du texte : voir `.ico` dans style.css).
@@ -88,27 +102,44 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
-    let session =
-        Session { info: RwSignal::new(None), me: RwSignal::new(None), checked: RwSignal::new(false) };
+    let session = Session {
+        info: RwSignal::new(None),
+        me: RwSignal::new(None),
+        checked: RwSignal::new(false),
+        logout_error: RwSignal::new(None),
+    };
     provide_context(session);
-    // Panne réseau ou serveur (hors 401) : on le dit et on propose de réessayer.
+    // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion).
+    Effect::new(move || {
+        if session.me.with(Option::is_none) {
+            session.logout_error.set(None);
+        }
+    });
+    // Panne réseau ou serveur (hors 401) : on le dit et on propose de réessayer. Une requête qui ne revient
+    // pas ne doit pas laisser l'écran de chargement sans bouton.
     let failure = RwSignal::new(None::<String>);
     let load = move || {
         failure.set(None);
         spawn_local(async move {
-            if let Ok(info) = api::get::<ServerInfo>("/api/info").await {
-                session.info.set(Some(info));
-            }
-            match api::get::<Me>("/api/me").await {
-                Ok(me) => {
+            let check = async {
+                if session.info.with_untracked(Option::is_none)
+                    && let Ok(info) = api::get::<ServerInfo>("/api/info").await
+                {
+                    session.info.set(Some(info));
+                }
+                api::get::<Me>("/api/me").await
+            };
+            match within(15_000, check).await {
+                Some(Ok(me)) => {
                     session.me.set(Some(me));
                     session.checked.set(true);
                 }
-                Err(api::Error::Unauthorized) => {
+                Some(Err(api::Error::Unauthorized)) => {
                     session.me.set(None);
                     session.checked.set(true);
                 }
-                Err(e) => failure.set(Some(e.to_string())),
+                Some(Err(e)) => failure.set(Some(e.to_string())),
+                None => failure.set(Some("le serveur ne répond pas".into())),
             }
         });
     };
@@ -156,7 +187,7 @@ fn Shell(children: Children) -> impl IntoView {
     let session = Session::get();
     let is_admin = move || session.me.with(|m| m.as_ref().is_some_and(|m| m.is_admin));
     // Échec de déconnexion : la session reste ouverte côté serveur, on le dit et on laisse réessayer.
-    let logout_error = RwSignal::new(None::<String>);
+    let logout_error = session.logout_error;
     let logout = move || {
         logout_error.set(None);
         spawn_local(async move {

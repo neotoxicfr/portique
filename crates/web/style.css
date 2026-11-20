@@ -71,6 +71,7 @@
   --kb-special: #adb1bb;
   --kb-text: #000000;
   --kb-shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+  /* Aussi en sombre : texte blanc 15 px, #0a84ff n'y donnerait que 3,6:1 (4,7:1 ici). */
   --kb-on: #0071e3;
   --sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 70%);
   --font: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
@@ -112,7 +113,6 @@
     --kb-special: #47474a;
     --kb-text: #ffffff;
     --kb-shadow: 0 1px 0 rgba(0, 0, 0, 0.5);
-    --kb-on: #0a84ff;
   }
 }
 
@@ -134,7 +134,7 @@ body {
 
 main {
   width: 100%; max-width: 960px; margin: 0 auto; flex: 1;
-  padding: 24px max(24px, env(safe-area-inset-left)) 40px max(24px, env(safe-area-inset-right));
+  padding: 24px max(24px, env(safe-area-inset-right)) 40px max(24px, env(safe-area-inset-left));
 }
 main.center { display: grid; place-items: center; align-content: center; gap: 16px; text-align: center; }
 h1 { font-size: 28px; line-height: 1.15; letter-spacing: -0.5px; margin: 0 0 20px; }
@@ -155,6 +155,16 @@ a { color: var(--link); text-decoration: none; }
   outline: none; box-shadow: 0 0 0 3px var(--focus);
 }
 .line:focus-within { box-shadow: none; }
+/* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
+@media (forced-colors: active) {
+  :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+  .theme input:checked ~ .prev { outline: 2px solid CanvasText; outline-offset: 2px; }
+  .switch input:focus-visible + .track,
+  .theme input:focus-visible ~ .prev { outline: 3px solid Highlight; outline-offset: 2px; }
+  .switch .track { border: 1px solid CanvasText; }
+  .switch .track::after { forced-color-adjust: none; background: CanvasText; }
+  .session-overlay :is(button, a.button):focus-visible { outline-offset: -3px; }
+}
 
 /* Icônes en ligne. */
 .ico { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
@@ -362,7 +372,7 @@ td.cell-actions { text-align: right; }
 
 /* ---------- Téléphone : onglets en bas ---------- */
 @media (max-width: 640px) {
-  main { padding: 8px max(16px, env(safe-area-inset-left)) 24px max(16px, env(safe-area-inset-right)); }
+  main { padding: 8px max(16px, env(safe-area-inset-right)) 24px max(16px, env(safe-area-inset-left)); }
   h1 { font-size: 24px; }
   /* Sans flou ici : un parent à backdrop-filter devient le repère des position:fixed, et la barre d'onglets
      se collerait sous l'en-tête au lieu du bas de l'écran. */
@@ -433,9 +443,13 @@ td.cell-actions { text-align: right; }
 .session-actions button { background: rgba(255, 255, 255, 0.16); color: #ffffff; min-height: 44px; padding: 0 16px; font-size: 14px; }
 .session-actions button.secondary { background: rgba(255, 69, 58, 0.9); }
 
-/* Fenêtre d'alerte façon iOS : la matière est l'overlay lui-même, l'ombre étalée assombrit le reste. */
+/* Fenêtre d'alerte façon iOS : la matière est l'overlay lui-même, l'ombre étalée assombrit le reste.
+   L'ombre ne reçoit pas les clics : un voile transparent plein cadre les arrête (poignée du menu, barre). */
+.session:has(> .session-overlay)::after, .ssh:has(> .session-overlay)::after {
+  content: ""; position: absolute; inset: 0; z-index: 3;
+}
 .session-overlay {
-  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3;
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 4;
   width: min(290px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow-y: auto;
   display: flex; flex-direction: column; align-items: center; text-align: center;
   padding: 20px 16px 0; border-radius: 14px; color: var(--text);
@@ -478,7 +492,8 @@ td.cell-actions { text-align: right; }
   content: ">_"; flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px;
   background: var(--sheen), var(--green); color: #ffffff; font: 700 10px/1 var(--mono);
 }
-.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; }
+/* isolation : les z-index internes de xterm (ascenseur, règle) restent sous l'alerte et son voile. */
+.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; isolation: isolate; }
 
 /* Barre de touches façon clavier iOS : 8 touches sur la 1re rangée, combinaisons en dessous. */
 .keybar {

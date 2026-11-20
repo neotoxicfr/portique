@@ -1221,7 +1221,7 @@ impl Engine {
             return true;
         }
         let t0 = js_sys::Date::now();
-        let mark = self.inner.borrow().clip_announces.mark();
+        let mark = self.inner.borrow_mut().clip_announces.mark();
         let items = clip::read_local().await;
         web_sys::console::debug_1(
             &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),

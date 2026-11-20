@@ -159,7 +159,8 @@ const ANNOUNCE_TTL_MS: f64 = 2000.0;
 #[derive(Clone, Copy)]
 pub struct Mark {
     remote_copies: u32,
-    published: u32,
+    /// Numéro de départ de la lecture : la plus récente commencée l'emporte, quel que soit l'ordre de fin.
+    seq: u64,
 }
 
 /// Suite à donner à une lecture locale terminée (`Announces::after_read`).
@@ -180,8 +181,10 @@ pub struct Announces {
     pending: VecDeque<Announce>,
     /// Copies faites sur le PC : une lecture locale commencée avant la dernière est dépassée.
     remote_copies: u32,
-    /// Contenus locaux publiés : une lecture commencée avant le dernier est dépassée aussi.
-    published: u32,
+    /// Lectures locales commencées (numéros de départ).
+    started: u64,
+    /// Numéro de départ de la dernière lecture publiée : une lecture commencée avant elle est dépassée.
+    published_seq: u64,
 }
 
 impl Announces {
@@ -212,8 +215,9 @@ impl Announces {
     }
 
     /// À relever avant une lecture locale, pour `after_read`.
-    pub fn mark(&self) -> Mark {
-        Mark { remote_copies: self.remote_copies, published: self.published }
+    pub fn mark(&mut self) -> Mark {
+        self.started += 1;
+        Mark { remote_copies: self.remote_copies, seq: self.started }
     }
 
     /// Lecture locale commencée à `mark`, d'empreinte `fp` ; `common` : empreinte commune.
@@ -224,9 +228,10 @@ impl Announces {
         if self.remote_copies != mark.remote_copies {
             return AfterRead::Done;
         }
-        // Une lecture commencée après celle-ci a déjà publié : ce contenu-ci est plus ancien. On
-        // attend plutôt l'accusé de la publication récente, si elle est encore en vol.
-        if self.published != mark.published {
+        // Une lecture commencée APRÈS celle-ci a déjà publié : ce contenu-ci est plus ancien. On
+        // attend plutôt l'accusé de la publication récente, si elle est encore en vol. Une lecture
+        // plus ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci.
+        if self.published_seq > mark.seq {
             return if self.pending.is_empty() { AfterRead::Done } else { AfterRead::Join };
         }
         match self.latest() {
@@ -234,7 +239,7 @@ impl Announces {
             Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
             None if common == Some(fp) => AfterRead::Done,
             _ => {
-                self.published = self.published.wrapping_add(1);
+                self.published_seq = mark.seq;
                 AfterRead::Publish
             }
         }
@@ -550,13 +555,16 @@ mod tests {
     fn local_reads_overtaken_are_dropped() {
         let mut a = Announces::default();
         // Rien en vol, contenu commun identique : rien à faire ; différent : publié.
-        assert_eq!(a.after_read(a.mark(), 1, Some(1), 0.0), AfterRead::Done);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 1, Some(1), 0.0), AfterRead::Done);
         let m = a.mark();
         assert_eq!(a.after_read(m, 2, Some(1), 0.0), AfterRead::Publish);
         a.sent(Some(2), 0.0, None);
         // Même contenu encore en vol : on rejoint son accusé ; au-delà du délai : réannoncé.
-        assert_eq!(a.after_read(a.mark(), 2, Some(1), 100.0), AfterRead::Join);
-        assert_eq!(a.after_read(a.mark(), 2, Some(1), 2100.0), AfterRead::Publish);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 2, Some(1), 100.0), AfterRead::Join);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 2, Some(1), 2100.0), AfterRead::Publish);
         // Lecture A (retour du focus) commencée, puis lecture B (Ctrl+V) qui publie avant elle.
         let ma = a.mark();
         let mb = a.mark();
@@ -573,6 +581,14 @@ mod tests {
         // Sans publication intermédiaire, la lecture se termine normalement.
         let m = a.mark();
         assert_eq!(a.after_read(m, 4, common, 500.0), AfterRead::Publish);
+        a.sent(Some(4), 500.0, None);
+        a.answered(true, &mut common);
+        // Ordre inverse : A (plus ancienne) publie AVANT B ; B, plus récente, publie quand même.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(ma, 6, common, 700.0), AfterRead::Publish);
+        a.sent(Some(6), 700.0, None);
+        assert_eq!(a.after_read(mb, 7, common, 750.0), AfterRead::Publish, "B reste prioritaire");
         // Copie sur le PC pendant la lecture : écartée.
         let m = a.mark();
         a.remote_changed();

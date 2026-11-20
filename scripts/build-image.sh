@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Image multi-architecture ghcr.io/neotoxicfr/portique : amd64 construite ici, arm64 construite en natif
-# sur ARM_HOST (pas d'émulation), puis réunies sous chaque tag demandé. L'hôte arm64 garde son image sous
-# ces tags : une instance qui y tourne s'en sert sans avoir à se connecter au registre.
+# sur ARM_HOST (pas d'émulation), puis réunies sous chaque tag demandé.
 # À lancer SUR l'hôte Docker connecté à ghcr.io (les scripts publish-dev.sh et release.sh le font par SSH) :
 #   ARM_HOST=<hôte ssh arm64> scripts/build-image.sh <version> <tag> [tag…]
 set -euo pipefail
@@ -22,9 +21,7 @@ tar --exclude=./target --exclude=./.audit --exclude=./dist --exclude=./.git --ex
 arm=$!
 docker build -q --build-arg VERSION="$version" -t "$image:$arch_tag-amd64" . >/dev/null
 wait "$arm"
-ssh "$ARM_HOST" "docker save $image:$arch_tag-arm64" | docker load -q >/dev/null
-for tag in "$@"; do ssh "$ARM_HOST" "docker tag $image:$arch_tag-arm64 $image:$tag"; done
-ssh "$ARM_HOST" "docker rmi $image:$arch_tag-arm64 >/dev/null; docker image prune -f >/dev/null"
+ssh "$ARM_HOST" "docker save $image:$arch_tag-arm64 && docker rmi $image:$arch_tag-arm64 >/dev/null" | docker load -q >/dev/null
 
 docker push -q "$image:$arch_tag-amd64"
 docker push -q "$image:$arch_tag-arm64"

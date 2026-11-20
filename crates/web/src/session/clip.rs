@@ -21,15 +21,75 @@ fn js_err(e: JsValue) -> String {
     e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message())).unwrap_or_else(|| format!("{e:?}"))
 }
 
-/// Ordre de préférence des formats demandés au serveur.
+/// Ordre de demande des formats au serveur : une image en PNG, en DIB si le PNG échoue ; sinon
+/// texte et HTML.
 pub fn wanted(formats: &[ClipFormat]) -> Vec<ClipFormat> {
-    if formats.contains(&ClipFormat::Png) {
-        return vec![ClipFormat::Png];
-    }
-    if formats.contains(&ClipFormat::Dib) {
-        return vec![ClipFormat::Dib];
+    let images: Vec<ClipFormat> =
+        [ClipFormat::Png, ClipFormat::Dib].into_iter().filter(|f| formats.contains(f)).collect();
+    if !images.is_empty() {
+        return images;
     }
     [ClipFormat::Text, ClipFormat::Html].into_iter().filter(|f| formats.contains(f)).collect()
+}
+
+/// Récupération du contenu du PC, un format à la fois : cliprdr n'identifie pas les réponses, une
+/// demande partie avant une nouvelle annonce doit être soldée (et sa réponse jetée) avant la suivante.
+#[derive(Default)]
+pub struct Fetch {
+    /// Génération de l'annonce courante du PC.
+    generation: u32,
+    /// Formats encore à demander pour l'annonce courante.
+    wanted: Vec<ClipFormat>,
+    received: Vec<LocalData>,
+    /// Génération de la demande en attente de réponse.
+    in_flight: Option<u32>,
+}
+
+impl Fetch {
+    /// Le PC annonce un nouveau contenu. `request` envoie une demande et dit si elle est partie.
+    /// Renvoie le contenu complet quand il n'y a plus rien à demander.
+    pub fn changed(
+        &mut self,
+        formats: &[ClipFormat],
+        request: impl FnMut(ClipFormat) -> bool,
+    ) -> Option<Vec<LocalData>> {
+        self.generation = self.generation.wrapping_add(1);
+        self.wanted = wanted(formats);
+        self.received.clear();
+        if self.in_flight.is_some() {
+            return None;
+        }
+        self.next(request)
+    }
+
+    /// Réponse à la demande en attente ; celle d'une annonce dépassée est jetée.
+    pub fn received(
+        &mut self,
+        data: Option<LocalData>,
+        request: impl FnMut(ClipFormat) -> bool,
+    ) -> Option<Vec<LocalData>> {
+        let current = self.in_flight.take() == Some(self.generation);
+        if current && let Some(d) = data {
+            // Une image obtenue rend inutile le format de repli.
+            if matches!(d, LocalData::Png(_) | LocalData::Rgba { .. }) {
+                self.wanted.retain(|f| !matches!(f, ClipFormat::Png | ClipFormat::Dib));
+            }
+            self.received.push(d);
+        }
+        self.next(request)
+    }
+
+    fn next(&mut self, mut request: impl FnMut(ClipFormat) -> bool) -> Option<Vec<LocalData>> {
+        while !self.wanted.is_empty() {
+            let f = self.wanted.remove(0);
+            if request(f) {
+                self.in_flight = Some(self.generation);
+                return None;
+            }
+        }
+        let items = std::mem::take(&mut self.received);
+        (!items.is_empty()).then_some(items)
+    }
 }
 
 fn blob(bytes: &[u8], mime: &str) -> Result<Blob, String> {
@@ -92,8 +152,9 @@ async fn image_to_rgba(b: &Blob) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((w, h, data.data().0))
 }
 
-/// Écrit dans le presse-papier local ce que Windows a copié.
-pub async fn write_local(items: &[LocalData]) -> Result<(), String> {
+/// Écrit dans le presse-papier local ce que Windows a copié. `current` est relu juste avant
+/// l'écriture : un contenu dépassé pendant la conversion n'écrase pas le plus récent.
+pub async fn write_local(items: &[LocalData], current: &dyn Fn() -> bool) -> Result<(), String> {
     let cb = clipboard().ok_or("presse-papier indisponible (HTTPS requis)")?;
     let record = Object::new();
     for item in items {
@@ -110,6 +171,9 @@ pub async fn write_local(items: &[LocalData]) -> Result<(), String> {
     let ctor = Reflect::get(&js_sys::global(), &"ClipboardItem".into()).map_err(js_err)?;
     let item =
         Reflect::construct(ctor.unchecked_ref::<js_sys::Function>(), &Array::of1(&record)).map_err(js_err)?;
+    if !current() {
+        return Ok(());
+    }
     JsFuture::from(cb.write(&Array::of1(&item))).await.map_err(js_err)?;
     Ok(())
 }
@@ -163,21 +227,108 @@ pub async fn read_local() -> Option<Vec<LocalData>> {
     Some(out)
 }
 
-/// Empreinte légère du contenu, pour ne pas renvoyer au PC ce qu'il a déjà.
+/// Empreinte du contenu, pour ne pas renvoyer au PC ce qu'il a déjà. Type et longueur de chaque
+/// élément en font partie (« ab » + « c » ≠ « a » + « bc »), et une image compte en entier.
 pub fn fingerprint(items: &[LocalData]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // FNV-1a par mots de 8 octets : une image de plusieurs Mo reste rapide à hacher.
     let mut eat = |b: &[u8]| {
-        for x in b {
+        let (words, rest) = b.as_chunks::<8>();
+        for w in words {
+            h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0x0100_0000_01b3);
+        }
+        for x in rest {
             h = (h ^ *x as u64).wrapping_mul(0x0100_0000_01b3);
         }
     };
     for i in items {
-        match i {
-            LocalData::Text(t) => eat(t.as_bytes()),
-            LocalData::Html(t) => eat(t.as_bytes()),
-            LocalData::Png(p) => eat(p),
-            LocalData::Rgba { rgba, .. } => eat(&rgba[..rgba.len().min(4096)]),
-        }
+        let (tag, body): (u8, &[u8]) = match i {
+            LocalData::Text(t) => (1, t.as_bytes()),
+            LocalData::Html(t) => (2, t.as_bytes()),
+            LocalData::Png(p) => (3, p),
+            LocalData::Rgba { width, height, rgba } => {
+                eat(&[&width.to_le_bytes()[..], &height.to_le_bytes()].concat());
+                (4, rgba)
+            }
+        };
+        eat(&[tag]);
+        eat(&(body.len() as u64).to_le_bytes());
+        eat(body);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_separates_items_and_whole_images() {
+        let t = |s: &str| LocalData::Text(s.into());
+        let html = |s: &str| LocalData::Html(s.into());
+        assert_ne!(fingerprint(&[t("ab"), html("c")]), fingerprint(&[t("a"), html("bc")]));
+        assert_ne!(fingerprint(&[t("ab")]), fingerprint(&[html("ab")]));
+        let img = |last: u8, width: u32, height: u32| {
+            let mut rgba = vec![0u8; 8192];
+            rgba[8191] = last;
+            LocalData::Rgba { width, height, rgba }
+        };
+        assert_ne!(
+            fingerprint(&[img(0, 64, 32)]),
+            fingerprint(&[img(1, 64, 32)]),
+            "écart après 4 096 octets"
+        );
+        assert_ne!(fingerprint(&[img(0, 64, 32)]), fingerprint(&[img(0, 32, 64)]), "dimensions");
+        assert_eq!(fingerprint(&[t("x"), img(7, 64, 32)]), fingerprint(&[t("x"), img(7, 64, 32)]));
+    }
+
+    #[test]
+    fn png_first_dib_only_as_fallback() {
+        use ClipFormat::*;
+        assert_eq!(wanted(&[Text, Dib, Png]), [Png, Dib]);
+        assert_eq!(wanted(&[Text, Html]), [Text, Html]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let req = |x| {
+            asked.borrow_mut().push(x);
+            true
+        };
+        let mut f = Fetch::default();
+        assert!(f.changed(&[Png, Dib], &req).is_none());
+        // PNG refusé par le PC : on demande le DIB.
+        assert!(f.received(None, &req).is_none());
+        let rgba = LocalData::Rgba { width: 1, height: 1, rgba: vec![1, 2, 3, 4] };
+        assert_eq!(f.received(Some(rgba.clone()), &req), Some(vec![rgba]));
+        assert_eq!(*asked.borrow(), [Png, Dib]);
+        // PNG obtenu : le DIB n'est pas demandé.
+        asked.borrow_mut().clear();
+        f.changed(&[Png, Dib], &req);
+        let png = LocalData::Png(vec![0x89]);
+        assert_eq!(f.received(Some(png.clone()), &req), Some(vec![png]));
+        assert_eq!(*asked.borrow(), [Png]);
+    }
+
+    #[test]
+    fn answer_to_superseded_announce_is_dropped() {
+        use ClipFormat::*;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let req = |x| {
+            asked.borrow_mut().push(x);
+            true
+        };
+        let mut f = Fetch::default();
+        assert!(f.changed(&[Text], &req).is_none());
+        // Nouvelle annonce (image) pendant la demande de texte : rien ne part encore.
+        assert!(f.changed(&[Png], &req).is_none());
+        assert_eq!(*asked.borrow(), [Text]);
+        // La réponse texte, dépassée, est jetée ; l'image est demandée.
+        assert!(f.received(Some(LocalData::Text("A".into())), &req).is_none());
+        assert_eq!(*asked.borrow(), [Text, Png]);
+        let png = LocalData::Png(vec![1]);
+        assert_eq!(f.received(Some(png.clone()), &req), Some(vec![png]));
+        // Une demande refusée passe au format suivant.
+        let only_html = |x| x == Html;
+        let html = LocalData::Html("<b>b</b>".into());
+        assert!(f.changed(&[Text, Html], only_html).is_none());
+        assert_eq!(f.received(Some(html.clone()), only_html), Some(vec![html]));
+    }
 }

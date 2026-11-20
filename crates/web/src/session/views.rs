@@ -49,20 +49,16 @@ impl View {
         self.canvas.set_height(rect.h);
     }
 
-    /// Recopie les zones modifiées de la sortie qui tombent dans cette vue.
-    pub fn blit(&self, fb: &[u8], fb_width: u32, damage: &[Rect]) {
+    /// Recopie les zones modifiées de la sortie (`fb`, `fb_width` × `fb_height`) qui tombent dans
+    /// cette vue.
+    pub fn blit(&self, fb: &[u8], fb_width: u32, fb_height: u32, damage: &[Rect]) {
         let v = self.rect;
+        // Tampon plus court qu'annoncé : on ne lit que ses lignes complètes.
+        let fb_height = fb_height.min((fb.len() / (fb_width.max(1) as usize * 4)) as u32);
         for d in damage {
-            let x1 = d.x.max(v.x);
-            let y1 = d.y.max(v.y);
-            let x2 = (d.x + d.w).min(v.x + v.w);
-            let y2 = (d.y + d.h).min(v.y + v.h);
-            if x1 >= x2 || y1 >= y2 {
-                continue;
-            }
-            let (w, h) = (x2 - x1, y2 - y1);
+            let Some(Rect { x: x1, y: y1, w, h }) = blit_area(*d, v, fb_width, fb_height) else { continue };
             let mut tmp = Vec::with_capacity((w * h * 4) as usize);
-            for row in y1..y2 {
+            for row in y1..y1 + h {
                 let o = ((row * fb_width + x1) * 4) as usize;
                 tmp.extend_from_slice(&fb[o..o + (w * 4) as usize]);
             }
@@ -82,6 +78,16 @@ impl View {
             let _ = w.close();
         }
     }
+}
+
+/// Partie de la zone `d` à recopier dans la vue `v`, bornée au tampon courant : une zone d'une
+/// image d'avant un changement de taille peut déborder du nouveau tampon.
+fn blit_area(d: Rect, v: Rect, fb_width: u32, fb_height: u32) -> Option<Rect> {
+    let x1 = d.x.max(v.x);
+    let y1 = d.y.max(v.y);
+    let x2 = d.x.saturating_add(d.w).min(v.x.saturating_add(v.w)).min(fb_width);
+    let y2 = d.y.saturating_add(d.h).min(v.y.saturating_add(v.h)).min(fb_height);
+    (x1 < x2 && y1 < y2).then(|| Rect { x: x1, y: y1, w: x2 - x1, h: y2 - y1 })
 }
 
 fn num(v: &JsValue, key: &str) -> f64 {
@@ -136,6 +142,38 @@ pub fn layout(screens: &[ScreenGeom], primary: usize) -> (Vec<Monitor>, Vec<Rect
     (rel, rects)
 }
 
+/// Limites annoncées par le PC (DISPLAYCONTROL_CAPS_PDU, MS-RDPEDISP 2.2.2.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayCaps {
+    pub max_monitors: u32,
+    /// Surface totale permise (px²) : MaxMonitorAreaFactorA × MaxMonitorAreaFactorB × MaxNumMonitors.
+    pub max_area: u64,
+}
+
+impl DisplayCaps {
+    /// `None` si `pdu` n'est pas une DISPLAYCONTROL_CAPS_PDU complète.
+    pub fn parse(pdu: &[u8]) -> Option<Self> {
+        let u = |i: usize| pdu.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if u(0)? != 5 || (u(4)? as usize) < 20 {
+            return None;
+        }
+        let (n, a, b) = (u(8)?, u(12)?, u(16)?);
+        Some(Self { max_monitors: n, max_area: u64::from(n) * u64::from(a) * u64::from(b) })
+    }
+
+    /// La disposition tient-elle dans les limites du PC ? Sinon, la raison à afficher.
+    pub fn check(&self, monitors: &[Monitor]) -> Result<(), String> {
+        if monitors.len() as u64 > u64::from(self.max_monitors) {
+            return Err(format!("le PC accepte au plus {} écran(s)", self.max_monitors));
+        }
+        let area: u64 = monitors.iter().map(|m| u64::from(m.2) * u64::from(m.3)).sum();
+        if area > self.max_area {
+            return Err("surface des écrans trop grande pour le PC".into());
+        }
+        Ok(())
+    }
+}
+
 /// DISPLAYCONTROL_MONITOR_LAYOUT_PDU (MS-RDPEDISP 2.2.2.2), écran `primary` principal.
 pub fn layout_pdu(monitors: &[Monitor], primary: usize) -> Vec<u8> {
     let mut p = Vec::with_capacity(16 + 40 * monitors.len());
@@ -152,8 +190,9 @@ pub fn layout_pdu(monitors: &[Monitor], primary: usize) -> Vec<u8> {
     p
 }
 
-/// Ouvre une fenêtre plein écran sur `screen` avec un canevas noir (appel dans un geste
-/// utilisateur, sinon le navigateur bloque la fenêtre).
+/// Ouvre une fenêtre plein écran sur `screen` avec un canevas noir. Appel dans un geste
+/// utilisateur, UNE fenêtre par geste : une deuxième ouverture dans le même clic peut être
+/// bloquée (l'activation est consommée par la première). Fermée si sa préparation échoue.
 pub fn open_window(screen: &ScreenGeom, n: usize) -> Result<(Window, HtmlCanvasElement), String> {
     let window = web_sys::window().ok_or("pas de fenêtre")?;
     let features = format!(
@@ -164,6 +203,16 @@ pub fn open_window(screen: &ScreenGeom, n: usize) -> Result<(Window, HtmlCanvasE
         .open_with_url_and_target_and_features("about:blank", &format!("portique-ecran-{n}"), &features)
         .map_err(|e| format!("{e:?}"))?
         .ok_or("fenêtre bloquée par le navigateur (autoriser les fenêtres surgissantes)")?;
+    match fill_window(&w, n) {
+        Ok(canvas) => Ok((w, canvas)),
+        Err(e) => {
+            let _ = w.close();
+            Err(e)
+        }
+    }
+}
+
+fn fill_window(w: &Window, n: usize) -> Result<HtmlCanvasElement, String> {
     let doc = w.document().ok_or("document de la fenêtre indisponible")?;
     doc.set_title(&format!("Portique — écran {}", n + 1));
     let body = doc.body().ok_or("corps de document absent")?;
@@ -185,7 +234,7 @@ pub fn open_window(screen: &ScreenGeom, n: usize) -> Result<(Window, HtmlCanvasE
     }
     canvas.set_tab_index(0);
     body.append_child(&canvas).map_err(|e| format!("{e:?}"))?;
-    Ok((w, canvas))
+    Ok(canvas)
 }
 
 #[cfg(test)]
@@ -207,5 +256,32 @@ mod tests {
         assert_eq!(pdu.len(), 96);
         assert_eq!(&pdu[16..20], &1u32.to_le_bytes(), "principal");
         assert_eq!(&pdu[60..64], &(-1280i32).to_le_bytes());
+    }
+
+    #[test]
+    fn display_caps_limit_layouts() {
+        let le = |v: [u32; 5]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let one = DisplayCaps::parse(&le([5, 20, 1, 3840, 2400])).unwrap();
+        assert_eq!(one, DisplayCaps { max_monitors: 1, max_area: 3840 * 2400 });
+        let two = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        assert!(one.check(&two).is_err(), "deux écrans pour un PC qui n'en accepte qu'un");
+        assert!(one.check(&two[..1]).is_ok());
+        let small = DisplayCaps::parse(&le([5, 20, 2, 1920, 1080])).unwrap();
+        assert!(small.check(&two).is_ok());
+        assert!(small.check(&[(0, 0, 3840, 2160), (3840, 0, 1920, 1080)]).is_err(), "surface");
+        assert_eq!(DisplayCaps::parse(&le([2, 20, 1, 1, 1])), None, "pas une CAPS PDU");
+        assert_eq!(DisplayCaps::parse(&le([5, 20, 1, 1, 1])[..16]), None, "tronquée");
+    }
+
+    #[test]
+    fn blit_area_bounded_by_current_buffer() {
+        let view = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        let d = Rect { x: 100, y: 900, w: 200, h: 100 };
+        assert_eq!(blit_area(d, view, 1920, 1080), Some(d));
+        // Tampon passé à 1280×720 avant la recopie d'une zone de l'image précédente.
+        assert_eq!(blit_area(d, view, 1280, 720), None);
+        let d = Rect { x: 1200, y: 700, w: 200, h: 100 };
+        assert_eq!(blit_area(d, view, 1280, 720), Some(Rect { x: 1200, y: 700, w: 80, h: 20 }));
+        assert_eq!(blit_area(Rect { x: u32::MAX, y: 0, w: 10, h: 10 }, view, 1280, 720), None);
     }
 }

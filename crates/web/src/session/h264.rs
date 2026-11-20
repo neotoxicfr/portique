@@ -53,15 +53,23 @@ fn user_agent() -> String {
     web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default()
 }
 
+/// Désactivation pour la page courante : tient même si `localStorage` est refusé (navigation
+/// privée, quota), qui ne sert qu'à la retenir d'un chargement à l'autre.
+static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Désactive le H.264 pour ce navigateur (cette version).
 pub fn disable(reason: &str) {
     web_sys::console::warn_1(&format!("H.264 désactivé pour ce navigateur : {reason}").into());
+    OFF.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(s) = storage() {
         let _ = s.set_item(OFF_KEY, &user_agent());
     }
 }
 
 fn disabled() -> bool {
+    if OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let Some(s) = storage() else { return false };
     s.get_item(OFF_KEY).ok().flatten().is_some_and(|ua| ua == user_agent())
 }

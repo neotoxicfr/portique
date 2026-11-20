@@ -379,8 +379,19 @@ mod tests {
             .unwrap();
         assert!(second_factor_gate(&s, &user, &jar("sans")).await.is_err(), "mot de passe seul : refusé");
         assert!(second_factor_gate(&s, &user, &jar("avec")).await.is_ok());
+        // Retirer la passkey depuis la session au mot de passe seul rouvrirait l'enrôlement libre.
+        let id: i64 = sqlx::query_scalar("SELECT id FROM passkeys").fetch_one(&s.db).await.unwrap();
+        let delete = |t| {
+            crate::api::account::passkey_delete(
+                axum::extract::State(s.clone()),
+                crate::auth::CurrentUser(user.clone()),
+                jar(t),
+                axum::extract::Path(id),
+            )
+        };
+        assert!(delete("sans").await.is_err(), "suppression au mot de passe seul : refusée");
+        assert!(delete("avec").await.is_ok());
         let mut totp = user.clone();
-        sqlx::query("DELETE FROM passkeys").execute(&s.db).await.unwrap();
         totp.totp_secret = Some(vec![1]);
         assert!(second_factor_gate(&s, &totp, &jar("sans")).await.is_err(), "TOTP actif : refusé aussi");
     }

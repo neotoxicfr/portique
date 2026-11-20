@@ -163,7 +163,7 @@ secours, laisse le reverse proxy basculer (par exemple un service `failover` de 
   certificat du PC épinglé après approbation par un admin.
 - SSH : clé d'hôte de chaque saut approuvée par un admin puis épinglée ; en mode intégré, un terminal ne
   s'ouvre que si la **session** a été ouverte avec un second facteur (TOTP ou passkey). Un compte qui a déjà
-  un facteur n'en ajoute un autre que depuis une telle session. Le premier facteur, lui, s'enrôle avec le
+  un facteur n'en ajoute ni n'en retire un que depuis une telle session. Le premier facteur, lui, s'enrôle avec le
   seul mot de passe : active-le dès la création du compte. Le serveur termine la session SSH et voit donc
   le texte du terminal, sans le conserver.
 - Secrets chiffrés en base (XChaCha20-Poly1305) ; aucun n'est jamais envoyé au navigateur.

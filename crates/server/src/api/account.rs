@@ -20,7 +20,7 @@ use crate::{
     totp,
 };
 
-/// Un compte qui a déjà un second facteur n'en ajoute un autre que depuis une session ouverte avec lui.
+/// Un compte qui a déjà un second facteur n'en ajoute ni n'en retire un que depuis une session ouverte avec lui.
 /// Sinon, un compte à passkey seule (connexion au mot de passe encore possible) se ferait enrôler un
 /// facteur par quiconque a son mot de passe, et le SSH s'ouvrirait.
 pub(crate) async fn second_factor_gate(state: &AppState, u: &UserRow, jar: &CookieJar) -> ApiResult<()> {
@@ -148,12 +148,14 @@ pub async fn totp_disable(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Json(proof): Json<ReAuth>,
 ) -> ApiResult<StatusCode> {
     if u.totp_secret.is_none() {
         return Err(bad("TOTP non activé"));
     }
     reauth(&state, ip, &u, &proof).await?;
+    second_factor_gate(&state, &u, &jar).await?;
     sqlx::query("UPDATE users SET totp_secret = NULL, totp_last = 0 WHERE id = ?")
         .bind(u.id)
         .execute(&state.db)
@@ -197,8 +199,11 @@ pub async fn passkey_register_start(
 pub async fn passkey_register_finish(
     State(state): State<AppState>,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Json(req): Json<CeremonyFinish<RegisterPublicKeyCredential>>,
 ) -> ApiResult<StatusCode> {
+    // Un facteur a pu apparaître depuis le début de la cérémonie.
+    second_factor_gate(&state, &u, &jar).await?;
     let Some(Ceremony::Register { user_id, state: st }) = state.ceremonies.take(req.ceremony) else {
         return Err(bad("défi expiré, recommence"));
     };
@@ -226,8 +231,11 @@ pub async fn passkey_register_finish(
 pub async fn passkey_delete(
     State(state): State<AppState>,
     CurrentUser(u): CurrentUser,
+    jar: CookieJar,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    // Retirer la dernière passkey rendrait le compte « sans facteur », donc libre d'enrôlement.
+    second_factor_gate(&state, &u, &jar).await?;
     let r = sqlx::query("DELETE FROM passkeys WHERE id = ? AND user_id = ?")
         .bind(id)
         .bind(u.id)

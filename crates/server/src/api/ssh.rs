@@ -42,17 +42,21 @@ pub async fn service_key(State(state): State<AppState>, _: AdminUser) -> ApiResu
     Ok(Json(ServiceKey { public: ssh::public_line(&key)? }))
 }
 
-/// La clé du service ouvre toutes les machines : en mode intégré, son usage exige un TOTP ou une
-/// passkey (en mode proxy, c'est au proxy d'exiger la double authentification).
-async fn has_second_factor(state: &AppState, user: &UserRow) -> ApiResult<bool> {
-    if state.cfg.auth_mode == AuthMode::Proxy || user.totp_secret.is_some() {
+/// La clé du service ouvre toutes les machines : en mode intégré, la session doit avoir été ouverte
+/// avec un second facteur (TOTP ou passkey) ; avoir une 2FA enregistrée ne suffit pas (un mot de passe
+/// volé permettrait d'en enregistrer une). En mode proxy, c'est au proxy d'exiger la 2FA.
+async fn session_has_mfa(state: &AppState, user: &UserRow, token: Option<&[u8]>) -> ApiResult<bool> {
+    if state.cfg.auth_mode == AuthMode::Proxy {
         return Ok(true);
     }
-    let passkeys: i64 = sqlx::query_scalar("SELECT count(*) FROM passkeys WHERE user_id = ?")
-        .bind(user.id)
-        .fetch_one(&state.db)
-        .await?;
-    Ok(passkeys > 0)
+    let Some(token) = token else { return Ok(false) };
+    let mfa: Option<bool> =
+        sqlx::query_scalar("SELECT mfa FROM sessions WHERE token_hash = ? AND user_id = ?")
+            .bind(token)
+            .bind(user.id)
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(mfa == Some(true))
 }
 
 pub async fn open(
@@ -71,9 +75,13 @@ pub async fn open(
     if !row.ssh_enabled {
         return Err(bad("pas de SSH sur cet hôte"));
     }
-    if !has_second_factor(&state, &user).await? {
+    let token = axum_extra::extract::CookieJar::from_headers(&headers)
+        .get(crate::auth::SESSION_COOKIE)
+        .map(|c| crate::crypto::token_hash(c.value()));
+    if !session_has_mfa(&state, &user, token.as_deref()).await? {
         return Err(bad(
-            "le SSH exige la double authentification : active un TOTP ou une passkey dans ton compte",
+            "le SSH exige une session ouverte avec la double authentification : active un TOTP ou une passkey, \
+             puis reconnecte-toi avec",
         ));
     }
     let trust = match (q.trust, q.trust_for) {
@@ -83,9 +91,6 @@ pub async fn open(
     };
     let host_theme = row.ssh_theme.clone();
     let hops = chain(&state, row).await?;
-    let token = axum_extra::extract::CookieJar::from_headers(&headers)
-        .get(crate::auth::SESSION_COOKIE)
-        .map(|c| crate::crypto::token_hash(c.value()));
     let size = (q.cols.unwrap_or(80).clamp(10, 500), q.rows.unwrap_or(24).clamp(5, 300));
     Ok(ws
         .max_message_size(1 << 20)
@@ -253,4 +258,58 @@ async fn run(
         seconds = started.elapsed().as_secs(),
         "fin SSH"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_has_mfa;
+    use crate::config::{Config, Env};
+
+    struct V(Vec<(&'static str, &'static str)>);
+    impl Env for V {
+        fn var(&self, k: &str) -> Option<String> {
+            self.0.iter().find(|(a, _)| *a == k).map(|(_, v)| v.to_string())
+        }
+    }
+
+    async fn state(mode: &'static str) -> crate::state::AppState {
+        let mut env = vec![
+            ("PORTIQUE_PUBLIC_URL", "https://portique.example.com"),
+            ("PORTIQUE_MASTER_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="), // gitleaks:allow (octets 0..31, factice)
+            ("PORTIQUE_ADMIN_PASSWORD", "admin-password-123"),
+            ("PORTIQUE_AUTH_MODE", mode),
+        ];
+        if mode == "proxy" {
+            env.push(("PORTIQUE_TRUSTED_PROXIES", "127.0.0.1"));
+        }
+        let db = crate::open_db("sqlite::memory:").await.unwrap();
+        let s = crate::build_state(Config::from_env(&V(env)).unwrap(), db).unwrap();
+        crate::bootstrap_admin(&s).await.unwrap();
+        s
+    }
+
+    /// Le SSH dépend de la façon dont la SESSION a été ouverte, pas de la 2FA enregistrée sur le compte :
+    /// avec un mot de passe volé, on pourrait enregistrer sa propre 2FA dans une session sans second facteur.
+    #[tokio::test]
+    async fn ssh_requires_a_session_opened_with_a_second_factor() {
+        let s = state("builtin").await;
+        let mut user = crate::auth::user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        user.totp_secret = Some(vec![1]); // 2FA enregistrée sur le compte
+        for (token, mfa) in [(b"sans".as_slice(), false), (b"avec".as_slice(), true)] {
+            sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, unixepoch() + 60, ?)")
+                .bind(token)
+                .bind(user.id)
+                .bind(mfa)
+                .execute(&s.db)
+                .await
+                .unwrap();
+        }
+        assert!(!session_has_mfa(&s, &user, Some(b"sans")).await.unwrap(), "mot de passe seul : refusé");
+        assert!(session_has_mfa(&s, &user, Some(b"avec")).await.unwrap());
+        assert!(!session_has_mfa(&s, &user, None).await.unwrap(), "pas de session : refusé");
+        assert!(!session_has_mfa(&s, &user, Some(b"inconnue")).await.unwrap());
+        // Mode proxy : la 2FA est l'affaire du proxy.
+        let p = state("proxy").await;
+        assert!(session_has_mfa(&p, &user, None).await.unwrap());
+    }
 }

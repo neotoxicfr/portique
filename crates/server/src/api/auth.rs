@@ -77,7 +77,8 @@ pub async fn login(
 
     state.limiter.succeeded(ip, name);
     tracing::info!(%ip, user = user.username, "connexion");
-    let jar = auth::open_session(&state, jar, user.id).await?;
+    // Mot de passe + TOTP vérifié ci-dessus : second facteur.
+    let jar = auth::open_session(&state, jar, user.id, user.totp_secret.is_some()).await?;
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))
 }
 
@@ -155,6 +156,6 @@ pub async fn passkey_finish(
 
     state.limiter.succeeded(ip, &user.username);
     tracing::info!(%ip, user = user.username, "connexion par passkey");
-    let jar = auth::open_session(&state, jar, user.id).await?;
+    let jar = auth::open_session(&state, jar, user.id, true).await?;
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))
 }

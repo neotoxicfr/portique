@@ -102,15 +102,21 @@ pub fn validate_username(name: &str) -> Result<(), AppError> {
     if ok { Ok(()) } else { Err(AppError::BadRequest("identifiant invalide".into())) }
 }
 
-/// Ouvre une session et renvoie le cookie à poser.
-pub async fn open_session(state: &AppState, jar: CookieJar, user_id: i64) -> Result<CookieJar, AppError> {
+/// Ouvre une session et renvoie le cookie à poser. `mfa` : ouverte avec un second facteur (TOTP ou passkey).
+pub async fn open_session(
+    state: &AppState,
+    jar: CookieJar,
+    user_id: i64,
+    mfa: bool,
+) -> Result<CookieJar, AppError> {
     let (token, hash) = crypto::new_session_token();
     let expires = OffsetDateTime::now_utc() + time::Duration::days(SESSION_DAYS);
     sqlx::query("DELETE FROM sessions WHERE expires_at < unixepoch()").execute(&state.db).await?;
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, ?, ?)")
         .bind(hash)
         .bind(user_id)
         .bind(expires.unix_timestamp())
+        .bind(mfa)
         .execute(&state.db)
         .await?;
     let cookie = Cookie::build((SESSION_COOKIE, token))

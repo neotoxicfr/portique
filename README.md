@@ -83,9 +83,10 @@ navigateur côté client, ordinateur ou téléphone.
 ### 1. Lancer le conteneur
 
 ```sh
-mkdir -p portique/secrets && cd portique
+mkdir -p portique/secrets portique/data && cd portique
 openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
 printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password
+chmod 400 secrets/* && sudo chown 10001:10001 data secrets/*   # le conteneur tourne sous l'UID 10001
 ```
 
 ```yaml
@@ -109,7 +110,7 @@ secrets:
   admin_password: { file: ./secrets/admin_password }
 ```
 
-Place-le derrière un reverse proxy HTTPS : passkeys, presse-papier et WebCodecs exigent un contexte sécurisé.
+Puis `docker compose up -d`. Place-le derrière un reverse proxy HTTPS : passkeys, presse-papier et WebCodecs exigent un contexte sécurisé.
 Un exemple complet (Traefik, Authelia, conteneur dans le réseau d'un tunnel WireGuard) est dans
 [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml). Pour construire l'image toi-même :
 `docker build -t portique .`
@@ -155,7 +156,8 @@ tu utilises le SSH.
 
 **Haute disponibilité.** Portique ne gère pas plusieurs instances : chacune a sa base. Pour une instance de
 secours, laisse le reverse proxy basculer (par exemple un service `failover` de Traefik, healthcheck sur
-`/api/info`).
+`/api/info`). Rien n'est répliqué : l'instance de secours se prépare à part, avec sa clé maîtresse, ses
+comptes (ou le mode proxy), ses machines et ses approbations de certificats et de clés d'hôte.
 
 ## Sécurité
 
@@ -214,8 +216,9 @@ Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkr
 ```sh
 ./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
 (cd crates/web && trunk build --release --dist ../../dist)
+mkdir -p secrets && [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key  # stable : ./data en dépend
 PORTIQUE_PUBLIC_URL=http://localhost:18431 PORTIQUE_LISTEN=127.0.0.1:18431 PORTIQUE_DATA_DIR=./data \
-PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY=$(openssl rand -base64 32) \
+PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY_FILE=secrets/master_key \
 PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 

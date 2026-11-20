@@ -30,8 +30,9 @@ ssh "$DOCKER_SSH" "cd '$REMOTE_DIR' && ARM_HOST='$ARM_HOST' scripts/build-image.
 ssh "$DOCKER_SSH" "cd '$REMOTE_DIR' && rm -rf release && mkdir release && for a in amd64:x86_64 arm64:aarch64; do
     out=release/portique-$version-\${a#*:}-linux; mkdir -p \$out
     cid=\$(docker create $image:$version-\${a%%:*})
-    docker cp \$cid:/usr/local/bin/portique \$out/portique && docker cp \$cid:/app/web \$out/web; docker rm \$cid >/dev/null
-    cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE \$out/ && tar -C release -czf \$out.tar.gz \${out#release/}
+    docker cp \$cid:/usr/local/bin/portique \$out/portique && docker cp \$cid:/app/web \$out/web; s=\$?
+    docker rm \$cid >/dev/null; [ \$s -eq 0 ] || exit 1
+    cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE \$out/ && tar -C release -czf \$out.tar.gz \${out#release/} || exit 1
   done && (cd release && sha256sum ./*.tar.gz > SHA256SUMS) && chown -R \$(stat -c %u:%g .) release"
 
 git tag -a "v$version" -m "v$version"

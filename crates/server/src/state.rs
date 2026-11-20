@@ -38,14 +38,19 @@ pub struct Ceremonies {
 }
 
 const CEREMONY_TTL: Duration = Duration::from_secs(300);
+/// Plafond des défis en attente : une rafale de démarrages ne fait pas grossir la mémoire sans fin.
+const MAX_CEREMONIES: usize = 1000;
 
 impl Ceremonies {
-    pub fn insert(&self, c: Ceremony) -> Uuid {
+    pub fn insert(&self, c: Ceremony) -> Result<Uuid, AppError> {
         let id = Uuid::new_v4();
         let mut map = self.pending.lock().unwrap();
         map.retain(|_, (t, _)| t.elapsed() < CEREMONY_TTL);
+        if map.len() >= MAX_CEREMONIES {
+            return Err(AppError::TooManyAttempts);
+        }
         map.insert(id, (Instant::now(), c));
-        id
+        Ok(id)
     }
 
     /// Retire la cérémonie : un défi ne sert qu'une fois, même en cas d'échec.

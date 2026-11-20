@@ -88,7 +88,7 @@ pub async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
         "INSERT INTO users (username, password_hash, is_admin, webauthn_id) VALUES ('admin', ?, 1, ?)
          ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash, is_admin = 1",
     )
-    .bind(auth::hash_password(pw)?)
+    .bind(auth::hash_password(pw).await?)
     .bind(uuid::Uuid::new_v4().to_string())
     .execute(&state.db)
     .await?;
@@ -201,7 +201,16 @@ pub fn app(state: AppState) -> Router {
             async move {
                 let mut res = next.run(req).await;
                 res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, value);
-                if let Some(c) = cache {
+                if let Some(mut c) = cache {
+                    // Nom empreinté absent du disque (onglet ancien, déploiement en cours) : la réponse est
+                    // le repli index.html ou une erreur, à ne pas garder un an sous l'URL de l'asset.
+                    let html = res
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+                    if !res.status().is_success() || html {
+                        c = "no-cache";
+                    }
                     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
                 }
                 res

@@ -2,6 +2,7 @@
 //!
 //! Les secrets (mots de passe Windows, graine TOTP) ne sortent jamais du serveur :
 //! aucun type de lecture ne les contient, seuls les types d'écriture les acceptent.
+//! Seule exception : `TotpSetup`, réponse d'enrôlement qui montre la graine une fois.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -83,6 +84,8 @@ pub struct ChangePassword {
     pub new: String,
 }
 
+/// Réponse d'enrôlement TOTP : contient la graine (en clair, dans l'URL et dans le QR code), à traiter
+/// comme un secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotpSetup {
     pub secret_base32: String,
@@ -114,6 +117,9 @@ pub struct ConnectionSummary {
     pub rdp: bool,
     pub ssh: bool,
     pub can_wake: bool,
+    /// Hôte marqué sensible (thème de terminal « alerte ») : l'accueil le signale en rouge.
+    #[serde(default)]
+    pub alert: bool,
 }
 
 /// Hôte vu par l'admin : tout sauf les mots de passe. `port`, `username`, `domain` et
@@ -208,7 +214,7 @@ pub struct WolCommandInput {
 
 /// Création ou modification d'une connexion. `password: None` garde l'ancien,
 /// `Some("")` l'efface.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInput {
     pub name: String,
     pub host: String,
@@ -314,9 +320,12 @@ pub struct Combo {
 impl Combo {
     pub fn parse(s: &str) -> Option<Self> {
         let mut c = Combo { ctrl: false, alt: false, key: ' ' };
-        let mut parts: Vec<&str> = s.split('+').collect();
-        let key = parts.pop()?;
-        for m in parts {
+        // La touche peut être « + » elle-même : « Alt++ ».
+        let (mods, key) = match s.strip_suffix("++") {
+            Some(m) => (m, "+"),
+            None => s.rsplit_once('+')?,
+        };
+        for m in mods.split('+') {
             match m.trim().to_ascii_lowercase().as_str() {
                 "ctrl" if !c.ctrl => c.ctrl = true,
                 "alt" if !c.alt => c.alt = true,
@@ -403,7 +412,10 @@ mod tests {
         assert_eq!(Combo::parse("Alt+b").unwrap().bytes(), [0x1b, b'b']);
         assert_eq!(Combo::parse("Ctrl+Alt+d").unwrap().bytes(), [0x1b, 0x04]);
         assert_eq!(Combo::parse("Ctrl+[").unwrap().bytes(), [0x1b]);
-        for bad in ["C", "Ctrl+", "Ctrl+CC", "Shift+C", "Ctrl+Ctrl+C", "Ctrl+é"] {
+        assert_eq!(Combo::parse("Alt++").unwrap().bytes(), [0x1b, b'+']);
+        assert_eq!(Combo::parse("Ctrl+Alt++").unwrap().bytes(), [0x1b, b'+']);
+        for bad in ["C", "+", "++", "Ctrl+", "Alt+", "Alt+++", "Ctrl+CC", "Shift+C", "Ctrl+Ctrl+C", "Ctrl+é"]
+        {
             assert!(Combo::parse(bad).is_none(), "{bad}");
         }
         assert!(DEFAULT_COMBOS.iter().all(|c| Combo::parse(c).is_some()));

@@ -94,12 +94,14 @@ async fn fail(mut socket: WebSocket, message: String) {
     let _ = socket.close().await;
 }
 
-/// La session web et l'accès à la connexion sont-ils toujours valides ?
+/// La session web, l'accès à la connexion et le protocole du relais (`enabled` : RDP ou SSH, l'autre
+/// pouvant rester actif sur le même hôte) sont-ils toujours valides ?
 pub(crate) async fn still_allowed(
     state: &AppState,
     user_id: i64,
     connection_id: i64,
     token: Option<&[u8]>,
+    enabled: fn(&Row) -> bool,
 ) -> bool {
     let user = match crate::auth::user_by_id(&state.db, user_id).await {
         Ok(Some(u)) => u,
@@ -118,7 +120,7 @@ pub(crate) async fn still_allowed(
             return false;
         }
     }
-    find_allowed(&state.db, user.id, user.is_admin, connection_id).await.is_ok()
+    find_allowed(&state.db, user.id, user.is_admin, connection_id).await.is_ok_and(|r| enabled(&r))
 }
 
 pub(crate) const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -176,13 +178,20 @@ async fn run(
         total_ms = started.elapsed().as_millis() as u64,
         "connexion RDP prête"
     );
-    if stored.is_none() {
-        // Empreinte approuvée par un admin et vérifiée avant CredSSP : on l'épingle.
-        let _ = sqlx::query("UPDATE connections SET cert_sha256 = ? WHERE id = ? AND cert_sha256 IS NULL")
-            .bind(connected.cert_sha256.to_vec())
-            .bind(row.id)
-            .execute(&state.db)
-            .await;
+    // Empreinte approuvée par un admin et vérifiée avant CredSSP : on l'épingle, si la cible n'a pas changé
+    // entre-temps (sinon le certificat de l'ancien PC serait épinglé sur le nouveau).
+    let pinned_now = stored.is_none()
+        && sqlx::query(
+            "UPDATE connections SET cert_sha256 = ? WHERE id = ? AND cert_sha256 IS NULL AND host = ? AND port = ?",
+        )
+        .bind(connected.cert_sha256.to_vec())
+        .bind(row.id)
+        .bind(&row.host)
+        .bind(row.port)
+        .execute(&state.db)
+        .await
+        .is_ok_and(|r| r.rows_affected() == 1);
+    if pinned_now {
         tracing::info!(
             user = user.username,
             connection = row.name,
@@ -209,7 +218,9 @@ async fn run(
             match msg {
                 Message::Binary(b) => {
                     up += b.len() as u64;
-                    if rdp_tx.write_all(&b).await.is_err() {
+                    // TLS : sans flush, la fin d'un message chiffré peut rester en tampon jusqu'à
+                    // l'écriture suivante (une frappe isolée partirait en retard).
+                    if rdp_tx.write_all(&b).await.is_err() || rdp_tx.flush().await.is_err() {
                         break;
                     }
                 }
@@ -239,7 +250,7 @@ async fn run(
         tick.tick().await;
         loop {
             tick.tick().await;
-            if !still_allowed(&state, user.id, row.id, token.as_deref()).await {
+            if !still_allowed(&state, user.id, row.id, token.as_deref(), |r| r.rdp_enabled).await {
                 tracing::info!(user = user.username, connection = row.name, "session révoquée : coupure");
                 break;
             }
@@ -259,4 +270,32 @@ async fn run(
         down_kib = down / 1024,
         "fin de session"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    /// Couper le RDP d'un hôte coupe ses relais RDP ouverts, pas ses terminaux SSH (et inversement).
+    #[tokio::test]
+    async fn watchdog_checks_the_relay_protocol() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let admin = crate::auth::user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let token = crate::crypto::token_hash("jeton");
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, unixepoch() + 60, 1)",
+        )
+        .bind(&token)
+        .bind(admin.id)
+        .execute(&s.db)
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO connections (name, host, port, rdp_enabled, ssh_enabled) VALUES ('H', '192.0.2.10', 3389, 0, 1)
+             RETURNING id",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert!(!super::still_allowed(&s, admin.id, id, Some(&token), |r| r.rdp_enabled).await);
+        assert!(super::still_allowed(&s, admin.id, id, Some(&token), |r| r.ssh_enabled).await);
+    }
 }

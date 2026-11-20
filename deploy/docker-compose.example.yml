@@ -15,7 +15,7 @@ services:
     secrets:
       - master_key
     volumes:
-      - ./data:/data
+      - ./data:/data                     # à créer avant : install -d -o 10001 -g 10001 data (UID de l'image)
     read_only: true
     security_opt:
       - no-new-privileges=true
@@ -28,7 +28,9 @@ services:
 
 secrets:
   master_key:
-    file: ./secrets/master_key           # openssl rand -base64 32 > secrets/master_key ; chmod 600
+    # Compose monte le fichier avec les droits de l'hôte : il doit être lisible par l'UID 10001 de l'image.
+    # openssl rand -base64 32 > secrets/master_key && chmod 400 secrets/master_key && chown 10001 secrets/master_key
+    file: ./secrets/master_key
 
 # Route Traefik (fichier dynamique, le conteneur partageant le réseau de wireguard) :
 # http:

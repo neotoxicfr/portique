@@ -42,33 +42,24 @@ fn local(u: &UserRow) -> ApiResult<()> {
 }
 
 /// Revérifie le mot de passe (et le TOTP s'il est actif) avant une opération sensible.
-/// Les échecs comptent dans la même limitation que la connexion.
+/// Les tentatives comptent dans la même limitation que la connexion.
 async fn reauth(state: &AppState, ip: std::net::IpAddr, u: &UserRow, proof: &ReAuth) -> ApiResult<()> {
     local(u)?;
-    if !state.limiter.allowed(ip, &u.username) {
+    if !state.limiter.reserve(ip, &u.username) {
         return Err(AppError::TooManyAttempts);
     }
-    let ok = u.password_hash.as_deref().is_some_and(|h| auth::verify_password(&proof.password, h));
+    let ok = match u.password_hash.as_deref() {
+        Some(h) => auth::verify_password(&proof.password, h).await,
+        None => false,
+    };
     if !ok {
-        state.limiter.failed(ip, &u.username);
         return Err(bad("mot de passe actuel incorrect"));
     }
     if let Some(sealed) = &u.totp_secret {
-        let secret = state.vault.open(&format!("totp:{}", u.id), sealed)?;
-        let last: i64 = sqlx::query_scalar("SELECT totp_last FROM users WHERE id = ?")
-            .bind(u.id)
-            .fetch_one(&state.db)
-            .await?;
         let code = proof.totp.as_deref().unwrap_or_default();
-        let Some(step) = totp::verify(&secret, &u.username, code, last)? else {
-            state.limiter.failed(ip, &u.username);
+        if !auth::consume_totp(state, u, sealed, code).await? {
             return Err(bad("code TOTP invalide"));
-        };
-        sqlx::query("UPDATE users SET totp_last = ? WHERE id = ?")
-            .bind(step)
-            .bind(u.id)
-            .execute(&state.db)
-            .await?;
+        }
     }
     state.limiter.succeeded(ip, &u.username);
     Ok(())
@@ -83,7 +74,7 @@ pub async fn change_password(
     reauth(&state, ip, &u, &req.auth).await?;
     auth::validate_password(&req.new)?;
     sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-        .bind(auth::hash_password(&req.new)?)
+        .bind(auth::hash_password(&req.new).await?)
         .bind(u.id)
         .execute(&state.db)
         .await?;
@@ -192,7 +183,7 @@ pub async fn passkey_register_start(
         .webauthn
         .start_passkey_registration(user_uuid, &u.username, &u.username, Some(exclude))
         .map_err(|e| anyhow::anyhow!("webauthn : {e}"))?;
-    let ceremony = state.ceremonies.insert(Ceremony::Register { user_id: u.id, state: st });
+    let ceremony = state.ceremonies.insert(Ceremony::Register { user_id: u.id, state: st })?;
     Ok(Json(CeremonyChallenge { ceremony, options }))
 }
 

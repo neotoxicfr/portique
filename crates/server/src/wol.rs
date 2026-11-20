@@ -152,6 +152,11 @@ pub async fn ssh_command(
     result
 }
 
+/// Durée maximale d'une commande de réveil, de l'ouverture du canal à sa fermeture.
+const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Sortie gardée pour y chercher une erreur ; au-delà, la commande n'est pas celle attendue.
+const MAX_OUTPUT: usize = 64 * 1024;
+
 /// Lance la commande de réveil (`template`, `{mac}` remplacé) sur une session SSH déjà authentifiée et
 /// vérifie son résultat. Commune au réveil par adresse saisie et au réveil par un hôte SSH déclaré.
 pub async fn run_wake_command<H: russh::client::Handler>(
@@ -162,26 +167,43 @@ pub async fn run_wake_command<H: russh::client::Handler>(
     use anyhow::Context;
     use russh::ChannelMsg;
 
-    let mut channel = session.channel_open_session().await.context("canal SSH")?;
-    // La MAC est formatée par nous (hexadécimal et « : ») : rien d'injectable.
-    let cmd = template.replace("{mac}", &format_mac(mac));
-    channel.exec(true, cmd.as_bytes()).await.context("commande de réveil")?;
-    let mut output = Vec::new();
-    let mut status = None;
-    while let Some(msg) = tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait())
-        .await
-        .context("réponse de l'hôte")?
-    {
-        match msg {
-            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                output.extend_from_slice(&data)
+    // Échéance absolue (ouverture du canal, exec, sortie) : un hôte qui écrit un peu avant chaque délai
+    // ne garde pas la requête ouverte sans fin.
+    let run = async {
+        let mut channel = session.channel_open_session().await.context("canal SSH")?;
+        // La MAC est formatée par nous (hexadécimal et « : ») : rien d'injectable.
+        let cmd = template.replace("{mac}", &format_mac(mac));
+        channel.exec(true, cmd.as_bytes()).await.context("commande de réveil")?;
+        let mut output = Vec::new();
+        let mut status = None;
+        // Jusqu'à la fermeture du canal : le code de sortie peut arriver après la fin des données (Eof).
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    anyhow::ensure!(
+                        output.len() + data.len() <= MAX_OUTPUT,
+                        "sortie de la commande trop longue (plus de {MAX_OUTPUT} octets) : résultat ignoré"
+                    );
+                    output.extend_from_slice(&data);
+                }
+                ChannelMsg::Failure => anyhow::bail!("l'hôte refuse d'exécuter la commande"),
+                ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                ChannelMsg::ExitSignal { signal_name, .. } => {
+                    anyhow::bail!("la commande a été interrompue (signal {signal_name:?})")
+                }
+                ChannelMsg::Close => break,
+                _ => {}
             }
-            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-            ChannelMsg::Eof | ChannelMsg::Close => break,
-            _ => {}
         }
+        anyhow::Ok((status, String::from_utf8_lossy(&output).trim().to_owned()))
+    };
+    let (status, text) = tokio::time::timeout(WAKE_TIMEOUT, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("résultat du réveil inconnu : l'hôte n'a pas fini à temps"))??;
+    if status.is_none() {
+        // Accepté comme avant (RFC 4254 : « SHOULD ») ; tracé pour vérifier ce que fait l'hôte réel.
+        tracing::warn!("commande de réveil terminée sans code de sortie");
     }
-    let text = String::from_utf8_lossy(&output).trim().to_owned();
     // Code de sortie non nul, ou erreur RouterOS écrite dans la sortie : RouterOS répond 0 même quand
     // la commande échoue.
     let failed = ["failure:", "bad command", "syntax error", "expected end of command"]

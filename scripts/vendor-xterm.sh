@@ -9,7 +9,9 @@ pkgs=(
   "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg=="
   "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g=="
 )
-[[ -s $dest/xterm.js && -s $dest/addon-fit.js && -s $dest/xterm.css ]] && exit 0
+# Cache valable seulement pour ces versions et empreintes (`.pkgs` écrit après une installation complète).
+want_pkgs=$(printf '%s\n' "${pkgs[@]}")
+[[ -s $dest/xterm.js && -s $dest/addon-fit.js && -s $dest/xterm.css && $(cat "$dest/.pkgs" 2>/dev/null) == "$want_pkgs" ]] && exit 0
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 for p in "${pkgs[@]}"; do
@@ -25,4 +27,5 @@ grep -v '^//# sourceMappingURL=' "$tmp/xterm-6.0.0.tgz.d/package/lib/xterm.js" >
 grep -v '^//# sourceMappingURL=' "$tmp/addon-fit-0.11.0.tgz.d/package/lib/addon-fit.js" > "$dest/addon-fit.js"
 cp "$tmp/xterm-6.0.0.tgz.d/package/css/xterm.css" "$dest/xterm.css"
 cp "$tmp/xterm-6.0.0.tgz.d/package/LICENSE" "$dest/LICENSE"
+printf '%s\n' "$want_pkgs" > "$dest/.pkgs"
 echo "xterm.js 6.0.0 + addon-fit 0.11.0 vérifiés dans $dest"

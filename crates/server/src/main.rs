@@ -60,8 +60,12 @@ async fn shutdown() {
 
 async fn healthcheck() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listen: SocketAddr =
-        std::env::var("PORTIQUE_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
+    // Comme `Config::from_env` : une variable vide vaut absente.
+    let listen: SocketAddr = std::env::var("PORTIQUE_LISTEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "0.0.0.0:8080".into())
+        .parse()?;
     let target = SocketAddr::new(
         if listen.ip().is_unspecified() { std::net::Ipv4Addr::LOCALHOST.into() } else { listen.ip() },
         listen.port(),

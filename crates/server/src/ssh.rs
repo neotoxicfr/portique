@@ -12,7 +12,7 @@ use std::{
 use anyhow::Context;
 use rand::Rng;
 use russh::{
-    Channel, client,
+    Channel, ChannelMsg, client,
     keys::{
         HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
         ssh_key::{LineEnding, private::Ed25519Keypair},
@@ -23,6 +23,9 @@ use crate::state::AppState;
 
 /// Rebonds enchaînés au plus (cible comprise).
 pub const MAX_HOPS: usize = 5;
+/// Borne de chaque attente de la chaîne (connexion, authentification, canal, réponses) : russh ne met
+/// aucun délai d'inactivité par défaut, et un hôte qui se tait après l'échange de clés bloquerait
+/// l'ouverture indéfiniment.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEY_SETTING: &str = "ssh_key";
 
@@ -73,10 +76,13 @@ pub struct Hop {
 #[derive(Debug)]
 pub enum OpenError {
     /// Clé d'hôte jamais approuvée : rien n'a été envoyé à ce saut (ni clé ni mot de passe).
+    /// `pinned` : clés des sauts précédents approuvées et vérifiées à cette ouverture, à épingler quand
+    /// même, sinon la reprise redemanderait la leur (rebond et cible inconnus : approbations en boucle).
     Unapproved {
         id: i64,
         name: String,
         fingerprint: String,
+        pinned: Vec<(i64, String)>,
     },
     Failed(anyhow::Error),
 }
@@ -111,6 +117,8 @@ pub struct Opened {
     pub channel: Channel<client::Msg>,
     /// Clés d'hôte approuvées à cette ouverture, à épingler : (hôte, empreinte).
     pub pinned: Vec<(i64, String)>,
+    /// Sortie du shell arrivée avant la réponse à son lancement, à relayer en premier.
+    pub early: Vec<u8>,
 }
 
 /// Chaîne ouverte et authentifiée : les connexions, premier rebond d'abord, cible en dernier.
@@ -131,17 +139,61 @@ pub async fn open(
 ) -> Result<Opened, OpenError> {
     let Chain { sessions, pinned } = connect(hops, key, trust).await?;
     let last = sessions.last().context("aucun hôte")?;
-    let channel = last.channel_open_session().await.context("ouverture du canal SSH")?;
+    let name = hops.last().map(|h| h.name.as_str()).unwrap_or_default();
+    let mut channel = bounded(name, "ouverture du canal", last.channel_open_session()).await?;
+    let mut early = Vec::new();
+    // Terminal et shell avec réponse attendue : un refus doit faire échouer l'ouverture, pas annoncer
+    // un terminal prêt qui ne démarrera jamais.
     channel
-        .request_pty(false, "xterm-256color", u32::from(cols), u32::from(rows), 0, 0, &[])
+        .request_pty(true, "xterm-256color", u32::from(cols), u32::from(rows), 0, 0, &[])
         .await
         .context("demande de terminal")?;
+    reply(&mut channel, name, "terminal", &mut early).await?;
     // Comme le client OpenSSH (SendEnv), annoncer un jeu de caractères UTF-8 : xterm.js parle UTF-8, et un
     // serveur en locale C perdrait les caractères accentués à la saisie. LC_CTYPE seul : la langue des
     // messages reste celle du serveur. Ignoré sans erreur si le serveur ne l'accepte pas (AcceptEnv).
     let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
-    channel.request_shell(false).await.context("lancement du shell")?;
-    Ok(Opened { sessions, channel, pinned })
+    channel.request_shell(true).await.context("lancement du shell")?;
+    reply(&mut channel, name, "shell", &mut early).await?;
+    Ok(Opened { sessions, channel, pinned, early })
+}
+
+/// Attend la réponse à une requête de canal envoyée avec `want_reply`. La sortie reçue entre-temps est
+/// gardée dans `early`.
+async fn reply(
+    channel: &mut Channel<client::Msg>,
+    name: &str,
+    what: &str,
+    early: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let wait = async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => anyhow::bail!("« {name} » refuse le {what}"),
+                Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
+                    early.extend_from_slice(&data)
+                }
+                Some(_) => {}
+                None => anyhow::bail!("« {name} » a fermé le canal (demande de {what})"),
+            }
+        }
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, wait)
+        .await
+        .map_err(|_| anyhow::anyhow!("« {name} » ne répond pas (demande de {what}, délai dépassé)"))?
+}
+
+/// Attente bornée par `CONNECT_TIMEOUT` : dépassée, l'ouverture échoue et les connexions déjà ouvertes
+/// de la chaîne sont fermées en étant abandonnées.
+async fn bounded<T, E>(name: &str, what: &str, f: impl Future<Output = Result<T, E>>) -> anyhow::Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(CONNECT_TIMEOUT, f).await {
+        Ok(r) => r.with_context(|| format!("{what} sur « {name} »")),
+        Err(_) => anyhow::bail!("« {name} » ne répond pas ({what}, délai dépassé)"),
+    }
 }
 
 /// Ouvre et authentifie la chaîne `hops`, saut par saut.
@@ -173,7 +225,7 @@ pub async fn connect(hops: &[Hop], key: &PrivateKey, trust: Option<(i64, &str)>)
                 let got = seen.lock().unwrap().clone();
                 return Err(match (expected, got) {
                     (None, Some(fingerprint)) => {
-                        OpenError::Unapproved { id: hop.id, name: hop.name.clone(), fingerprint }
+                        OpenError::Unapproved { id: hop.id, name: hop.name.clone(), fingerprint, pinned }
                     }
                     (Some(want), Some(got)) if want != got => OpenError::Failed(anyhow::anyhow!(
                         "la clé SSH de « {} » a changé (approuvée {want}, présentée {got})",
@@ -191,16 +243,17 @@ pub async fn connect(hops: &[Hop], key: &PrivateKey, trust: Option<(i64, &str)>)
         {
             pinned.push((hop.id, fp));
         }
-        let mut ok = session
-            .authenticate_publickey(hop.user.as_str(), PrivateKeyWithHashAlg::new(key.clone(), None))
-            .await
-            .context("authentification par clé")?
-            .success();
+        let signer = PrivateKeyWithHashAlg::new(key.clone(), None);
+        let mut ok = bounded(
+            &hop.name,
+            "authentification par clé",
+            session.authenticate_publickey(hop.user.as_str(), signer),
+        )
+        .await?
+        .success();
         if !ok && let Some(pw) = &hop.password {
-            ok = session
-                .authenticate_password(hop.user.as_str(), pw)
-                .await
-                .context("authentification")?
+            ok = bounded(&hop.name, "authentification", session.authenticate_password(hop.user.as_str(), pw))
+                .await?
                 .success();
         }
         if !ok {

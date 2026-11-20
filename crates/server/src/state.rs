@@ -46,8 +46,12 @@ impl Ceremonies {
         let id = Uuid::new_v4();
         let mut map = self.pending.lock().unwrap();
         map.retain(|_, (t, _)| t.elapsed() < CEREMONY_TTL);
-        if map.len() >= MAX_CEREMONIES {
-            return Err(AppError::TooManyAttempts);
+        // Plein : on évince le plus ancien plutôt que de refuser. Refuser laisserait une rafale de démarrages
+        // (sans compte) bloquer les passkeys de tout le monde pendant cinq minutes.
+        if map.len() >= MAX_CEREMONIES
+            && let Some(oldest) = map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k)
+        {
+            map.remove(&oldest);
         }
         map.insert(id, (Instant::now(), c));
         Ok(id)

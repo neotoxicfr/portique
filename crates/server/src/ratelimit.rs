@@ -19,9 +19,24 @@ pub struct LoginLimiter {
     failures: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
+/// Adresse de comptage : une machine IPv6 dispose de tout un /64, on compte donc par /64.
+fn ip_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        v4 => v4.to_string(),
+    }
+}
+
 impl LoginLimiter {
     fn keys(ip: IpAddr, username: &str) -> [(String, usize); 2] {
-        [(format!("{ip}|{}", username.to_lowercase()), MAX_PER_ACCOUNT), (ip.to_string(), MAX_PER_IP)]
+        let ip = ip_key(ip);
+        [(format!("{ip}|{}", username.to_lowercase()), MAX_PER_ACCOUNT), (ip, MAX_PER_IP)]
     }
 
     /// Réserve une tentative : plafonds vérifiés et tentative comptée sous le même verrou, avant tout travail
@@ -49,12 +64,14 @@ impl LoginLimiter {
         allowed
     }
 
-    /// Tentative réussie : compteur du compte effacé, réservation rendue à l'IP.
+    /// Tentative réussie : compteur du compte effacé, réservation rendue à l'IP. Seulement si ce compte
+    /// avait réservé : un succès ne rend jamais à l'IP une place prise par un autre identifiant.
     pub fn succeeded(&self, ip: IpAddr, username: &str) {
         let [(account, _), (ip, _)] = Self::keys(ip, username);
         let mut map = self.failures.lock().unwrap();
-        map.remove(&account);
-        if let Some(v) = map.get_mut(&ip) {
+        if map.remove(&account).is_some_and(|v| !v.is_empty())
+            && let Some(v) = map.get_mut(&ip)
+        {
             v.pop();
         }
     }
@@ -86,6 +103,20 @@ mod tests {
         assert!(l.reserve(ip, "autre"));
         l.succeeded(ip, "alice");
         assert!(l.reserve(ip, "alice"));
+    }
+
+    #[test]
+    fn ipv6_counts_per_64_and_unpaired_success_refunds_nothing() {
+        let l = LoginLimiter::default();
+        for i in 0..MAX_PER_IP {
+            let ip: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+            assert!(l.reserve(ip, &format!("u{i}")));
+        }
+        let other: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        // Une réussite sur un compte qui n'a rien réservé ne rend aucune place au /64.
+        l.succeeded(other, "jamais-vu");
+        assert!(!l.reserve(other, "nouveau"), "même /64 : plafond atteint");
+        assert!(l.reserve("2001:db8:1:3::1".parse().unwrap(), "nouveau"), "autre /64 : libre");
     }
 
     #[test]

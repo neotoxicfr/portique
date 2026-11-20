@@ -240,11 +240,13 @@ async fn run(
             if matches!(msg, Message::Close(_)) {
                 break;
             }
-            kept += match &msg {
-                Message::Binary(b) => b.len(),
-                Message::Text(t) => t.len(),
-                _ => 0,
-            };
+            // Chaque message coûte au moins 64 octets : des messages vides ne font pas grossir la file sans fin.
+            kept += 64
+                + match &msg {
+                    Message::Binary(b) => b.len(),
+                    Message::Text(t) => t.len(),
+                    _ => 0,
+                };
             if kept > MAX_PENDING {
                 return true;
             }

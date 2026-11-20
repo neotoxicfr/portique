@@ -1,8 +1,0 @@
-[package]
-name = "rdp-pdu"
-description = "PDU RDP sans I/O (MS-RDPBCGR) : TPKT, X.224, MCS, GCC"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

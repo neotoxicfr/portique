@@ -1,9 +1,0 @@
-[package]
-name = "rdp-gfx"
-description = "Pipeline graphique EGFX (MS-RDPEGFX) sans I/O : surfaces, cache, codecs, composition"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-rdp-codecs = { path = "../rdp-codecs" }

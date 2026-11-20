@@ -90,7 +90,11 @@ if ($nic) {
       # Sans memo, l'annulation viserait la carte active : on retire l'autorisation.
       $raison = $_.Exception.Message
       powercfg /devicedisablewake $nic.InterfaceDescription 2>$null | Out-Null
-      Write-Host "[!] Reveil : carte $($nic.InterfaceDescription) non memorisee dans le registre ($raison), reveil non autorise."
+      if (Test-Exit 'Reveil (retrait)') {
+        Write-Host "[!] Reveil : carte $($nic.InterfaceDescription) non memorisee dans le registre ($raison), reveil non autorise."
+      } else {
+        Write-Host "[!] Reveil : carte $($nic.InterfaceDescription) non memorisee ($raison) ET autorisation encore active : lancer a la main powercfg /devicedisablewake ""$($nic.InterfaceDescription)""."
+      }
       $echecs += 'Reveil (memo)'
       $memo = $false
     }

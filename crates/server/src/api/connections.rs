@@ -180,6 +180,8 @@ pub async fn wake(
 ) -> ApiResult<StatusCode> {
     let row = find_allowed(&state.db, u.id, u.is_admin, id).await?;
     let mac = row.wol_mac.as_deref().and_then(wol::parse_mac).ok_or_else(|| bad("WoL non configuré"))?;
+    // Pas de double authentification exigée ici, même par l'hôte SSH : la commande est celle de l'admin
+    // et la MAC vient de la base. L'utilisateur ne peut que réveiller sa machine, comme par paquet UDP.
     if let (Some(via), Some(template)) = (row.wol_via_id, row.wol_ssh_command.as_deref()) {
         let result = wake_via(&state, via, template, mac).await;
         return match result {

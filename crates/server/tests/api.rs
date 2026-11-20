@@ -429,6 +429,20 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(r.body["wol_command"]["via_id"], gw_id);
     assert_eq!(r.body["wol_command"]["host"], "");
+    // SSH coupé ensuite sur l'hôte de réveil : le réveil est refusé, pas tenté avec ses identifiants.
+    let r = call(
+        &app,
+        "PUT",
+        &format!("/api/admin/connections/{gw_id}"),
+        Some(&admin),
+        Some(json!({"name": "Passerelle", "host": "10.0.0.2"})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body["error"].as_str().unwrap().contains("n'a pas de SSH"), "{:?}", r.body);
 
     // Clé du service : créée une fois, stable ensuite.
     let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;

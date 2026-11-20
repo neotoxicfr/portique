@@ -1,0 +1,16 @@
+[package]
+name = "rdp-connect"
+description = "Connexion RDP côté serveur Portique : TCP, négociation, TLS épinglé, NLA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rdp-auth = { path = "../rdp-auth" }
+rdp-pdu = { path = "../rdp-pdu" }
+tokio = { version = "1.54", features = ["net", "io-util", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11.1"
+rand = "0.10.3"
+thiserror = "2.0.21"

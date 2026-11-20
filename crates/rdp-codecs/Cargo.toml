@@ -1,0 +1,8 @@
+[package]
+name = "rdp-codecs"
+description = "Décodeurs RDP sans I/O : ZGFX (RDP8 bulk), Planar, ClearCodec, NSCodec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

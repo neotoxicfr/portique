@@ -300,16 +300,26 @@ impl Touch {
         out
     }
 
-    /// Geste interrompu par le système : un bouton enfoncé est relâché, rien n'est cliqué.
+    /// Geste interrompu par le système : un bouton enfoncé est relâché, rien n'est cliqué. Un doigt
+    /// supplémentaire (ignoré par le geste) annulé ne termine pas le geste en cours.
     pub fn cancel(&mut self, id: i32) -> Vec<Action> {
         self.down.retain(|d| *d != id);
+        let ours = match self.state {
+            State::Pending { f, .. } | State::Dragging { f } => f.id == id,
+            State::Two { a, b, .. } => a.id == id || b.id == id,
+            State::Idle | State::Done => false,
+        };
         let out = match self.state {
-            State::Dragging { f } if f.id == id => {
+            State::Dragging { f } if ours => {
                 vec![Action::Button { button: Button::Left, down: false, x: f.x, y: f.y }]
             }
             _ => Vec::new(),
         };
-        self.state = if self.down.is_empty() { State::Idle } else { State::Done };
+        if self.down.is_empty() {
+            self.state = State::Idle;
+        } else if ours {
+            self.state = State::Done;
+        }
         out
     }
 }
@@ -394,6 +404,23 @@ mod tests {
         assert_eq!(t.cancel(1), vec![Action::Button { button: Button::Left, down: false, x: 40.0, y: 10.0 }]);
         t.down(2, 10.0, 10.0);
         assert!(t.cancel(2).is_empty(), "un toucher annulé ne clique pas");
+    }
+
+    #[test]
+    fn cancelled_extra_finger_keeps_drag() {
+        let mut t = touch();
+        t.down(1, 10.0, 10.0);
+        t.moved(1, 40.0, 10.0);
+        t.down(2, 300.0, 300.0);
+        assert!(t.cancel(2).is_empty());
+        assert_eq!(
+            t.up(1, 45.0, 10.0, 0.0),
+            vec![
+                Action::Move { x: 45.0, y: 10.0 },
+                Action::Button { button: Button::Left, down: false, x: 45.0, y: 10.0 },
+            ],
+            "le bouton est relâché par le doigt qui glisse"
+        );
     }
 
     #[test]

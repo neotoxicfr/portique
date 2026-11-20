@@ -43,6 +43,8 @@ pub struct Fetch {
     received: Vec<LocalData>,
     /// Génération de la demande en attente de réponse.
     in_flight: Option<u32>,
+    /// Format de repli (DIB) écarté par un PNG reçu : demandé si le navigateur ne décode pas ce PNG.
+    fallback: Vec<ClipFormat>,
 }
 
 impl Fetch {
@@ -56,6 +58,7 @@ impl Fetch {
         self.generation = self.generation.wrapping_add(1);
         self.wanted = wanted(formats);
         self.received.clear();
+        self.fallback.clear();
         if self.in_flight.is_some() {
             return None;
         }
@@ -70,12 +73,38 @@ impl Fetch {
     ) -> Option<Vec<LocalData>> {
         let current = self.in_flight.take() == Some(self.generation);
         if current && let Some(d) = data {
-            // Une image obtenue rend inutile le format de repli.
+            // Une image obtenue rend inutile le format de repli (gardé de côté pour un PNG).
             if matches!(d, LocalData::Png(_) | LocalData::Rgba { .. }) {
-                self.wanted.retain(|f| !matches!(f, ClipFormat::Png | ClipFormat::Dib));
+                let (images, rest) = std::mem::take(&mut self.wanted)
+                    .into_iter()
+                    .partition(|f| matches!(f, ClipFormat::Png | ClipFormat::Dib));
+                self.wanted = rest;
+                if matches!(d, LocalData::Png(_)) {
+                    self.fallback = images;
+                }
             }
             self.received.push(d);
         }
+        self.next(request)
+    }
+
+    /// Génération de l'annonce courante (à rendre à `png_unusable`).
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Le PNG livré pour l'annonce `generation` ne se décode pas dans le navigateur : demande le
+    /// format de repli si cette annonce est toujours la courante. Renvoie le contenu complet.
+    pub fn png_unusable(
+        &mut self,
+        generation: u32,
+        request: impl FnMut(ClipFormat) -> bool,
+    ) -> Option<Vec<LocalData>> {
+        if generation != self.generation || self.in_flight.is_some() {
+            return None;
+        }
+        self.wanted = std::mem::take(&mut self.fallback);
+        self.received.clear();
         self.next(request)
     }
 
@@ -128,6 +157,20 @@ async fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, St
     });
     let b: Blob = JsFuture::from(promise).await.map_err(js_err)?.unchecked_into();
     blob_bytes(&b).await
+}
+
+/// Le navigateur décode-t-il ce PNG ? Chromium refuse d'écrire une image qu'il ne décode pas, et
+/// `rdp-clip` ne vérifie que la signature.
+pub async fn png_decodes(png: &[u8]) -> bool {
+    let (Ok(b), Some(window)) = (blob(png, "image/png"), web_sys::window()) else { return false };
+    let Ok(p) = window.create_image_bitmap_with_blob(&b) else { return false };
+    match JsFuture::from(p).await {
+        Ok(bmp) => {
+            bmp.unchecked_into::<ImageBitmap>().close();
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Image (PNG ou autre format lisible par le navigateur) → RGBA.
@@ -297,14 +340,29 @@ mod tests {
         // PNG refusé par le PC : on demande le DIB.
         assert!(f.received(None, &req).is_none());
         let rgba = LocalData::Rgba { width: 1, height: 1, rgba: vec![1, 2, 3, 4] };
-        assert_eq!(f.received(Some(rgba.clone()), &req), Some(vec![rgba]));
+        assert_eq!(f.received(Some(rgba.clone()), &req), Some(vec![rgba.clone()]));
         assert_eq!(*asked.borrow(), [Png, Dib]);
         // PNG obtenu : le DIB n'est pas demandé.
         asked.borrow_mut().clear();
         f.changed(&[Png, Dib], &req);
         let png = LocalData::Png(vec![0x89]);
-        assert_eq!(f.received(Some(png.clone()), &req), Some(vec![png]));
+        assert_eq!(f.received(Some(png.clone()), &req), Some(vec![png.clone()]));
         assert_eq!(*asked.borrow(), [Png]);
+        // PNG illisible par le navigateur : le DIB est demandé, une fois, pour l'annonce courante.
+        let g = f.generation();
+        assert!(f.png_unusable(g, &req).is_none());
+        assert_eq!(*asked.borrow(), [Png, Dib]);
+        assert_eq!(f.received(Some(rgba.clone()), &req), Some(vec![rgba]));
+        assert!(f.png_unusable(g, &req).is_none());
+        assert_eq!(*asked.borrow(), [Png, Dib], "repli déjà consommé");
+        // Annonce dépassée : rien n'est demandé.
+        f.changed(&[Png, Dib], &req);
+        f.received(Some(png), &req);
+        f.changed(&[Text], &req);
+        f.received(Some(LocalData::Text("t".into())), &req);
+        asked.borrow_mut().clear();
+        assert!(f.png_unusable(g + 1, &req).is_none());
+        assert!(asked.borrow().is_empty());
     }
 
     #[test]

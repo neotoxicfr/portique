@@ -28,6 +28,14 @@ const RETRY_DELAYS: [u32; 8] = [1, 2, 3, 5, 8, 13, 21, 30];
 /// Icône du bouton de clavier virtuel.
 const KEYBOARD: &str = r#"<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/>"#;
 
+/// Texte collé dans le champ du clavier virtuel quand le navigateur le met dans `dataTransfer`
+/// plutôt que dans `data` (lu par réflexion : pas de feature web-sys `DataTransfer`).
+fn transfer_text(e: &web_sys::InputEvent) -> Option<String> {
+    let dt = js_sys::Reflect::get(e, &"dataTransfer".into()).ok().filter(|v| v.is_object())?;
+    let get: js_sys::Function = js_sys::Reflect::get(&dt, &"getData".into()).ok()?.dyn_into().ok()?;
+    get.call1(&dt, &"text/plain".into()).ok()?.as_string()
+}
+
 /// Délai avant le prochain essai de reconnexion (`attempt` essais déjà faits), `None` pour
 /// s'arrêter.
 fn retry_delay(retry: Retry, attempt: usize) -> Option<u32> {
@@ -212,6 +220,18 @@ pub fn SessionPage() -> impl IntoView {
             }
             return;
         }
+        // Composition en cours dans le champ (IME, accents) : ses touches, Entrée de validation
+        // comprise, restent locales ; seul le texte final part (`compositionend`). Safari envoie
+        // l'Entrée de validation après `compositionend`, `isComposing` faux mais keyCode 229 ; une
+        // vraie Entrée ainsi écartée arrive encore par `beforeinput` (insertLineBreak).
+        if virtual_kbd
+            && (e.is_composing() || (e.key_code() == 229 && (e.key() == "Enter" || e.code() == "Enter")))
+        {
+            if !down {
+                with_engine(&|eng| eng.release_key(&e));
+            }
+            return;
+        }
         with_engine(&|eng| eng.key_input(&e, down, virtual_kbd));
     };
     let kd = window_event_listener(ev::keydown, move |e| key_handler(e, true));
@@ -221,7 +241,9 @@ pub fn SessionPage() -> impl IntoView {
     let focus = window_event_listener(ev::focus, move |_| {
         with_engine(&|e| {
             let e = e.clone();
-            spawn_local(async move { e.sync_local_clipboard().await });
+            spawn_local(async move {
+                e.sync_local_clipboard().await;
+            });
         })
     });
 
@@ -393,7 +415,8 @@ pub fn SessionPage() -> impl IntoView {
                     // Composition (accents, IME) : seul le résultat final compte.
                     if !e.is_composing() {
                         e.prevent_default();
-                        with_engine(&|eng| eng.text_input(&e.input_type(), e.data()));
+                        let data = e.data().or_else(|| transfer_text(&e));
+                        with_engine(&|eng| eng.text_input(&e.input_type(), data.clone()));
                     }
                 }
                 on:compositionstart=move |_| composing.set_value(true)

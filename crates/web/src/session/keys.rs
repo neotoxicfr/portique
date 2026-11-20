@@ -162,11 +162,15 @@ pub fn tap(code: u8, extended: bool) -> [Input; 2] {
 }
 
 /// Texte tapé au clavier virtuel : caractères en Unicode (une paire de substitution est appuyée
-/// puis relâchée d'un bloc), fins de ligne en touche Entrée.
+/// puis relâchée d'un bloc), fins de ligne (CRLF, CR ou LF) en une touche Entrée.
 pub fn text_events(text: &str) -> Vec<Input> {
     let mut out = Vec::new();
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         if c == '\n' || c == '\r' {
+            if c == '\r' {
+                chars.next_if_eq(&'\n');
+            }
             out.extend(tap(0x1C, false));
             continue;
         }
@@ -201,5 +205,11 @@ mod tests {
             [u(0x61, false), u(0x61, true), tap(0x1C, false)[0], tap(0x1C, false)[1]]
         );
         assert_eq!(text_events("😀"), [u(0xD83D, false), u(0xDE00, false), u(0xD83D, true), u(0xDE00, true)]);
+        let enter = tap(0x1C, false);
+        let ab = |eol: &str| text_events(&format!("a{eol}b"));
+        let one = [u(0x61, false), u(0x61, true), enter[0], enter[1], u(0x62, false), u(0x62, true)];
+        assert_eq!(ab("\r\n"), one, "CRLF = une seule Entrée");
+        assert_eq!(ab("\r"), one);
+        assert_eq!(ab("\n\r").len(), one.len() + 2, "LF puis CR : deux lignes");
     }
 }

@@ -100,7 +100,9 @@ struct Inner {
     /// Écriture locale refusée (page sans focus) : retentée au prochain geste.
     clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>)>,
     /// Empreinte du dernier contenu commun aux deux côtés (évite l'écho PC → navigateur → PC) :
-    /// reçu du PC, ou annoncé par nous ET accepté par Windows.
+    /// reçu du PC, ou annoncé par nous ET accepté par Windows. Gardée quand Windows copie un
+    /// contenu sans format pris en charge (fichiers…) : le contenu local, plus ancien que cette
+    /// copie, ne doit pas l'écraser au prochain Ctrl+V.
     clip_last: Option<u64>,
     /// Notre dernière annonce sans réponse encore : empreinte et instant (ms).
     clip_announced: Option<(u64, f64)>,
@@ -109,9 +111,9 @@ struct Inner {
     /// Ctrl+V en cours : les entrées attendent la synchronisation du presse-papier.
     holding: bool,
     held: Vec<Input>,
-    /// Attentes de l'accusé de notre annonce : Windows ne l'envoie qu'une fois notre contenu
-    /// installé, c'est le moment de relâcher un Ctrl+V.
-    clip_ack: Vec<futures::channel::oneshot::Sender<()>>,
+    /// Attentes de l'accusé de notre annonce (vrai si acceptée) : Windows ne l'envoie qu'une fois
+    /// notre contenu installé, c'est le moment de relâcher un Ctrl+V. Vidées à la fermeture.
+    clip_ack: Vec<futures::channel::oneshot::Sender<bool>>,
 }
 
 /// Poignée partagée sur une session en cours.
@@ -246,6 +248,8 @@ impl Engine {
     pub fn close(&self) {
         let mut i = self.inner.borrow_mut();
         i.closing = true;
+        // Une synchronisation qui attend l'accusé ne le recevra plus : elle libère le moteur.
+        i.clip_ack.clear();
         for v in i.views.iter().skip(1).chain(&i.staged) {
             v.close();
         }
@@ -285,6 +289,9 @@ impl Engine {
                 break;
             }
         }
+        let mut i = self.inner.borrow_mut();
+        i.connected = false;
+        i.clip_ack.clear();
     }
 
     fn control(&self, text: &str) -> Result<(), String> {
@@ -644,7 +651,16 @@ impl Engine {
         let (monitors, rects) = views::layout(screens, current);
         caps.check(&monitors)?;
         let secondary: Vec<usize> = (0..screens.len()).filter(|&i| i != current).collect();
-        let k = self.inner.borrow().staged.len();
+        let (k, closed) = {
+            let i = self.inner.borrow();
+            let closed =
+                i.staged.iter().any(|v| v.window.as_ref().is_some_and(|w| w.closed().unwrap_or(true)));
+            (i.staged.len(), closed)
+        };
+        // Une fenêtre déjà préparée a été fermée : la disposition annoncerait un écran invisible.
+        if closed {
+            return Err("fenêtre d'écran fermée pendant l'extension : recommencer".into());
+        }
         if k == 0 {
             self.disable_multi_views();
         }
@@ -964,7 +980,8 @@ impl Engine {
     }
 
     /// Saisie du clavier virtuel (`beforeinput` du champ caché, ou fin de composition) : texte en
-    /// Unicode, effacement et Entrée en vraies touches.
+    /// Unicode, effacement et Entrée en vraies touches. « Coller » du menu du champ : texte tapé
+    /// sur le PC (Ctrl+V, lui, est annulé au keydown et passe par le presse-papier).
     pub fn text_input(&self, input_type: &str, data: Option<String>) {
         use super::keys::{tap, text_events};
         if !self.is_connected() {
@@ -972,7 +989,9 @@ impl Engine {
         }
         self.user_gesture();
         let events = match input_type {
-            "insertText" | "insertReplacementText" => text_events(&data.unwrap_or_default()),
+            "insertText" | "insertReplacementText" | "insertFromPaste" => {
+                text_events(&data.unwrap_or_default())
+            }
             "insertLineBreak" | "insertParagraph" => tap(0x1C, false).to_vec(),
             "deleteContentBackward" | "deleteWordBackward" => tap(0x0E, false).to_vec(),
             "deleteContentForward" | "deleteWordForward" => tap(0x53, true).to_vec(),
@@ -1042,8 +1061,6 @@ impl Engine {
         match kind {
             // Monitor Ready : `rdp-clip` y répond par notre liste de formats, que Windows accusera.
             1 => self.inner.borrow_mut().clip_unacked += 1,
-            // Windows a copié : notre annonce en attente est dépassée, son accusé ne validera rien.
-            2 => self.inner.borrow_mut().clip_announced = None,
             // Format List Response : CB_RESPONSE_OK (0x0001) ou CB_RESPONSE_FAIL.
             3 => self.format_list_answered(le16(2) & 0x0001 != 0),
             _ => {}
@@ -1051,6 +1068,7 @@ impl Engine {
         web_sys::console::debug_1(
             &format!("cliprdr ← type {kind} ({} o) → {} événement(s)", msg.len(), events.len()).into(),
         );
+        // Les demandes de `fetch_step` ne produisent que des envois : la file ne grossit plus.
         let mut queue = self.clip_send(events);
         while let Some(ev) = queue.pop() {
             web_sys::console::debug_1(
@@ -1064,26 +1082,50 @@ impl Engine {
                 )
                 .into(),
             );
-            let mut sends = Vec::new();
-            let done = {
-                let mut i = self.inner.borrow_mut();
-                let Inner { clip, clip_fetch, .. } = &mut *i;
-                let request = |f| {
-                    let ev = clip.request(&[f]);
-                    let sent = !ev.is_empty();
-                    sends.extend(ev);
-                    sent
-                };
-                match ev {
-                    rdp_clip::ClipEvent::RemoteChanged(formats) => clip_fetch.changed(&formats, request),
-                    rdp_clip::ClipEvent::RemoteData(data) => clip_fetch.received(data, request),
-                    rdp_clip::ClipEvent::Send(_) => None,
+            match ev {
+                rdp_clip::ClipEvent::RemoteChanged(formats) => {
+                    // Windows a copié (liste acceptée par `rdp-clip`) : notre annonce en attente est
+                    // dépassée, son accusé ne validera rien ; une écriture locale en attente aussi.
+                    {
+                        let mut i = self.inner.borrow_mut();
+                        i.clip_announced = None;
+                        i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
+                        i.clip_pending_write = None;
+                    }
+                    self.fetch_step(|f, request| f.changed(&formats, request));
                 }
-            };
-            queue.extend(self.clip_send(sends));
-            if let Some(items) = done {
-                self.write_remote(items);
+                rdp_clip::ClipEvent::RemoteData(data) => {
+                    self.fetch_step(|f, request| f.received(data, request))
+                }
+                rdp_clip::ClipEvent::Send(_) => {}
             }
+        }
+    }
+
+    /// Fait avancer la récupération du contenu du PC : envoie la demande suivante, ou écrit
+    /// localement le contenu complet.
+    fn fetch_step(
+        &self,
+        step: impl FnOnce(
+            &mut clip::Fetch,
+            &mut dyn FnMut(rdp_clip::ClipFormat) -> bool,
+        ) -> Option<Vec<rdp_clip::LocalData>>,
+    ) {
+        let mut sends = Vec::new();
+        let done = {
+            let mut i = self.inner.borrow_mut();
+            let Inner { clip, clip_fetch, .. } = &mut *i;
+            let mut request = |f| {
+                let ev = clip.request(&[f]);
+                let sent = !ev.is_empty();
+                sends.extend(ev);
+                sent
+            };
+            step(clip_fetch, &mut request)
+        };
+        self.clip_send(sends);
+        if let Some(items) = done {
+            self.write_remote(items);
         }
     }
 
@@ -1104,21 +1146,36 @@ impl Engine {
             std::mem::take(&mut i.clip_ack)
         };
         for tx in waiters {
-            let _ = tx.send(());
+            let _ = tx.send(ok);
         }
     }
 
     /// Écrit localement ce que Windows a copié, hors de la boucle de réception : une demande de
-    /// permission du navigateur peut faire attendre l'écriture longtemps.
+    /// permission du navigateur peut faire attendre l'écriture longtemps. Un PNG que le navigateur
+    /// ne décode pas est remplacé par le DIB, s'il est proposé, plutôt que réessayé à chaque geste.
     fn write_remote(&self, items: Vec<rdp_clip::LocalData>) {
-        let generation = {
+        let (generation, announce) = {
             let mut i = self.inner.borrow_mut();
             i.clip_last = Some(clip::fingerprint(&items));
             i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
             i.clip_pending_write = None;
-            i.clip_write_gen
+            (i.clip_write_gen, i.clip_fetch.generation())
         };
-        self.write_local(generation, items);
+        let e = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let png = items.iter().find_map(|d| match d {
+                rdp_clip::LocalData::Png(p) => Some(p),
+                _ => None,
+            });
+            if let Some(p) = png
+                && !clip::png_decodes(p).await
+            {
+                web_sys::console::debug_1(&"presse-papier : PNG du PC illisible, repli sur le DIB".into());
+                e.fetch_step(|f, request| f.png_unusable(announce, request));
+                return;
+            }
+            e.write_local(generation, items);
+        });
     }
 
     fn write_local(&self, generation: u32, items: Vec<rdp_clip::LocalData>) {
@@ -1138,24 +1195,28 @@ impl Engine {
     }
 
     /// Envoie au PC le contenu du presse-papier local s'il a changé, et attend que Windows l'ait
-    /// accepté (borné par l'appelant).
-    pub async fn sync_local_clipboard(&self) {
+    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste : il reste à réannoncer.
+    pub async fn sync_local_clipboard(&self) -> bool {
         if !self.is_connected() {
-            return;
+            return true;
         }
         let t0 = js_sys::Date::now();
         let items = clip::read_local().await;
         web_sys::console::debug_1(
             &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),
         );
-        let Some(items) = items else { return };
+        let Some(items) = items else { return true };
         if items.is_empty() {
-            return;
+            return true;
         }
         let fp = clip::fingerprint(&items);
         let (tx, rx) = futures::channel::oneshot::channel();
         let events = {
             let mut i = self.inner.borrow_mut();
+            // Session fermée pendant la lecture : plus d'accusé à attendre.
+            if !i.connected || i.closing {
+                return true;
+            }
             let now = js_sys::Date::now();
             i.clip_ack.retain(|t| !t.is_canceled());
             match i.clip_announced {
@@ -1165,12 +1226,12 @@ impl Engine {
                     i.clip_ack.push(tx);
                     Vec::new()
                 }
-                None if i.clip_last == Some(fp) => return,
+                None if i.clip_last == Some(fp) => return true,
                 _ => {
                     let events = i.clip.set_local(items);
                     // Canal pas encore prêt : la liste partira avec Monitor Ready.
                     if events.is_empty() {
-                        return;
+                        return true;
                     }
                     i.clip_unacked += 1;
                     i.clip_announced = Some((fp, now));
@@ -1183,7 +1244,8 @@ impl Engine {
             }
         };
         self.clip_send(events);
-        let _ = rx.await;
+        // Attente abandonnée (session fermée) : rien de plus à tenter.
+        rx.await.unwrap_or(true)
     }
 
     /// Geste utilisateur : occasion de réussir une écriture locale refusée plus tôt, si son
@@ -1201,7 +1263,10 @@ impl Engine {
         }
     }
 
-    /// Ctrl+V : synchronise d'abord le presse-papier (2 s au plus), puis laisse passer les touches retenues.
+    /// Ctrl+V : synchronise d'abord le presse-papier (2 s au plus), puis laisse passer les touches
+    /// retenues. Une liste refusée par Windows est réannoncée dans ce délai ; après trois refus, les
+    /// touches partent quand même (sinon Ctrl resterait enfoncé sur le PC) et Windows colle son
+    /// propre contenu.
     pub fn paste_guard(&self) {
         if self.inner.borrow().holding {
             return;
@@ -1209,7 +1274,14 @@ impl Engine {
         self.inner.borrow_mut().holding = true;
         let e = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let sync = e.sync_local_clipboard();
+            let sync = async {
+                for _ in 0..3 {
+                    if e.sync_local_clipboard().await {
+                        return true;
+                    }
+                }
+                false
+            };
             let timeout = async {
                 let p = js_sys::Promise::new(&mut |resolve, _| {
                     let _ = web_sys::window()
@@ -1219,7 +1291,9 @@ impl Engine {
                 let _ = wasm_bindgen_futures::JsFuture::from(p).await;
             };
             futures::pin_mut!(sync, timeout);
-            futures::future::select(sync, timeout).await;
+            if let futures::future::Either::Left((false, _)) = futures::future::select(sync, timeout).await {
+                web_sys::console::warn_1(&"presse-papier : Windows refuse le contenu local".into());
+            }
             let held = {
                 let mut i = e.inner.borrow_mut();
                 i.holding = false;

@@ -150,11 +150,11 @@ a { color: var(--link); text-decoration: none; }
 .mono { font-family: var(--mono); font-size: 13px; word-break: break-all; }
 .error { color: var(--red); margin: 0; }
 
-/* Focus visible : anneau bleu translucide sur tout élément interactif. */
-:is(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
-  outline: none; box-shadow: 0 0 0 3px var(--focus);
-}
-.line:focus-within { box-shadow: none; }
+/* Focus visible : anneau bleu translucide sur tout élément interactif. Un contour et non une ombre : les ombres
+   décoratives (bouton plein, segment actif, touche) ne peuvent pas l'effacer. */
+:is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 3px solid var(--focus); outline-offset: 0; }
+/* Ligne cliquable : le groupe rogne ce qui dépasse, l'anneau passe à l'intérieur. */
+:is(a, button).line:focus-visible { outline-offset: -3px; }
 /* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
 @media (forced-colors: active) {
   :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
@@ -163,7 +163,6 @@ a { color: var(--link); text-decoration: none; }
   .theme input:focus-visible ~ .prev { outline: 3px solid Highlight; outline-offset: 2px; }
   .switch .track { border: 1px solid CanvasText; }
   .switch .track::after { forced-color-adjust: none; background: CanvasText; }
-  .session-overlay :is(button, a.button):focus-visible { outline-offset: -3px; }
 }
 
 /* Icônes en ligne. */
@@ -286,7 +285,8 @@ a.line, button.line {
 }
 .line.danger { color: var(--red); }
 .line:focus-within:has(input:focus-visible, select:focus-visible, textarea:focus-visible) { background: var(--fill); }
-.line input:focus-visible, .line select:focus-visible, .line textarea:focus-visible { box-shadow: none; }
+/* Contour transparent plutôt qu'absent : les couleurs forcées le rendent visible. */
+.line input:focus-visible, .line select:focus-visible, .line textarea:focus-visible { outline-color: transparent; }
 
 .card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 16px; box-shadow: var(--card-shadow); }
 .row { display: flex; gap: 8px; align-items: center; }
@@ -354,7 +354,7 @@ td.cell-actions { text-align: right; }
   padding: 0 12px; border-radius: 10px; background: var(--fill); color: var(--muted); font-size: 15px;
 }
 .search input { flex: 1; background: transparent; border-radius: 0; padding: 0; min-height: 0; height: 100%; font-size: 15px; }
-.search input:focus-visible { box-shadow: none; }
+.search input:focus-visible { outline-color: transparent; }
 .search:focus-within { box-shadow: 0 0 0 3px var(--focus); }
 .hosts { list-style: none; margin: 0; padding: 0; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
 .host {
@@ -394,7 +394,6 @@ td.cell-actions { text-align: right; }
   .host { height: 136px; padding: 16px; }
   .host .pastille { --s: 40px; }
   .search { height: 44px; max-width: none; border-radius: 12px; }
-  .search input { font-size: 17px; }
   .line-label { min-width: 84px; }
 }
 
@@ -468,7 +467,7 @@ td.cell-actions { text-align: right; }
 }
 .session-overlay .row :is(button, a.button) { width: 100%; margin: 0; }
 .session-overlay button { font-weight: 600; }
-.session-overlay :is(button, a.button):focus-visible { box-shadow: inset 0 0 0 3px var(--focus); }
+.session-overlay :is(button, a.button):focus-visible { outline-offset: -3px; }
 
 /* ---------- Terminal SSH ---------- */
 /* Plein cadre ; la hauteur suit la partie visible (clavier virtuel exclu). */
@@ -599,3 +598,10 @@ label.line { flex-direction: row; }
 .pick .ico { color: var(--link); }
 .group fieldset .alert { margin: 12px 0 0; }
 .mrow .pastille { --s: 30px; }
+
+/* Écran tactile ou étroit : 16 px au moins dans les champs, sinon iOS zoome la page au focus (le zoom manuel reste
+   permis). En fin de fichier pour passer devant les tailles propres (.tags input). */
+@media (max-width: 640px), (pointer: coarse) {
+  input, select, textarea, .tags input { font-size: 16px; }
+  .search input { font-size: 17px; }
+}

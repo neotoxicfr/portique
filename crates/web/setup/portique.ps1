@@ -85,14 +85,24 @@ $nic = Get-ActiveNic
 if ($nic) {
   powercfg /deviceenablewake $nic.InterfaceDescription 2>$null | Out-Null
   if (Test-Exit 'Reveil (powercfg)') {
-    Set-Dw $mem 'WakeNic' $nic.InterfaceDescription 'String'
-    try {
-      Set-NetAdapterPowerManagement -Name $nic.Name -WakeOnMagicPacket Enabled -ErrorAction Stop
-      Write-Host "[ok] Reveil autorise pour : $($nic.InterfaceDescription)"
-    } catch {
-      Write-Host "[!] Reveil autorise par powercfg pour : $($nic.InterfaceDescription), mais WakeOnMagicPacket non configure ($($_.Exception.Message)) : a verifier dans les proprietes de la carte."
+    $memo = $true
+    try { Set-Dw $mem 'WakeNic' $nic.InterfaceDescription 'String' } catch {
+      # Sans memo, l'annulation viserait la carte active : on retire l'autorisation.
+      $raison = $_.Exception.Message
+      powercfg /devicedisablewake $nic.InterfaceDescription 2>$null | Out-Null
+      Write-Host "[!] Reveil : carte $($nic.InterfaceDescription) non memorisee dans le registre ($raison), reveil non autorise."
+      $echecs += 'Reveil (memo)'
+      $memo = $false
     }
-    Write-Host "     Adresse MAC a recopier dans Portique : $($nic.MacAddress)"
+    if ($memo) {
+      try {
+        Set-NetAdapterPowerManagement -Name $nic.Name -WakeOnMagicPacket Enabled -ErrorAction Stop
+        Write-Host "[ok] Reveil autorise pour : $($nic.InterfaceDescription)"
+      } catch {
+        Write-Host "[!] Reveil autorise par powercfg pour : $($nic.InterfaceDescription), mais WakeOnMagicPacket non configure ($($_.Exception.Message)) : a verifier dans les proprietes de la carte."
+      }
+      Write-Host "     Adresse MAC a recopier dans Portique : $($nic.MacAddress)"
+    }
   }
 } else { Write-Host '[!] Aucune carte reseau physique active trouvee.' }
 Write-Host '     Pense aussi a activer Wake-on-LAN dans le BIOS/UEFI.'

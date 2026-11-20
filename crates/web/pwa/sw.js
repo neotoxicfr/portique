@@ -5,7 +5,8 @@ const CACHE = "portique-v3";
 
 // Le serveur répond index.html (200) à toute adresse inconnue : un fichier retiré par un déploiement
 // reviendrait en HTML. Gardé sous l'URL du module, il casserait le prochain démarrage hors ligne.
-const isHtml = (r) => (r.headers.get("content-type") || "").startsWith("text/html");
+// Le type de média ne tient pas compte de la casse (RFC 9110 8.3.1).
+const isHtml = (r) => (r.headers.get("content-type") || "").toLowerCase().startsWith("text/html");
 
 async function asset(url) {
   const r = await fetch(url);

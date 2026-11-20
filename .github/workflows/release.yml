@@ -1,6 +1,7 @@
 # Release : le push d'un tag vX.Y.Z construit l'image (amd64 et arm64, chacune sur un runner natif),
-# la publie sur ghcr en X.Y.Z et latest, et crée la release GitHub (corps vide : les notes, écrites à la
-# main, s'ajoutent ensuite avec `gh release edit`) avec les archives binaire + front et SHA256SUMS.
+# la publie sur ghcr en X.Y.Z (et latest pour une version stable, jamais pour une préversion -rc), et crée
+# la release GitHub (corps vide : les notes, écrites à la main, s'ajoutent ensuite avec `gh release edit`)
+# avec les archives binaire + front et SHA256SUMS.
 name: Release
 on:
   push:
@@ -84,7 +85,6 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
       - name: Manifeste multi-arch
         env:
           TAGS: ${{ steps.meta.outputs.tags }}

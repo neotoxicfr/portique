@@ -13,6 +13,13 @@ pub fn Login() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
+    // Retour à la saisie du mot de passe : le défi TOTP et les secrets saisis sont effacés.
+    let reset = move || {
+        need_totp.set(false);
+        password.set(String::new());
+        totp.set(String::new());
+    };
+
     let done = move |r: api::Result<LoginResponse>| {
         busy.set(false);
         match r {
@@ -21,10 +28,12 @@ pub fn Login() -> impl IntoView {
                 need_totp.set(true);
                 error.set(None);
             }
-            Err(api::Error::Unauthorized) if need_totp.get_untracked() => {
-                error.set(Some("code incorrect".into()))
+            // Mot de passe refusé, y compris pendant le défi TOTP (changé entre les deux envois) : il faut le
+            // ressaisir. Un code TOTP faux arrive autrement (400, message du serveur).
+            Err(api::Error::Unauthorized) => {
+                reset();
+                error.set(Some("identifiant ou mot de passe incorrect".into()));
             }
-            Err(api::Error::Unauthorized) => error.set(Some("identifiant ou mot de passe incorrect".into())),
             Err(e) => error.set(Some(e.to_string())),
         }
     };
@@ -50,11 +59,8 @@ pub fn Login() -> impl IntoView {
         spawn_local(async move { done(api::passkey_login(&name).await) });
     };
 
-    // Retour au choix du compte : le défi TOTP et les secrets saisis sont effacés.
     let change_account = move |_| {
-        need_totp.set(false);
-        password.set(String::new());
-        totp.set(String::new());
+        reset();
         error.set(None);
     };
 
@@ -93,7 +99,9 @@ pub fn Login() -> impl IntoView {
                 <Show
                     when=move || !need_totp.get()
                     fallback=move || view! {
-                        <button type="button" class="secondary block" on:click=change_account>"Changer de compte"</button>
+                        <button type="button" class="secondary block" disabled=move || busy.get() on:click=change_account>
+                            "Changer de compte"
+                        </button>
                     }
                 >
                     <button type="button" class="secondary block" disabled=move || busy.get() on:click=passkey>

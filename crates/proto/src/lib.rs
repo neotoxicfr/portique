@@ -103,38 +103,27 @@ pub struct PasskeyInfo {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    Rdp,
-    Ssh,
-}
+pub const RDP_PORT: u16 = 3389;
+pub const SSH_PORT: u16 = 22;
 
-impl Protocol {
-    pub fn default_port(self) -> u16 {
-        match self {
-            Protocol::Rdp => 3389,
-            Protocol::Ssh => 22,
-        }
-    }
-}
-
-/// Connexion vue par un utilisateur : rien de secret.
+/// Hôte vu par un utilisateur : rien de secret. Un hôte offre le RDP, le SSH ou les deux.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionSummary {
     pub id: i64,
     pub name: String,
-    pub protocol: Protocol,
+    pub rdp: bool,
+    pub ssh: bool,
     pub can_wake: bool,
 }
 
-/// Connexion vue par l'admin : tout sauf le mot de passe.
+/// Hôte vu par l'admin : tout sauf les mots de passe. `port`, `username`, `domain` et
+/// `has_password` sont ceux du RDP.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionAdmin {
     pub id: i64,
     pub name: String,
-    pub protocol: Protocol,
     pub host: String,
+    pub rdp: bool,
     pub port: u16,
     pub username: String,
     pub domain: String,
@@ -146,6 +135,39 @@ pub struct ConnectionAdmin {
     pub cert_fingerprint: Option<String>,
     /// Réveil « par commande » (SSH) ; `None` = paquet UDP direct.
     pub wol_command: Option<WolCommandAdmin>,
+    /// SSH sur cet hôte ; `None` = pas de SSH.
+    pub ssh: Option<SshAdmin>,
+}
+
+/// SSH d'un hôte. Le service s'authentifie avec sa clé, puis avec `password` s'il y en a un.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SshAdmin {
+    pub port: u16,
+    pub user: String,
+    pub has_password: bool,
+    /// Empreinte SHA-256 de la clé d'hôte approuvée (format OpenSSH).
+    pub hostkey: Option<String>,
+    /// Hôte SSH de rebond (ProxyJump), lui-même éventuellement derrière un rebond.
+    pub jump_id: Option<i64>,
+    /// Thème propre à cet hôte ; `None` = thème du compte.
+    pub theme: Option<String>,
+}
+
+/// `password: None` garde l'ancien, `Some("")` l'efface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SshInput {
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub user: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub jump_id: Option<i64>,
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Oublie la clé d'hôte approuvée (machine réinstallée).
+    #[serde(default)]
+    pub forget_hostkey: bool,
 }
 
 /// Réveil par commande : SSH vers `host` puis `command`, où `{mac}` est remplacé par l'adresse
@@ -181,8 +203,10 @@ pub struct WolCommandInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionInput {
     pub name: String,
-    pub protocol: Option<Protocol>,
     pub host: String,
+    /// RDP sur cet hôte (`port`, `username`, `domain`, `password` le concernent).
+    #[serde(default = "yes")]
+    pub rdp: bool,
     pub port: Option<u16>,
     #[serde(default)]
     pub username: String,
@@ -203,6 +227,13 @@ pub struct ConnectionInput {
     /// Réveil par commande SSH ; `None` = paquet UDP direct.
     #[serde(default)]
     pub wol_command: Option<WolCommandInput>,
+    /// SSH sur cet hôte ; `None` = pas de SSH.
+    #[serde(default)]
+    pub ssh: Option<SshInput>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,7 +282,120 @@ pub enum SessionMessage {
     },
 }
 
+/// Thèmes du terminal proposés (couleurs définies par le front). Le premier est le défaut.
+pub const TERMINAL_THEMES: &[&str] = &["sombre", "clair", "solarise", "dracula", "nord", "alerte"];
+
+/// Combinaisons de la barre de touches tant que le compte n'en a pas choisi.
+pub const DEFAULT_COMBOS: &[&str] = &["Ctrl+C", "Ctrl+D", "Ctrl+Z", "Ctrl+R", "Ctrl+L"];
+
+/// Préférences de terminal d'un compte.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalPrefs {
+    pub theme: String,
+    pub combos: Vec<String>,
+}
+
+/// Combinaison de la barre de touches : `Ctrl+X`, `Alt+X` ou `Ctrl+Alt+X`, X un caractère ASCII visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Combo {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub key: char,
+}
+
+impl Combo {
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut c = Combo { ctrl: false, alt: false, key: ' ' };
+        let mut parts: Vec<&str> = s.split('+').collect();
+        let key = parts.pop()?;
+        for m in parts {
+            match m.trim().to_ascii_lowercase().as_str() {
+                "ctrl" if !c.ctrl => c.ctrl = true,
+                "alt" if !c.alt => c.alt = true,
+                _ => return None,
+            }
+        }
+        let mut chars = key.chars();
+        c.key = chars.next().filter(|k| k.is_ascii_graphic())?;
+        (chars.next().is_none() && (c.ctrl || c.alt)).then_some(c)
+    }
+
+    /// Octets envoyés au terminal (Ctrl : code de contrôle ; Alt : préfixe Échap).
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(2);
+        if self.alt {
+            b.push(0x1b);
+        }
+        b.push(if self.ctrl { ctrl_code(self.key) } else { self.key as u8 });
+        b
+    }
+}
+
+/// Code de contrôle d'une touche (Ctrl+A = 0x01…, Ctrl+[ = Échap, Ctrl+? = Suppr).
+pub fn ctrl_code(key: char) -> u8 {
+    match key.to_ascii_uppercase() {
+        k @ '@'..='_' => k as u8 - b'@',
+        ' ' => 0,
+        '?' => 0x7f,
+        k => k as u8,
+    }
+}
+
+/// Clé SSH publique du service, à poser dans `authorized_keys` des hôtes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceKey {
+    /// Ligne OpenSSH : `ssh-ed25519 AAAA… portique`.
+    pub public: String,
+}
+
+/// Messages texte du WebSocket SSH (`/api/connections/{id}/ssh`) du serveur au navigateur ; les
+/// messages binaires portent les octets du terminal dans les deux sens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SshMessage {
+    /// Clé d'hôte inconnue sur un saut (cible ou rebond) : à approuver par un admin.
+    UntrustedHostKey {
+        connection_id: i64,
+        name: String,
+        fingerprint: String,
+        can_approve: bool,
+    },
+    /// Shell ouvert : thème et combinaisons à appliquer.
+    Ready {
+        theme: String,
+        combos: Vec<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Messages texte du navigateur au serveur sur le WebSocket SSH.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SshControl {
+    Resize { cols: u16, rows: u16 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combos() {
+        assert_eq!(Combo::parse("Ctrl+C").unwrap().bytes(), [0x03]);
+        assert_eq!(Combo::parse("ctrl+r").unwrap().bytes(), [0x12]);
+        assert_eq!(Combo::parse("Alt+b").unwrap().bytes(), [0x1b, b'b']);
+        assert_eq!(Combo::parse("Ctrl+Alt+d").unwrap().bytes(), [0x1b, 0x04]);
+        assert_eq!(Combo::parse("Ctrl+[").unwrap().bytes(), [0x1b]);
+        for bad in ["C", "Ctrl+", "Ctrl+CC", "Shift+C", "Ctrl+Ctrl+C", "Ctrl+é"] {
+            assert!(Combo::parse(bad).is_none(), "{bad}");
+        }
+        assert!(DEFAULT_COMBOS.iter().all(|c| Combo::parse(c).is_some()));
+    }
 }

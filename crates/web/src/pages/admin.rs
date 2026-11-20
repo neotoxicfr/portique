@@ -1,5 +1,7 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use portique_proto::{ConnectionAdmin, ConnectionInput, Protocol, UserAdmin, UserInput};
+use portique_proto::{
+    ConnectionAdmin, ConnectionInput, ServiceKey, SshInput, TERMINAL_THEMES, UserAdmin, UserInput,
+};
 
 use crate::{Session, api};
 
@@ -26,6 +28,7 @@ pub fn Admin() -> impl IntoView {
     view! {
         <h1>"Administration"</h1>
         <Connections conns users reload/>
+        <ServiceKeyPanel/>
         <Users users reload/>
     }
 }
@@ -154,7 +157,7 @@ fn web_sys_confirm(msg: &str) -> bool {
 #[derive(Clone, Default)]
 struct Form {
     name: RwSignal<String>,
-    protocol: RwSignal<String>,
+    rdp: RwSignal<bool>,
     host: RwSignal<String>,
     port: RwSignal<String>,
     username: RwSignal<String>,
@@ -177,19 +180,24 @@ struct Form {
     cmd_hostkey: RwSignal<Option<String>>,
     cmd_pending: RwSignal<Option<String>>,
     cmd_approve: RwSignal<bool>,
+    ssh: RwSignal<bool>,
+    ssh_port: RwSignal<String>,
+    ssh_user: RwSignal<String>,
+    ssh_password: RwSignal<String>,
+    ssh_has_password: RwSignal<bool>,
+    /// Identifiant de l'hôte de rebond ; vide = connexion directe.
+    ssh_jump: RwSignal<String>,
+    /// Thème propre à l'hôte ; vide = thème du compte.
+    ssh_theme: RwSignal<String>,
+    ssh_hostkey: RwSignal<Option<String>>,
+    ssh_forget: RwSignal<bool>,
 }
 
 impl Form {
     fn fill(&self, c: Option<&ConnectionAdmin>) {
         let s = |v: Option<&str>| v.unwrap_or_default().to_owned();
         self.name.set(s(c.map(|c| c.name.as_str())));
-        self.protocol.set(
-            match c.map(|c| c.protocol) {
-                Some(Protocol::Ssh) => "ssh",
-                _ => "rdp",
-            }
-            .into(),
-        );
+        self.rdp.set(c.is_none_or(|c| c.rdp));
         self.host.set(s(c.map(|c| c.host.as_str())));
         self.port.set(c.map(|c| c.port.to_string()).unwrap_or_default());
         self.username.set(s(c.map(|c| c.username.as_str())));
@@ -212,17 +220,23 @@ impl Form {
         self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
         self.cmd_pending.set(w.and_then(|w| w.pending_hostkey.clone()));
         self.cmd_approve.set(false);
+        let h = c.and_then(|c| c.ssh.as_ref());
+        self.ssh.set(h.is_some());
+        self.ssh_port.set(h.map(|h| h.port.to_string()).unwrap_or_default());
+        self.ssh_user.set(s(h.map(|h| h.user.as_str())));
+        self.ssh_password.set(String::new());
+        self.ssh_has_password.set(h.is_some_and(|h| h.has_password));
+        self.ssh_jump.set(h.and_then(|h| h.jump_id).map(|j| j.to_string()).unwrap_or_default());
+        self.ssh_theme.set(s(h.and_then(|h| h.theme.as_deref())));
+        self.ssh_hostkey.set(h.and_then(|h| h.hostkey.clone()));
+        self.ssh_forget.set(false);
     }
 
     fn input(&self) -> ConnectionInput {
         let opt = |s: RwSignal<String>| Some(s.get_untracked()).filter(|v| !v.trim().is_empty());
         ConnectionInput {
             name: self.name.get_untracked(),
-            protocol: Some(if self.protocol.get_untracked() == "ssh" {
-                Protocol::Ssh
-            } else {
-                Protocol::Rdp
-            }),
+            rdp: self.rdp.get_untracked(),
             host: self.host.get_untracked(),
             port: self.port.get_untracked().trim().parse().ok(),
             username: self.username.get_untracked(),
@@ -243,6 +257,14 @@ impl Form {
                     .get_untracked()
                     .then(|| self.cmd_pending.get_untracked())
                     .flatten(),
+            }),
+            ssh: self.ssh.get_untracked().then(|| SshInput {
+                port: self.ssh_port.get_untracked().trim().parse().ok(),
+                user: self.ssh_user.get_untracked(),
+                password: opt(self.ssh_password),
+                jump_id: self.ssh_jump.get_untracked().parse().ok(),
+                theme: opt(self.ssh_theme),
+                forget_hostkey: self.ssh_forget.get_untracked(),
             }),
         }
     }
@@ -312,7 +334,9 @@ fn Connections(
                             view! {
                                 <tr>
                                     <td>{c.name.clone()}</td>
-                                    <td class="mono">{format!("{}:{}", c.host, c.port)}</td>
+                                    <td class="mono">{c.host.clone()}
+                                        {c.rdp.then(|| view! { <span class="badge">{format!("RDP {}", c.port)}</span> })}
+                                        {c.ssh.as_ref().map(|h| view! { <span class="badge">{format!("SSH {}", h.port)}</span> })}</td>
                                     <td>{if c.domain.is_empty() { c.username.clone() } else { format!("{}\\{}", c.domain, c.username) }}
                                         {(!c.has_password).then_some(view! { <span class="badge">"sans mot de passe"</span> })}</td>
                                     <td class="mono">{c.wol_mac.clone().unwrap_or_else(|| "—".into())}</td>
@@ -333,21 +357,68 @@ fn Connections(
                     view! {
                         <form on:submit=save class="grid">
                             <label>"Nom"<input type="text" required prop:value=move || f.name.get() on:input=input(f.name)/></label>
-                            <label>"Protocole"
-                                <select prop:value=move || f.protocol.get() on:change=input(f.protocol)>
-                                    <option value="rdp">"RDP"</option>
-                                    <option value="ssh">"SSH (plus tard)"</option>
-                                </select>
-                            </label>
                             <label>"Hôte"<input type="text" required placeholder="10.8.0.2" prop:value=move || f.host.get() on:input=input(f.host)/></label>
-                            <label>"Port"<input type="number" min="1" max="65535" placeholder="3389" prop:value=move || f.port.get() on:input=input(f.port)/></label>
-                            <label>"Utilisateur Windows"<input type="text" autocomplete="off" prop:value=move || f.username.get() on:input=input(f.username)/></label>
-                            <label>"Domaine"<input type="text" autocomplete="off" prop:value=move || f.domain.get() on:input=input(f.domain)/></label>
-                            <label>"Mot de passe"
-                                <input type="password" autocomplete="new-password"
-                                    placeholder=move || if f.has_password.get() { "inchangé" } else { "" }
-                                    prop:value=move || f.password.get() on:input=input(f.password)/>
-                            </label>
+                            <fieldset class="full">
+                                <legend>"Protocoles (au moins un)"</legend>
+                                <label class="check">
+                                    <input type="checkbox" prop:checked=move || f.rdp.get() on:change=move |ev| f.rdp.set(event_target_checked(&ev))/>
+                                    "RDP (bureau Windows)"
+                                </label>
+                                <label class="check">
+                                    <input type="checkbox" prop:checked=move || f.ssh.get() on:change=move |ev| f.ssh.set(event_target_checked(&ev))/>
+                                    "SSH (terminal)"
+                                </label>
+                            </fieldset>
+                            <Show when=move || f.rdp.get()>
+                                <fieldset class="full grid">
+                                    <legend>"RDP"</legend>
+                                    <label>"Port"<input type="number" min="1" max="65535" placeholder="3389" prop:value=move || f.port.get() on:input=input(f.port)/></label>
+                                    <label>"Utilisateur Windows"<input type="text" autocomplete="off" prop:value=move || f.username.get() on:input=input(f.username)/></label>
+                                    <label>"Domaine"<input type="text" autocomplete="off" prop:value=move || f.domain.get() on:input=input(f.domain)/></label>
+                                    <label>"Mot de passe"
+                                        <input type="password" autocomplete="new-password"
+                                            placeholder=move || if f.has_password.get() { "inchangé" } else { "" }
+                                            prop:value=move || f.password.get() on:input=input(f.password)/>
+                                    </label>
+                                </fieldset>
+                            </Show>
+                            <Show when=move || f.ssh.get()>
+                                <fieldset class="full grid">
+                                    <legend>"SSH (clé du service d'abord, puis le mot de passe s'il y en a un)"</legend>
+                                    <label>"Port"<input type="number" min="1" max="65535" placeholder="22" prop:value=move || f.ssh_port.get() on:input=input(f.ssh_port)/></label>
+                                    <label>"Utilisateur"<input type="text" autocomplete="off" prop:value=move || f.ssh_user.get() on:input=input(f.ssh_user)/></label>
+                                    <label>"Mot de passe (facultatif)"
+                                        <input type="password" autocomplete="new-password"
+                                            placeholder=move || if f.ssh_has_password.get() { "inchangé" } else { "clé du service seulement" }
+                                            prop:value=move || f.ssh_password.get() on:input=input(f.ssh_password)/>
+                                    </label>
+                                    <label>"Rebond"
+                                        <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
+                                            <option value="">"direct"</option>
+                                            {move || conns.get().into_iter()
+                                                .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
+                                                .map(|c| view! { <option value=c.id.to_string()>{format!("par {}", c.name)}</option> })
+                                                .collect_view()}
+                                        </select>
+                                    </label>
+                                    <label>"Thème du terminal"
+                                        <select prop:value=move || f.ssh_theme.get() on:change=input(f.ssh_theme)>
+                                            <option value="">"celui du compte"</option>
+                                            {TERMINAL_THEMES.iter().map(|t| view! { <option value=*t>{*t}</option> }).collect_view()}
+                                        </select>
+                                    </label>
+                                    {move || f.ssh_hostkey.get().map(|k| view! {
+                                        <div class="full">
+                                            <p class="muted mono">"Clé d'hôte approuvée : " {k}</p>
+                                            <label class="check">
+                                                <input type="checkbox" prop:checked=move || f.ssh_forget.get()
+                                                    on:change=move |ev| f.ssh_forget.set(event_target_checked(&ev))/>
+                                                "Oublier (machine réinstallée : il faudra réapprouver)"
+                                            </label>
+                                        </div>
+                                    })}
+                                </fieldset>
+                            </Show>
                             <label>"MAC (WoL)"<input type="text" placeholder="00:1A:2B:3C:4D:5E" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
                             <fieldset class="full">
                                 <legend>"Réveil (Wake-on-LAN) — MAC ci-dessus"</legend>
@@ -370,9 +441,9 @@ fn Connections(
                                     <div class="grid full">
                                         <label>"Hôte SSH"<input type="text" placeholder="10.0.0.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
                                         <label>"Utilisateur SSH"<input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
-                                        <label>"Mot de passe SSH"
+                                        <label>"Mot de passe SSH (facultatif)"
                                             <input type="password" autocomplete="new-password"
-                                                placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "" }
+                                                placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "clé du service seulement" }
                                                 prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/>
                                         </label>
                                         <label class="full">"Commande ({mac} est remplacé)"
@@ -427,6 +498,56 @@ fn Connections(
                     }
                 }
             </Show>
+        </section>
+    }
+}
+
+/// Clé publique du service, à poser dans `authorized_keys` ; `from="…"` facultatif.
+#[component]
+fn ServiceKeyPanel() -> impl IntoView {
+    let key = RwSignal::new(None::<String>);
+    let restrict = RwSignal::new(false);
+    let from = RwSignal::new(String::new());
+    let copied = RwSignal::new(false);
+    spawn_local(async move {
+        if let Ok(k) = api::get::<ServiceKey>("/api/admin/ssh-key").await {
+            key.set(Some(k.public));
+        }
+    });
+    let line = move || {
+        let k = key.get()?;
+        let f = from.get();
+        let addrs: Vec<&str> = f.split([',', ' ']).filter(|a| !a.is_empty()).collect();
+        Some(if restrict.get() && !addrs.is_empty() {
+            format!("from=\"{}\" {k}", addrs.join(","))
+        } else {
+            k
+        })
+    };
+    let copy = move |_| {
+        if let Some(l) = line() {
+            let _ = leptos::prelude::window().navigator().clipboard().write_text(&l);
+            copied.set(true);
+        }
+    };
+    view! {
+        <section class="card">
+            <h2>"Clé SSH du service"</h2>
+            <p class="muted">"Ligne à ajouter dans ~/.ssh/authorized_keys de chaque hôte SSH (Windows : C:\\ProgramData\\ssh\\administrators_authorized_keys pour un compte administrateur). Elle ouvre toutes ces machines : le SSH exige donc la double authentification."</p>
+            <label class="check">
+                <input type="checkbox" prop:checked=move || restrict.get() on:change=move |ev| restrict.set(event_target_checked(&ev))/>
+                "Limiter aux adresses du service (from=)"
+            </label>
+            <Show when=move || restrict.get()>
+                <label>"Adresses ou réseaux, séparés par des virgules"
+                    <input type="text" class="mono" placeholder="192.0.2.10,198.51.100.0/24" prop:value=move || from.get() on:input=input(from)/>
+                </label>
+            </Show>
+            <textarea class="mono" readonly rows="3" prop:value=move || line().unwrap_or_else(|| "chargement…".into())></textarea>
+            <div class="row">
+                <button type="button" on:click=copy>"Copier"</button>
+                {move || copied.get().then_some(view! { <span class="muted">"Copiée."</span> })}
+            </div>
         </section>
     }
 }

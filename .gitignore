@@ -1,6 +1,9 @@
 # Compilation
 /target/
 /dist/
+# xterm.js : téléchargé et vérifié par scripts/vendor-xterm.sh (seul le README est suivi)
+/crates/web/vendor/xterm/*
+!/crates/web/vendor/xterm/README.md
 /pkg/
 
 # Données locales et secrets (jamais dans Git)

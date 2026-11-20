@@ -1,0 +1,256 @@
+//! Session SSH par WebSocket : le serveur ouvre la chaîne de rebonds avec la clé du service, puis
+//! relaie le terminal (binaire dans les deux sens, `SshControl` en texte pour le redimensionnement).
+
+use std::time::Instant;
+
+use axum::{
+    Json,
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::HeaderMap,
+    response::Response,
+};
+use futures_util::{SinkExt, StreamExt};
+use portique_proto::{AuthMode, ServiceKey, SshControl, SshMessage};
+use russh::ChannelMsg;
+
+use crate::{
+    api::{
+        account::terminal_prefs,
+        connections::{Row, find_allowed},
+        session::{REVALIDATE_EVERY, same_origin, still_allowed},
+    },
+    auth::{AdminUser, ClientIp, CurrentUser, UserRow},
+    ssh::{self, Hop, OpenError},
+    state::{ApiResult, AppError, AppState, bad},
+};
+
+#[derive(serde::Deserialize)]
+pub struct OpenQuery {
+    cols: Option<u16>,
+    rows: Option<u16>,
+    /// Empreinte (format OpenSSH) qu'un admin approuve pour l'hôte `trust_for`.
+    trust: Option<String>,
+    trust_for: Option<i64>,
+}
+
+/// Clé publique du service, à poser dans `authorized_keys` des hôtes.
+pub async fn service_key(State(state): State<AppState>, _: AdminUser) -> ApiResult<Json<ServiceKey>> {
+    let key = ssh::service_key(&state).await?;
+    Ok(Json(ServiceKey { public: ssh::public_line(&key)? }))
+}
+
+/// La clé du service ouvre toutes les machines : en mode intégré, son usage exige un TOTP ou une
+/// passkey (en mode proxy, c'est au proxy d'exiger la double authentification).
+async fn has_second_factor(state: &AppState, user: &UserRow) -> ApiResult<bool> {
+    if state.cfg.auth_mode == AuthMode::Proxy || user.totp_secret.is_some() {
+        return Ok(true);
+    }
+    let passkeys: i64 = sqlx::query_scalar("SELECT count(*) FROM passkeys WHERE user_id = ?")
+        .bind(user.id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(passkeys > 0)
+}
+
+pub async fn open(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    ClientIp(ip): ClientIp,
+    Path(id): Path<i64>,
+    Query(q): Query<OpenQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    if !same_origin(&headers, &state.cfg.public_url) {
+        return Err(AppError::Forbidden);
+    }
+    let row = find_allowed(&state.db, user.id, user.is_admin, id).await?;
+    if !row.ssh_enabled {
+        return Err(bad("pas de SSH sur cet hôte"));
+    }
+    if !has_second_factor(&state, &user).await? {
+        return Err(bad(
+            "le SSH exige la double authentification : active un TOTP ou une passkey dans ton compte",
+        ));
+    }
+    let trust = match (q.trust, q.trust_for) {
+        (Some(fp), Some(host)) if user.is_admin => Some((host, fp)),
+        (None, _) => None,
+        _ => return Err(AppError::Forbidden),
+    };
+    let host_theme = row.ssh_theme.clone();
+    let hops = chain(&state, row).await?;
+    let token = axum_extra::extract::CookieJar::from_headers(&headers)
+        .get(crate::auth::SESSION_COOKIE)
+        .map(|c| crate::crypto::token_hash(c.value()));
+    let size = (q.cols.unwrap_or(80).clamp(10, 500), q.rows.unwrap_or(24).clamp(5, 300));
+    Ok(ws
+        .max_message_size(1 << 20)
+        .on_upgrade(move |socket| run(state, user, ip, hops, host_theme, trust, size, token, socket)))
+}
+
+/// Chaîne des sauts, premier rebond d'abord, cible en dernier. Les rebonds n'ont pas à être
+/// accessibles à l'utilisateur : seul l'accès à la cible compte.
+async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> {
+    let mut rows = vec![target];
+    while let Some(jump) = rows.last().and_then(|r| r.ssh_jump_id) {
+        if rows.len() >= ssh::MAX_HOPS || rows.iter().any(|r| r.id == jump) {
+            return Err(bad("chaîne de rebonds invalide (boucle ou trop longue)"));
+        }
+        let r = find_allowed(&state.db, 0, true, jump).await?;
+        if !r.ssh_enabled {
+            return Err(bad(format!("le rebond « {} » n'a pas de SSH", r.name)));
+        }
+        rows.push(r);
+    }
+    rows.reverse();
+    rows.into_iter()
+        .map(|r| {
+            let password = match &r.ssh_password {
+                Some(sealed) => Some(
+                    String::from_utf8_lossy(&state.vault.open(&format!("ssh:{}", r.id), sealed)?)
+                        .into_owned(),
+                ),
+                None => None,
+            };
+            Ok(Hop {
+                id: r.id,
+                name: r.name,
+                host: r.host,
+                port: r.ssh_port as u16,
+                user: r.ssh_user,
+                password,
+                hostkey: r.ssh_hostkey,
+            })
+        })
+        .collect()
+}
+
+async fn send(socket: &mut WebSocket, msg: &SshMessage) {
+    if let Ok(json) = serde_json::to_string(msg) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run(
+    state: AppState,
+    user: UserRow,
+    ip: std::net::IpAddr,
+    hops: Vec<Hop>,
+    host_theme: Option<String>,
+    trust: Option<(i64, String)>,
+    (cols, rows): (u16, u16),
+    token: Option<Vec<u8>>,
+    mut socket: WebSocket,
+) {
+    let target = hops.last().map(|h| (h.id, h.name.clone())).unwrap_or_default();
+    let fail = |message: String| SshMessage::Error { message };
+    let key = match ssh::service_key(&state).await {
+        Ok(k) => k,
+        Err(e) => return send(&mut socket, &fail(format!("clé SSH du service : {e:#}"))).await,
+    };
+    let started = Instant::now();
+    tracing::info!(user = user.username, %ip, connection = target.1, hops = hops.len(), "ouverture SSH");
+    let trust_ref = trust.as_ref().map(|(id, fp)| (*id, fp.as_str()));
+    let opened = match ssh::open(&hops, &key, trust_ref, cols, rows).await {
+        Ok(o) => o,
+        Err(OpenError::Unapproved { id, name, fingerprint }) => {
+            let msg = SshMessage::UntrustedHostKey {
+                connection_id: id,
+                name,
+                fingerprint,
+                can_approve: user.is_admin,
+            };
+            send(&mut socket, &msg).await;
+            let _ = socket.close().await;
+            return;
+        }
+        Err(OpenError::Failed(e)) => {
+            tracing::warn!(user = user.username, connection = target.1, "échec SSH : {e:#}");
+            return send(&mut socket, &fail(format!("{e:#}"))).await;
+        }
+    };
+    for (id, fp) in &opened.pinned {
+        let _ = sqlx::query("UPDATE connections SET ssh_hostkey = ? WHERE id = ? AND ssh_hostkey IS NULL")
+            .bind(fp)
+            .bind(id)
+            .execute(&state.db)
+            .await;
+        tracing::info!(
+            user = user.username,
+            host = id,
+            fingerprint = fp,
+            "clé SSH d'hôte approuvée et épinglée"
+        );
+    }
+    let prefs = terminal_prefs(&state.db, user.id).await.unwrap_or_else(|_| portique_proto::TerminalPrefs {
+        theme: portique_proto::TERMINAL_THEMES[0].into(),
+        combos: portique_proto::DEFAULT_COMBOS.iter().map(|c| (*c).into()).collect(),
+    });
+    send(&mut socket, &SshMessage::Ready { theme: host_theme.unwrap_or(prefs.theme), combos: prefs.combos })
+        .await;
+
+    let _sessions = opened.sessions;
+    let (mut from_host, to_host) = opened.channel.split();
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let upstream = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(b) => {
+                    if to_host.data(&b[..]).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Text(t) => {
+                    if let Ok(SshControl::Resize { cols, rows }) = serde_json::from_str(&t) {
+                        let (c, r) = (cols.clamp(10, 500), rows.clamp(5, 300));
+                        let _ = to_host.window_change(u32::from(c), u32::from(r), 0, 0).await;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = to_host.eof().await;
+    };
+    let downstream = async {
+        while let Some(msg) = from_host.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    if ws_tx.send(Message::Binary(data.to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitStatus { .. } => break,
+                _ => {}
+            }
+        }
+        let _ = ws_tx.close().await;
+    };
+    let watchdog = async {
+        let mut tick = tokio::time::interval(REVALIDATE_EVERY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if !still_allowed(&state, user.id, target.0, token.as_deref()).await {
+                tracing::info!(user = user.username, connection = target.1, "session révoquée : coupure SSH");
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = upstream => {}
+        _ = downstream => {}
+        _ = watchdog => {}
+    }
+    tracing::info!(
+        user = user.username,
+        connection = target.1,
+        seconds = started.elapsed().as_secs(),
+        "fin SSH"
+    );
+}

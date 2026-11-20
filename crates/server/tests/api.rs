@@ -357,3 +357,90 @@ async fn stolen_session_cannot_touch_2fa() {
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "code déjà utilisé : rejeu refusé");
 }
+
+#[tokio::test]
+async fn ssh_hosts_jumps_and_terminal_prefs() {
+    let app = setup(&[], "203.0.113.9:4000").await;
+    let admin = login(&app, "admin", ADMIN_PW).await;
+    let post = |body: Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move { call(&app, "POST", "/api/admin/connections", Some(&admin), Some(body), &[]).await }
+    };
+
+    // Ni RDP ni SSH : refusé.
+    let r = post(json!({"name": "Vide", "host": "10.0.0.1", "rdp": false})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let gw = post(json!({"name": "Passerelle", "host": "10.0.0.2", "rdp": false,
+        "ssh": {"user": "root", "password": "pw-ssh"}}))
+    .await;
+    assert_eq!(gw.status, StatusCode::CREATED, "{:?}", gw.body);
+    assert_eq!(gw.body["rdp"], false);
+    assert_eq!(gw.body["ssh"]["port"], 22);
+    assert_eq!(gw.body["ssh"]["has_password"], true);
+    assert!(gw.body["ssh"].get("password").is_none(), "le mot de passe SSH ne ressort jamais");
+    let gw_id = gw.body["id"].as_i64().unwrap();
+
+    let pc = post(json!({"name": "PC", "host": "192.0.2.50", "username": "alice",
+        "ssh": {"user": "alice", "port": 2201, "jump_id": gw_id, "theme": "alerte"}}))
+    .await;
+    assert_eq!(pc.status, StatusCode::CREATED, "{:?}", pc.body);
+    assert_eq!(pc.body["ssh"]["jump_id"], gw_id);
+    let pc_id = pc.body["id"].as_i64().unwrap();
+
+    // Boucle : la passerelle ne peut pas passer par le PC qui passe par elle.
+    let r = call(
+        &app,
+        "PUT",
+        &format!("/api/admin/connections/{gw_id}"),
+        Some(&admin),
+        Some(json!({"name": "Passerelle", "host": "10.0.0.2", "rdp": false,
+            "ssh": {"user": "root", "jump_id": pc_id}})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    // Rebond qui n'est pas un hôte SSH, thème inconnu : refusés.
+    let rdp_only = post(json!({"name": "RDP seul", "host": "10.0.0.3"})).await.body["id"].as_i64().unwrap();
+    let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "jump_id": rdp_only}})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "theme": "fluo"}})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let list = call(&app, "GET", "/api/connections", Some(&admin), None, &[]).await.body;
+    let pc = list.as_array().unwrap().iter().find(|c| c["name"] == "PC").unwrap();
+    assert_eq!((pc["rdp"].as_bool(), pc["ssh"].as_bool()), (Some(true), Some(true)));
+
+    // Clé du service : créée une fois, stable ensuite.
+    let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;
+    let k2 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;
+    assert!(k1["public"].as_str().unwrap().starts_with("ssh-ed25519 AAAA"), "{k1:?}");
+    assert_eq!(k1, k2);
+
+    // Préférences de terminal : défauts, puis validation.
+    let p = call(&app, "GET", "/api/account/terminal", Some(&admin), None, &[]).await.body;
+    assert_eq!(p["theme"], "sombre");
+    assert_eq!(p["combos"][0], "Ctrl+C");
+    let r = call(
+        &app,
+        "PUT",
+        "/api/account/terminal",
+        Some(&admin),
+        Some(json!({"theme": "nord", "combos": ["Ctrl+C", "Alt+B"]})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = call(
+        &app,
+        "PUT",
+        "/api/account/terminal",
+        Some(&admin),
+        Some(json!({"theme": "nord", "combos": ["Shift+C"]})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let p = call(&app, "GET", "/api/account/terminal", Some(&admin), None, &[]).await.body;
+    assert_eq!(p, json!({"theme": "nord", "combos": ["Ctrl+C", "Alt+B"]}));
+}

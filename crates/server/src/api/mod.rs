@@ -2,6 +2,7 @@ pub mod account;
 pub mod auth;
 pub mod connections;
 pub mod session;
+pub mod ssh;
 pub mod users;
 
 use axum::{
@@ -27,9 +28,12 @@ pub fn router() -> Router<AppState> {
         .route("/account/passkeys/{id}", delete(account::passkey_delete))
         .route("/account/passkeys/register/start", post(account::passkey_register_start))
         .route("/account/passkeys/register/finish", post(account::passkey_register_finish))
+        .route("/account/terminal", get(account::terminal_get).put(account::terminal_set))
         .route("/connections", get(connections::list))
         .route("/connections/{id}/wake", post(connections::wake))
         .route("/connections/{id}/session", get(session::open))
+        .route("/connections/{id}/ssh", get(ssh::open))
+        .route("/admin/ssh-key", get(ssh::service_key))
         .route("/admin/connections", get(connections::admin_list).post(connections::create))
         .route("/admin/connections/{id}", put(connections::update).delete(connections::delete))
         .route("/admin/users", get(users::list).post(users::create))

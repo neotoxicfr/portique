@@ -5,7 +5,9 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use portique_proto::{ConnectionAdmin, ConnectionInput, ConnectionSummary, Protocol};
+use portique_proto::{
+    ConnectionAdmin, ConnectionInput, ConnectionSummary, RDP_PORT, SSH_PORT, SshAdmin, SshInput,
+};
 use sqlx::SqlitePool;
 
 use crate::{
@@ -18,8 +20,8 @@ use crate::{
 pub(crate) struct Row {
     pub(crate) id: i64,
     pub(crate) name: String,
-    pub(crate) protocol: String,
     pub(crate) host: String,
+    pub(crate) rdp_enabled: bool,
     pub(crate) port: i64,
     pub(crate) username: String,
     pub(crate) domain: String,
@@ -33,24 +35,21 @@ pub(crate) struct Row {
     pub(crate) wol_ssh_command: Option<String>,
     pub(crate) wol_ssh_hostkey: Option<String>,
     pub(crate) wol_ssh_hostkey_pending: Option<String>,
+    pub(crate) ssh_enabled: bool,
+    pub(crate) ssh_port: i64,
+    pub(crate) ssh_user: String,
+    pub(crate) ssh_password: Option<Vec<u8>>,
+    pub(crate) ssh_hostkey: Option<String>,
+    pub(crate) ssh_jump_id: Option<i64>,
+    pub(crate) ssh_theme: Option<String>,
 }
 
 macro_rules! columns {
     () => {
-        "id, name, protocol, host, port, username, domain, password, wol_mac, wol_target, cert_sha256, \
-         wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey, wol_ssh_hostkey_pending"
+        "id, name, host, rdp_enabled, port, username, domain, password, wol_mac, wol_target, cert_sha256, \
+         wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_command, wol_ssh_hostkey, wol_ssh_hostkey_pending, \
+         ssh_enabled, ssh_port, ssh_user, ssh_password, ssh_hostkey, ssh_jump_id, ssh_theme"
     };
-}
-
-fn protocol(s: &str) -> Protocol {
-    if s == "ssh" { Protocol::Ssh } else { Protocol::Rdp }
-}
-
-fn protocol_str(p: Protocol) -> &'static str {
-    match p {
-        Protocol::Rdp => "rdp",
-        Protocol::Ssh => "ssh",
-    }
 }
 
 /// Connexion accessible à l'utilisateur ? Les admins voient tout.
@@ -149,7 +148,8 @@ pub async fn list(
             .map(|r| ConnectionSummary {
                 id: r.id,
                 name: r.name,
-                protocol: protocol(&r.protocol),
+                rdp: r.rdp_enabled,
+                ssh: r.ssh_enabled,
                 can_wake: r.wol_mac.is_some(),
             })
             .collect(),
@@ -165,16 +165,18 @@ pub async fn wake(
     let mac = row.wol_mac.as_deref().and_then(wol::parse_mac).ok_or_else(|| bad("WoL non configuré"))?;
     if let Some(host) = &row.wol_ssh_host {
         let password = match &row.wol_ssh_password {
-            Some(sealed) => {
+            Some(sealed) => Some(
                 String::from_utf8_lossy(&state.vault.open(&format!("wol-ssh:{}", row.id), sealed)?)
-                    .into_owned()
-            }
-            None => return Err(bad("réveil par commande pas encore configuré (mot de passe SSH absent)")),
+                    .into_owned(),
+            ),
+            None => None,
         };
+        let key = crate::ssh::service_key(&state).await?;
         let result = wol::ssh_command(
             host,
             row.wol_ssh_user.as_deref().unwrap_or_default(),
-            &password,
+            &key,
+            password.as_deref(),
             row.wol_ssh_command.as_deref().unwrap_or_default(),
             mac,
             row.wol_ssh_hostkey.as_deref(),
@@ -230,8 +232,8 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
     Ok(ConnectionAdmin {
         id: r.id,
         name: r.name,
-        protocol: protocol(&r.protocol),
         host: r.host,
+        rdp: r.rdp_enabled,
         port: r.port as u16,
         username: r.username,
         domain: r.domain,
@@ -247,6 +249,14 @@ async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
             has_password: r.wol_ssh_password.is_some(),
             hostkey: r.wol_ssh_hostkey.clone(),
             pending_hostkey: r.wol_ssh_hostkey_pending.clone(),
+        }),
+        ssh: r.ssh_enabled.then(|| SshAdmin {
+            port: r.ssh_port as u16,
+            user: r.ssh_user.clone(),
+            has_password: r.ssh_password.is_some(),
+            hostkey: r.ssh_hostkey.clone(),
+            jump_id: r.ssh_jump_id,
+            theme: r.ssh_theme.clone(),
         }),
     })
 }
@@ -269,7 +279,6 @@ pub async fn admin_list(
 /// Entrée validée et normalisée.
 struct Valid {
     name: String,
-    protocol: Protocol,
     host: String,
     port: u16,
     wol_mac: Option<String>,
@@ -288,10 +297,24 @@ fn validate(i: &ConnectionInput) -> ApiResult<Valid> {
     if !host_ok {
         return Err(bad("hôte invalide"));
     }
-    let protocol = i.protocol.unwrap_or(Protocol::Rdp);
-    let port = i.port.unwrap_or(protocol.default_port());
+    if !i.rdp && i.ssh.is_none() {
+        return Err(bad("choisir au moins un protocole (RDP ou SSH)"));
+    }
+    let port = i.port.unwrap_or(RDP_PORT);
     if port == 0 {
         return Err(bad("port invalide"));
+    }
+    if let Some(ssh) = &i.ssh {
+        if ssh.port == Some(0) {
+            return Err(bad("port SSH invalide"));
+        }
+        let user = ssh.user.trim();
+        if user.is_empty() || user.len() > 64 || user.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(bad("utilisateur SSH requis (sans espace)"));
+        }
+        if ssh.theme.as_deref().is_some_and(|t| !portique_proto::TERMINAL_THEMES.contains(&t)) {
+            return Err(bad("thème de terminal inconnu"));
+        }
     }
     let wol_mac = match i.wol_mac.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(m) => Some(wol::format_mac(wol::parse_mac(m).ok_or_else(|| bad("adresse MAC invalide"))?)),
@@ -303,7 +326,7 @@ fn validate(i: &ConnectionInput) -> ApiResult<Valid> {
         }
         None => None,
     };
-    Ok(Valid { name: name.into(), protocol, host: host.into(), port, wol_mac, wol_target })
+    Ok(Valid { name: name.into(), host: host.into(), port, wol_mac, wol_target })
 }
 
 async fn save_access(db: &SqlitePool, id: i64, users: &[i64]) -> ApiResult<()> {
@@ -319,6 +342,64 @@ async fn save_access(db: &SqlitePool, id: i64, users: &[i64]) -> ApiResult<()> {
         .await?;
     }
     Ok(())
+}
+
+/// SSH de l'hôte `id`. La clé d'hôte approuvée est oubliée si le port change (l'adresse : dans `update`).
+async fn save_ssh(state: &AppState, id: i64, ssh: &Option<SshInput>) -> ApiResult<()> {
+    let Some(s) = ssh else {
+        sqlx::query("UPDATE connections SET ssh_enabled = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        return Ok(());
+    };
+    if let Some(jump) = s.jump_id {
+        check_jump(&state.db, id, jump).await?;
+    }
+    let port = s.port.unwrap_or(SSH_PORT) as i64;
+    sqlx::query(
+        "UPDATE connections SET ssh_enabled = 1, ssh_user = ?, ssh_jump_id = ?, ssh_theme = ?,
+         ssh_hostkey = CASE WHEN ?4 OR ssh_port IS NOT ?5 THEN NULL ELSE ssh_hostkey END,
+         ssh_port = ?5 WHERE id = ?6",
+    )
+    .bind(s.user.trim())
+    .bind(s.jump_id)
+    .bind(s.theme.as_deref())
+    .bind(s.forget_hostkey)
+    .bind(port)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    if let Some(pw) = &s.password {
+        let sealed = (!pw.is_empty()).then(|| state.vault.seal(&format!("ssh:{id}"), pw.as_bytes()));
+        sqlx::query("UPDATE connections SET ssh_password = ? WHERE id = ?")
+            .bind(sealed)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Le rebond doit être un autre hôte SSH, sans boucle (A par B par A).
+async fn check_jump(db: &SqlitePool, id: i64, jump: i64) -> ApiResult<()> {
+    let mut cur = Some(jump);
+    for _ in 0..crate::ssh::MAX_HOPS {
+        let Some(c) = cur else { return Ok(()) };
+        if c == id {
+            return Err(bad("rebond en boucle : un hôte ne peut pas passer par lui-même"));
+        }
+        let next: Option<(bool, Option<i64>)> =
+            sqlx::query_as("SELECT ssh_enabled, ssh_jump_id FROM connections WHERE id = ?")
+                .bind(c)
+                .fetch_optional(db)
+                .await?;
+        match next {
+            Some((true, j)) => cur = j,
+            _ => return Err(bad("le rebond doit être un hôte SSH existant")),
+        }
+    }
+    Err(bad("trop de rebonds enchaînés"))
 }
 
 async fn save_password(state: &AppState, id: i64, pw: &Option<String>) -> ApiResult<()> {
@@ -339,11 +420,11 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<ConnectionAdmin>)> {
     let v = validate(&i)?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO connections (name, protocol, host, port, username, domain, wol_mac, wol_target)
+        "INSERT INTO connections (name, rdp_enabled, host, port, username, domain, wol_mac, wol_target)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&v.name)
-    .bind(protocol_str(v.protocol))
+    .bind(i.rdp)
     .bind(&v.host)
     .bind(v.port as i64)
     .bind(i.username.trim())
@@ -355,6 +436,7 @@ pub async fn create(
     save_password(&state, id, &i.password).await?;
     save_access(&state.db, id, &i.allowed_users).await?;
     save_wol_command(&state, id, &i.wol_command).await?;
+    save_ssh(&state, id, &i.ssh).await?;
     let row = find_allowed(&state.db, 0, true, id).await?;
     Ok((StatusCode::CREATED, Json(to_admin(&state.db, row).await?)))
 }
@@ -367,11 +449,12 @@ pub async fn update(
 ) -> ApiResult<Json<ConnectionAdmin>> {
     let v = validate(&i)?;
     let r = sqlx::query(
-        "UPDATE connections SET name = ?, protocol = ?, host = ?, port = ?, username = ?, domain = ?,
-         wol_mac = ?, wol_target = ? WHERE id = ?",
+        "UPDATE connections SET name = ?1, rdp_enabled = ?2, host = ?3, port = ?4, username = ?5, domain = ?6,
+         wol_mac = ?7, wol_target = ?8,
+         ssh_hostkey = CASE WHEN host IS NOT ?3 THEN NULL ELSE ssh_hostkey END WHERE id = ?9",
     )
     .bind(&v.name)
-    .bind(protocol_str(v.protocol))
+    .bind(i.rdp)
     .bind(&v.host)
     .bind(v.port as i64)
     .bind(i.username.trim())
@@ -387,6 +470,7 @@ pub async fn update(
     save_password(&state, id, &i.password).await?;
     save_access(&state.db, id, &i.allowed_users).await?;
     save_wol_command(&state, id, &i.wol_command).await?;
+    save_ssh(&state, id, &i.ssh).await?;
     if i.forget_certificate {
         sqlx::query("UPDATE connections SET cert_sha256 = NULL WHERE id = ?")
             .bind(id)

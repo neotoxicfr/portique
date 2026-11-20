@@ -77,14 +77,15 @@ impl std::fmt::Display for UnapprovedHostKey {
 
 impl std::error::Error for UnapprovedHostKey {}
 
-/// Réveil « par commande » : SSH (mot de passe) vers `host`, puis `template` où `{mac}` est remplacé
-/// par l'adresse MAC. `pinned` : empreinte SHA-256 approuvée de la clé d'hôte. Sans elle, la
-/// connexion s'arrête AVANT l'authentification (aucun mot de passe ne part) et renvoie
+/// Réveil « par commande » : SSH vers `host` (clé du service, puis mot de passe s'il y en a un), puis
+/// `template` où `{mac}` est remplacé par l'adresse MAC. `pinned` : empreinte SHA-256 approuvée de la
+/// clé d'hôte. Sans elle, la connexion s'arrête AVANT l'authentification (rien ne part) et renvoie
 /// `UnapprovedHostKey` avec la clé présentée, à faire approuver par un admin.
 pub async fn ssh_command(
     host: &str,
     user: &str,
-    password: &str,
+    key: &russh::keys::PrivateKey,
+    password: Option<&str>,
     template: &str,
     mac: [u8; 6],
     pinned: Option<&str>,
@@ -136,8 +137,16 @@ pub async fn ssh_command(
         }
         Err(_) => anyhow::bail!("l'hôte SSH ne répond pas (délai dépassé)"),
     };
-    let auth = session.authenticate_password(user, password).await.context("authentification SSH")?;
-    anyhow::ensure!(auth.success(), "identifiants SSH refusés");
+    let signer = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None);
+    let mut ok =
+        session.authenticate_publickey(user, signer).await.context("authentification SSH")?.success();
+    if !ok && let Some(pw) = password {
+        ok = session.authenticate_password(user, pw).await.context("authentification SSH")?.success();
+    }
+    anyhow::ensure!(
+        ok,
+        "identifiants SSH refusés (clé du service absente de l'hôte, mot de passe absent ou faux)"
+    );
     let mut channel = session.channel_open_session().await.context("canal SSH")?;
     // La MAC est formatée par nous (hexadécimal et « : ») : rien d'injectable.
     let cmd = template.replace("{mac}", &format_mac(mac));

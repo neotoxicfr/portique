@@ -14,6 +14,7 @@ cargo clippy -p portique-web --target wasm32-unknown-unknown --locked -- -D warn
 step "tests"
 cargo test --workspace --exclude portique-web --locked
 step "front"
+./scripts/vendor-xterm.sh
 (cd crates/web && trunk build --release --dist ../../dist)
 if command -v cargo-audit >/dev/null; then
   step "audit des dépendances"

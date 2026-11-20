@@ -1,6 +1,7 @@
 mod api;
 mod pages;
 mod session;
+mod ssh;
 
 use leptos::{prelude::*, task::spawn_local};
 use leptos_router::{
@@ -74,6 +75,7 @@ fn App() -> impl IntoView {
                 >
                     <Routes fallback=|| view! { <Shell><p>"Page introuvable."</p></Shell> }>
                         <Route path=path!("/session/:id") view=session::SessionPage/>
+                        <Route path=path!("/ssh/:id") view=ssh::SshPage/>
                         <Route path=path!("/") view=|| view! { <Shell><pages::home::Home/></Shell> }/>
                         <Route path=path!("/compte") view=|| view! { <Shell><pages::account::Account/></Shell> }/>
                         <Route path=path!("/admin") view=|| view! { <Shell><pages::admin::Admin/></Shell> }/>

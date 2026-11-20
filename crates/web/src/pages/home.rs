@@ -1,5 +1,5 @@
 use leptos::{prelude::*, task::spawn_local};
-use portique_proto::{ConnectionSummary, Protocol};
+use portique_proto::ConnectionSummary;
 
 use crate::{Session, api};
 
@@ -40,9 +40,18 @@ pub fn Home() -> impl IntoView {
             Some(l) => view! {
                 <ul class="tiles">
                     {l.into_iter().map(|c| {
-                        let proto = match c.protocol { Protocol::Rdp => "RDP", Protocol::Ssh => "SSH" };
+                        let proto = match (c.rdp, c.ssh) { (true, true) => "RDP · SSH", (false, true) => "SSH", _ => "RDP" };
                         let can_wake = c.can_wake;
                         let c2 = c.clone();
+                        // Un seul protocole : le bouton connecte directement ; les deux : le choix.
+                        let open = match (c.rdp, c.ssh) {
+                            (true, true) => view! {
+                                <a class="button" href=format!("/session/{}", c.id)>"Bureau"</a>
+                                <a class="button" href=format!("/ssh/{}", c.id)>"Terminal"</a>
+                            }.into_any(),
+                            (false, true) => view! { <a class="button" href=format!("/ssh/{}", c.id)>"Ouvrir"</a> }.into_any(),
+                            _ => view! { <a class="button" href=format!("/session/{}", c.id)>"Ouvrir"</a> }.into_any(),
+                        };
                         view! {
                             <li class="card tile">
                                 <div class="tile-head">
@@ -50,7 +59,7 @@ pub fn Home() -> impl IntoView {
                                     <span class="badge">{proto}</span>
                                 </div>
                                 <div class="actions">
-                                    <a class="button" href=format!("/session/{}", c.id)>"Ouvrir"</a>
+                                    {open}
                                     <Show when=move || can_wake>
                                         {
                                             let c = c2.clone();

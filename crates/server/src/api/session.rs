@@ -24,7 +24,7 @@ use crate::{
 
 /// Le WebSocket n'est pas protégé par CORS : on exige que l'origine soit le site lui-même
 /// (sinon une page tierce pourrait ouvrir une session avec le cookie de l'utilisateur).
-fn same_origin(headers: &HeaderMap, public: &url::Url) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap, public: &url::Url) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else { return false };
     url::Url::parse(origin).is_ok_and(|o| o.origin() == public.origin())
 }
@@ -48,8 +48,8 @@ pub async fn open(
         return Err(AppError::Forbidden);
     }
     let row = find_allowed(&state.db, user.id, user.is_admin, id).await?;
-    if row.protocol != "rdp" {
-        return Err(bad("seul le RDP est disponible pour l'instant"));
+    if !row.rdp_enabled {
+        return Err(bad("pas de RDP sur cet hôte"));
     }
     let trust = match q.trust.as_deref() {
         Some(t) if user.is_admin => Some(
@@ -78,7 +78,12 @@ async fn fail(mut socket: WebSocket, message: String) {
 }
 
 /// La session web et l'accès à la connexion sont-ils toujours valides ?
-async fn still_allowed(state: &AppState, user_id: i64, connection_id: i64, token: Option<&[u8]>) -> bool {
+pub(crate) async fn still_allowed(
+    state: &AppState,
+    user_id: i64,
+    connection_id: i64,
+    token: Option<&[u8]>,
+) -> bool {
     let user = match crate::auth::user_by_id(&state.db, user_id).await {
         Ok(Some(u)) => u,
         _ => return false,
@@ -99,7 +104,7 @@ async fn still_allowed(state: &AppState, user_id: i64, connection_id: i64, token
     find_allowed(&state.db, user.id, user.is_admin, connection_id).await.is_ok()
 }
 
-const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn run(
     state: AppState,

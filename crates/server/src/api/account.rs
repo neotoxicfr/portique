@@ -6,7 +6,8 @@ use axum::{
     http::StatusCode,
 };
 use portique_proto::{
-    CeremonyChallenge, CeremonyFinish, ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup,
+    CeremonyChallenge, CeremonyFinish, ChangePassword, Combo, DEFAULT_COMBOS, PasskeyInfo, ReAuth,
+    TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
 };
 use uuid::Uuid;
 use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential};
@@ -209,4 +210,51 @@ pub async fn passkey_delete(
         .execute(&state.db)
         .await?;
     if r.rows_affected() == 0 { Err(AppError::NotFound) } else { Ok(StatusCode::NO_CONTENT) }
+}
+
+/// Préférences de terminal du compte, valeurs par défaut comprises.
+pub(crate) async fn terminal_prefs(db: &sqlx::SqlitePool, user_id: i64) -> ApiResult<TerminalPrefs> {
+    let (theme, combos): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT terminal_theme, key_combos FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(db)
+            .await?;
+    Ok(TerminalPrefs {
+        theme: theme.unwrap_or_else(|| TERMINAL_THEMES[0].into()),
+        combos: combos
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_else(|| DEFAULT_COMBOS.iter().map(|c| (*c).into()).collect()),
+    })
+}
+
+pub async fn terminal_get(
+    State(state): State<AppState>,
+    CurrentUser(u): CurrentUser,
+) -> ApiResult<Json<TerminalPrefs>> {
+    Ok(Json(terminal_prefs(&state.db, u.id).await?))
+}
+
+/// Préférences de terminal : réglables aussi par un compte géré par le proxy (rien de sensible).
+pub async fn terminal_set(
+    State(state): State<AppState>,
+    CurrentUser(u): CurrentUser,
+    Json(p): Json<TerminalPrefs>,
+) -> ApiResult<Json<TerminalPrefs>> {
+    if !TERMINAL_THEMES.contains(&p.theme.as_str()) {
+        return Err(bad("thème de terminal inconnu"));
+    }
+    if p.combos.len() > 12 {
+        return Err(bad("12 combinaisons au plus"));
+    }
+    let combos: Vec<String> = p.combos.iter().map(|c| c.trim().to_owned()).collect();
+    if let Some(c) = combos.iter().find(|c| Combo::parse(c).is_none()) {
+        return Err(bad(format!("combinaison invalide : « {c} » (ex. Ctrl+C, Alt+B, Ctrl+Alt+D)")));
+    }
+    sqlx::query("UPDATE users SET terminal_theme = ?, key_combos = ? WHERE id = ?")
+        .bind(&p.theme)
+        .bind(serde_json::to_string(&combos).map_err(anyhow::Error::from)?)
+        .bind(u.id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(TerminalPrefs { theme: p.theme, combos }))
 }

@@ -8,3 +8,5 @@ secrets
 CLAUDE.md
 .claude
 .env
+crates/web/vendor/xterm/*
+!crates/web/vendor/xterm/README.md

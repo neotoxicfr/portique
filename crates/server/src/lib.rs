@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod ratelimit;
+pub mod ssh;
 pub mod state;
 pub mod totp;
 pub mod wol;

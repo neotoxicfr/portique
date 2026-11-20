@@ -1,5 +1,7 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
-use portique_proto::{ChangePassword, PasskeyInfo, ReAuth, TotpConfirm, TotpSetup};
+use portique_proto::{
+    ChangePassword, PasskeyInfo, ReAuth, TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
+};
 
 use crate::{Session, api};
 
@@ -17,6 +19,58 @@ pub fn Account() -> impl IntoView {
             <Totp/>
             <Passkeys/>
         </Show>
+        <Terminal/>
+    }
+}
+
+/// Thème par défaut du terminal SSH (un hôte peut avoir le sien) et combinaisons de la barre de touches.
+#[component]
+fn Terminal() -> impl IntoView {
+    let theme = RwSignal::new(String::new());
+    let combos = RwSignal::new(String::new());
+    let st = status();
+    spawn_local(async move {
+        if let Ok(p) = api::get::<TerminalPrefs>("/api/account/terminal").await {
+            theme.set(p.theme);
+            combos.set(p.combos.join(", "));
+        }
+    });
+    let submit = move |ev: SubmitEvent| {
+        ev.prevent_default();
+        let body = TerminalPrefs {
+            theme: theme.get_untracked(),
+            combos: combos
+                .get_untracked()
+                .split(',')
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty())
+                .collect(),
+        };
+        spawn_local(async move {
+            let r = api::send::<_, TerminalPrefs>("PUT", "/api/account/terminal", &body).await;
+            st.set(Some(
+                r.map(|_| "Préférences du terminal enregistrées.".into()).map_err(|e| e.to_string()),
+            ));
+        });
+    };
+    view! {
+        <section class="card">
+            <h2>"Terminal SSH"</h2>
+            <form on:submit=submit class="stack">
+                <label>"Thème par défaut"
+                    <select prop:value=move || theme.get() on:change=move |ev| theme.set(event_target_value(&ev))>
+                        {TERMINAL_THEMES.iter().map(|t| view! { <option value=*t>{*t}</option> }).collect_view()}
+                    </select>
+                </label>
+                <label>"Combinaisons de la barre de touches (séparées par des virgules)"
+                    <input type="text" class="mono" placeholder="Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+R, Ctrl+L"
+                        prop:value=move || combos.get() on:input=move |ev| combos.set(event_target_value(&ev))/>
+                </label>
+                <p class="muted">"Ctrl+lettre, Alt+lettre ou Ctrl+Alt+lettre, 12 au plus. La barre apparaît en bas de l'écran sur téléphone et tablette, au-dessus du clavier."</p>
+                <button type="submit">"Enregistrer"</button>
+            </form>
+            {show_status(st)}
+        </section>
     }
 }
 

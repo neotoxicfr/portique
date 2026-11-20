@@ -2,6 +2,33 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.3.0] - 2026-11-20
+
+### Ajouté
+
+- **SSH.** Une machine offre le RDP, le SSH ou les deux (une seule tuile, le choix au clic quand il y a
+  les deux). Le serveur ouvre la session avec un terminal et suit le redimensionnement ; le navigateur
+  affiche xterm.js, servi par Portique (aucun CDN).
+- **Clé SSH du service** : ed25519, créée au premier besoin et chiffrée en base. La page admin donne la
+  ligne `authorized_keys`, avec `from=` facultatif. Le mot de passe de l'hôte, s'il y en a un, sert de
+  second essai.
+- **Rebonds** : un hôte SSH peut passer par un autre, en chaîne ; une boucle est refusée. La clé d'hôte de
+  chaque saut est approuvée par un admin, puis épinglée.
+- **Barre de touches** sur écran tactile, au-dessus du clavier virtuel : Échap, Tab, Ctrl et Alt collants,
+  flèches et combinaisons du compte (page « Mon compte »).
+- **Thèmes du terminal** : sombre, clair, solarisé, Dracula, Nord, alerte ; par compte, remplaçable par hôte.
+- Le réveil par commande SSH essaie aussi la clé du service : le mot de passe devient facultatif.
+
+### Sécurité
+
+- Ouvrir un terminal exige la double authentification en mode intégré (TOTP ou passkey) : la clé du
+  service ouvre toutes les machines où elle est posée.
+
+### Modifié
+
+- Les connexions deviennent des hôtes : le champ `protocol` de l'API est remplacé par `rdp` et `ssh`. La
+  migration garde le RDP des connexions existantes.
+
 ## [v0.2.0] - 2026-11-20
 
 ### Modifié

@@ -2,19 +2,19 @@
 
 # Portique
 
-**Ton bureau Windows dans un navigateur**, sans Java, sans guacd, sans plugin.
+**Tes machines dans un navigateur** : bureau Windows en RDP et terminal SSH, sans Java, sans guacd, sans plugin.
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.2.0-green)
+![Version](https://img.shields.io/badge/version-v0.3.0-green)
 
 </div>
 
-Portique est un client RDP web auto-hébergé, écrit en Rust de bout en bout. Le serveur établit la connexion
-authentifiée avec le PC, puis ne fait que relayer les octets. C'est le navigateur qui décode l'image (wasm
-et WebCodecs). La pile RDP est **écrite à partir des spécifications Microsoft**, sans aucune crate RDP
-tierce.
+Portique est un accès web auto-hébergé à tes machines, écrit en Rust de bout en bout : bureau Windows en
+RDP, terminal en SSH, une tuile par machine. En RDP, le serveur établit la connexion authentifiée avec le
+PC, puis ne fait que relayer les octets : c'est le navigateur qui décode l'image (wasm et WebCodecs). La
+pile RDP est **écrite à partir des spécifications Microsoft**, sans aucune crate RDP tierce.
 
 Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de léger :
 
@@ -24,6 +24,7 @@ Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de lé
 | Décodage de l'image | sur le serveur, réencodée en PNG/JPEG | dans le navigateur ; H.264 décodé par le GPU du client |
 | Identifiants Windows | envoyés à guacd | ne quittent jamais le serveur (NLA faite côté serveur) |
 | Presse-papier | texte | texte, HTML et images, dans les deux sens |
+| SSH | clé ou mot de passe par connexion | une clé du service, rebonds enchaînés, barre de touches mobile |
 
 ## Fonctions
 
@@ -34,7 +35,17 @@ Il est conçu pour remplacer Apache Guacamole quand on veut quelque chose de lé
 - **Affichage adaptatif** : résolution dynamique (la session suit la fenêtre), multi-écran (une fenêtre par
   écran), plein écran avec capture du clavier (Alt+Tab, touche Windows…), Ctrl+Alt+Suppr depuis le menu de
   session.
-- **Fiabilité** : reconnexion automatique, appli installable (PWA).
+- **Terminal SSH** (xterm.js, servi par Portique) :
+  - une machine peut offrir le RDP, le SSH ou les deux : avec les deux, la tuile propose le choix ;
+  - une **clé ed25519 du service**, chiffrée en base, posée sur chaque hôte (`from=` facultatif), puis le
+    mot de passe de l'hôte s'il y en a un ;
+  - **rebonds** : un hôte peut passer par un autre hôte SSH, en chaîne (comme `ProxyJump`) ;
+  - clé d'hôte approuvée par un admin à chaque saut, puis épinglée ;
+  - **barre de touches** sur téléphone et tablette, juste au-dessus du clavier virtuel : Échap, Tab, Ctrl
+    et Alt collants, flèches, combinaisons enregistrées par compte (Ctrl+C, Ctrl+R…) ;
+  - **thèmes** de couleur par compte, remplaçables par hôte (ex. rouge sombre pour la production).
+- **Fiabilité** : reconnexion automatique, appli installable (PWA), images amd64 et arm64 : une seconde
+  instance peut tourner sur une petite machine ARM et servir de secours derrière le reverse proxy.
 - **Wake-on-LAN** : paquet magique UDP direct, ou commande SSH sur un hôte du réseau du PC (par exemple un
   routeur MikroTik : `/tool wol interface=ether1 mac={mac}`), indispensable à travers un VPN.
 - **Comptes** : mot de passe Argon2id, TOTP, passkeys (WebAuthn), rôles admin et utilisateur, accès par
@@ -50,11 +61,15 @@ flowchart LR
     B["Navigateur<br/>Leptos + pile RDP en wasm<br/>WebCodecs"] -- "WSS<br/>(flux RDP chiffré)" --> S["Serveur portique<br/>axum, SQLite"]
     S -- "TCP 3389<br/>TLS + CredSSP/NLA" --> P["PC Windows"]
     S -. "Wake-on-LAN<br/>UDP ou SSH" .-> P
+    S -- "SSH (clé du service)<br/>rebonds éventuels" --> H["Hôtes SSH"]
 ```
 
 Le serveur négocie X.224, TLS (certificat épinglé) et CredSSP/NTLMv2 avec les identifiants stockés
 chiffrés. Il passe ensuite la session au navigateur, qui gère tout le reste : canaux, graphismes,
 presse-papier, entrées. La même pile compile en natif et en wasm.
+
+En SSH, c'est l'inverse : le serveur **termine** la session (russh, avec terminal et redimensionnement) et
+relaie le texte du terminal au navigateur, sous WSS.
 
 | Crate | Rôle |
 |---|---|
@@ -146,19 +161,22 @@ pour le réseau local, laisse passer les requêtes sans `Remote-User`, et l'API 
 - CSP stricte : seul le script d'amorce du wasm est autorisé, par son empreinte.
 - Cookies `SameSite=Strict`, en-tête anti-CSRF et contrôle d'origine du WebSocket.
 - Limitation des tentatives de connexion, réauthentification pour modifier la 2FA.
-- Session RDP coupée dès que la session web est révoquée ou que l'accès est retiré.
+- Session RDP ou SSH coupée dès que la session web est révoquée ou que l'accès est retiré.
+- La clé SSH du service ouvre toutes les machines où elle est posée : en mode intégré, ouvrir un terminal
+  exige un TOTP ou une passkey ; en mode proxy, le proxy doit imposer la double authentification.
+- En SSH, le serveur voit le texte du terminal (il termine la session) : il ne le conserve pas.
 - Budgets de mémoire et de CPU sur tout ce qui vient du PC (surfaces, cache, régions H.264).
 
 Pour signaler une faille, voir [SECURITY.md](SECURITY.md).
 
 ## Feuille de route
 
-La V1 (`v0.1.0`) couvre l'usage bureau quotidien. Pour la suite :
+La V1 (`v0.1.0`) couvre l'usage bureau quotidien, la `v0.3.0` ajoute le SSH. Pour la suite :
 
 - transcodage HEVC/AV1 sur le serveur (NVENC, QSV, VAAPI, SVT-AV1), au choix comme un réglage de qualité ;
 - son, micro, transfert et copier-coller de fichiers ;
-- confort mobile (trackpad, barre de touches, multi-touch), HiDPI et zoom ;
-- client SSH, partage et enregistrement de session.
+- confort mobile en RDP (trackpad, barre de touches, multi-touch), HiDPI et zoom ;
+- partage et enregistrement de session.
 
 ## Développement
 

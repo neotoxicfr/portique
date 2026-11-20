@@ -2,7 +2,7 @@
 # portique : serveur (Rust) + front wasm (Leptos, trunk) dans une image Debian minimale.
 
 FROM rust:1.100.0-slim-trixie AS build
-RUN apt-get update && apt-get install -y --no-install-recommends perl make pkg-config \
+RUN apt-get update && apt-get install -y --no-install-recommends perl make pkg-config curl openssl \
  && rm -rf /var/lib/apt/lists/* \
  && rustup target add wasm32-unknown-unknown \
  && cargo install --locked trunk --version 0.21.14
@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p portique-server \
  && cp target/release/portique /portique \
- && cd crates/web && trunk build --release --dist /web
+ && ./scripts/vendor-xterm.sh && cd crates/web && trunk build --release --dist /web
 
 FROM debian:trixie-slim
 ARG VERSION=dev

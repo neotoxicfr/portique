@@ -23,6 +23,7 @@ for p in "${pkgs[@]}"; do
   mkdir -p "$f.d" && tar -xzf "$f" -C "$f.d"
 done
 # Builds UMD (variables globales Terminal et FitAddon), sans la ligne sourceMappingURL.
+rm -f "$dest/.pkgs"   # une copie interrompue ne doit pas passer pour une installation complète
 grep -v '^//# sourceMappingURL=' "$tmp/xterm-6.0.0.tgz.d/package/lib/xterm.js" > "$dest/xterm.js"
 grep -v '^//# sourceMappingURL=' "$tmp/addon-fit-0.11.0.tgz.d/package/lib/addon-fit.js" > "$dest/addon-fit.js"
 cp "$tmp/xterm-6.0.0.tgz.d/package/css/xterm.css" "$dest/xterm.css"

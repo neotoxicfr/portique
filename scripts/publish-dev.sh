@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Image de branche ghcr.io/neotoxicfr/portique:dev (amd64 + arm64), à republier à chaque livraison sur dev
-# (dépôt privé : pas de CI GitHub). Les déploiements suivent ce tag.
+# (construite ici : la CI GitHub ne publie que les releases). Les déploiements suivent ce tag.
 # Prérequis : .env (voir .env.exemple), arbre propre dont HEAD = origin/dev.
 set -euo pipefail
 cd "$(dirname "$0")/.."

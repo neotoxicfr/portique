@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vérifications locales, à lancer avant chaque push (pas de CI GitHub : tout se fait sur le poste).
+# Vérifications à lancer avant chaque push ; la CI GitHub (.github/workflows/ci.yml) lance ce même script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

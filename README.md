@@ -216,15 +216,17 @@ Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkr
 ```sh
 ./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
 (cd crates/web && trunk build --release --dist ../../dist)
-mkdir -p secrets && [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key  # stable : ./data en dépend
+(umask 077; mkdir -p secrets; [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key)
+chmod 600 secrets/master_key             # clé stable : ./data en dépend
 PORTIQUE_PUBLIC_URL=http://localhost:18431 PORTIQUE_LISTEN=127.0.0.1:18431 PORTIQUE_DATA_DIR=./data \
 PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY_FILE=secrets/master_key \
 PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 
-Les images amd64 et arm64 se construisent en natif (`scripts/build-image.sh`, sans émulation) ; les versions se
-publient par `scripts/release.sh X.Y.Z`. Les contributions sont bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md),
-[code de conduite](CODE_OF_CONDUCT.md).
+Les images amd64 et arm64 se construisent en natif, sans émulation : runners GitHub des deux architectures pour
+les releases, `scripts/build-image.sh` pour l'image `dev`. Une version se publie par `scripts/release.sh X.Y.Z` :
+contrôles, tag poussé, release créée par le workflow, puis notes posées dessus. Les contributions sont
+bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md), [code de conduite](CODE_OF_CONDUCT.md).
 
 ## Feuille de route
 

@@ -70,6 +70,6 @@ docker run --rm --network container:<tunnel> \
 - Presse-papier : un Ctrl+V transmis trop tôt colle l'ancien contenu ; attendre l'accusé (Format List
   Response) de notre liste de formats, que Windows n'envoie qu'une fois notre contenu installé.
 - Le Wake-on-LAN en broadcast ne traverse pas un tunnel IP ; une commande envoyée par SSH à un hôte du
-  réseau du PC (par exemple `/tool wol` sur un routeur MikroTik) fonctionne.
+  réseau du PC (routeur, serveur…) qui émet le paquet magique fonctionne.
 - Sur un lien lointain, chaque aller-retour compte : les jointures de canaux MCS (une par canal) se sautent
   quand Windows annonce `SKIP_CHANNELJOIN_SUPPORTED`, ce qu'il fait.

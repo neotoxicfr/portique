@@ -26,6 +26,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   cadre), page hors ligne dès le premier lancement.
 - L'API des connexions expose `alert` ; le champ `reset_2fa` de la mise à jour d'un compte est retiré.
 - Les scripts « Préparer un PC » contrôlent chaque étape et gardent des fins de ligne Windows.
+- Réveil par commande SSH : plus de commande proposée par défaut, et seul le code de sortie de l'hôte décide de
+  l'échec (la sortie n'est plus lue). Une commande qui échoue en répondant 0 passe désormais pour réussie.
 
 ### Sécurité
 

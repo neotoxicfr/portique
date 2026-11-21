@@ -6,9 +6,6 @@ use wasm_bindgen::JsCast;
 
 use crate::{Session, api, glyph, icon, sentence};
 
-/// Commande de réveil proposée pour un routeur MikroTik (RouterOS).
-const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
-
 const CHECK: &str = r#"<path d="M5 12l5 5 9-10"/>"#;
 const RESET: &str = r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#;
 const STAR: &str = r#"<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>"#;
@@ -356,7 +353,7 @@ impl Form {
         self.wol_by_command.set(w.is_some());
         self.cmd_host.set(s(w.map(|w| w.host.as_str())));
         self.cmd_user.set(s(w.map(|w| w.user.as_str())));
-        self.cmd_command.set(w.map(|w| w.command.clone()).unwrap_or_else(|| MIKROTIK_COMMAND.into()));
+        self.cmd_command.set(w.map(|w| w.command.clone()).unwrap_or_default());
         self.cmd_password.set(String::new());
         self.cmd_has_password.set(w.is_some_and(|w| w.has_password));
         self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
@@ -743,7 +740,7 @@ fn Editor(
                                         title="Paquet magique UDP : même réseau, ou broadcast dirigé"
                                         on:click=move |_| f.wol_by_command.set(false)>"UDP direct"</button>
                                     <button type="button" aria-pressed=move || f.wol_by_command.get().to_string()
-                                        title="Commande SSH sur un hôte du réseau du PC (routeur MikroTik…) : indispensable à travers un VPN"
+                                        title="Commande SSH sur un hôte du réseau du PC : indispensable à travers un VPN"
                                         on:click=move |_| f.wol_by_command.set(true)>"Commande SSH"</button>
                                 </div></div>
                             <Show
@@ -783,7 +780,7 @@ fn Editor(
                                 })}
                                 {move || f.cmd_pending.get().map(|k| view! {
                                     <div class="line col">
-                                        <span>"Clé présentée par l'hôte, à comparer avec la sienne (MikroTik : " <code>"/ip ssh print"</code> ")"</span>
+                                        <span>"Clé présentée par l'hôte, à comparer avec la sienne"</span>
                                         <span class="val">{k}</span>
                                     </div>
                                     <label class="line"><span class="line-label grow">"Elle est identique : approuver"</span>{switch(f.cmd_approve)}</label>

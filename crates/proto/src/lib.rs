@@ -177,7 +177,7 @@ pub struct SshInput {
 }
 
 /// Réveil par commande : SSH vers `host` puis `command`, où `{mac}` est remplacé par l'adresse
-/// MAC (ex. routeur MikroTik : `/tool wol interface=ether1 mac={mac}`).
+/// MAC (par exemple `wakeonlan {mac}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WolCommandAdmin {
     /// Hôte SSH déclaré par lequel passe la commande ; `None` = adresse `host` saisie.

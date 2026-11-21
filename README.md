@@ -10,7 +10,7 @@
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Images](https://img.shields.io/badge/images-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.3.0-green)
+![Version](https://img.shields.io/badge/version-v0.4.0-green)
 
 </div>
 
@@ -52,6 +52,8 @@ navigateur côté client, ordinateur ou téléphone.
   fenêtre par écran) ; plein écran avec capture du clavier (Alt+Tab, touche Windows) ; Ctrl+Alt+Suppr.
 - Reconnexion automatique ; ouverture rapide même sur un lien lointain (jointure des canaux évitée quand
   Windows le permet).
+- **Sur iPhone et iPad** : bouton clavier (texte, saisie IME, coller), toucher pour cliquer, appui long pour le
+  clic droit, deux doigts pour défiler, pincer pour zoomer la vue.
 - **Wake-on-LAN** : paquet magique direct, ou commande lancée par un hôte SSH du réseau du PC (un routeur, par
   exemple), indispensable à travers un VPN.
 - Préparation du PC **sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
@@ -70,12 +72,14 @@ navigateur côté client, ordinateur ou téléphone.
 
 - Comptes intégrés : mot de passe Argon2id, TOTP, passkeys ; rôles admin et utilisateur ; accès par machine.
 - Ou **mode proxy** : Authelia, Authentik… devant, connexion intégrée désactivée, comptes créés à la volée.
-- Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur.
+- Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur, en clair et en
+  sombre selon l'appareil : une carte par machine, trois boutons toujours à la même place (Terminal, Bureau,
+  Réveil).
 
 <p align="center">
   <img src="docs/images/accueil-mobile.png" width="24%" alt="Accueil sur téléphone">
   <img src="docs/images/terminal-mobile.png" width="24%" alt="Terminal et barre de touches sur téléphone">
-  <img src="docs/images/connexion.png" width="49%" alt="Écran de connexion">
+  <img src="docs/images/accueil-sombre.png" width="49%" alt="Accueil en thème sombre">
 </p>
 
 ## Démarrer

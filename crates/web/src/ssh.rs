@@ -39,6 +39,10 @@ extern "C" {
     fn rows(this: &Terminal) -> u16;
     #[wasm_bindgen(method, getter)]
     fn options(this: &Terminal) -> JsValue;
+    #[wasm_bindgen(method, getter)]
+    fn element(this: &Terminal) -> Option<web_sys::HtmlElement>;
+    #[wasm_bindgen(method)]
+    fn resize(this: &Terminal, cols: u16, rows: u16);
 }
 
 #[wasm_bindgen]
@@ -174,6 +178,7 @@ impl Live {
             return;
         }
         self.fit.fit();
+        self.trim_overflow();
         let size = (self.term.cols(), self.term.rows());
         // La taille n'est mémorisée qu'une fois envoyée : un changement pendant la connexion
         // part à `Ready`.
@@ -186,6 +191,24 @@ impl Live {
             && ws.send_with_str(&msg).is_ok()
         {
             *self.size.borrow_mut() = size;
+        }
+    }
+
+    /// Sécurité après `fit` : la hauteur de ligne qu'il mesure peut différer du rendu réel (iOS), et
+    /// l'écran déborderait alors sur la barre de touches. Une ligne de moins tant qu'il dépasse son cadre.
+    fn trim_overflow(&self) {
+        let Some(el) = self.term.element() else { return };
+        let (Some(frame), Ok(Some(screen))) = (el.parent_element(), el.query_selector(".xterm-screen"))
+        else {
+            return;
+        };
+        let limit = frame.get_bounding_client_rect().bottom();
+        for _ in 0..5 {
+            let rows = self.term.rows();
+            if rows <= 1 || screen.get_bounding_client_rect().bottom() <= limit + 0.5 {
+                break;
+            }
+            self.term.resize(self.term.cols(), rows - 1);
         }
     }
 

@@ -515,7 +515,9 @@ impl Engine {
                         Some(d) => d.decode(&data).await,
                         None => Err(DecodeError::Unusable("décodeur H.264 indisponible".into())),
                     };
-                    self.set_image(h264::Kind::Avc420, h264.as_ref().and_then(H264::format));
+                    if decoded.is_ok() {
+                        self.set_image(h264::Kind::Avc420, h264.as_ref().and_then(H264::format));
+                    }
                     let more = match decoded {
                         Ok(Decoded::Yuv(p)) => self.inner.borrow_mut().gfx.submit_yuv420(&p.view()),
                         Ok(Decoded::Rgba { width, height, data }) => self
@@ -556,7 +558,8 @@ impl Engine {
                         };
                         decoded.push(frame);
                     }
-                    let mut kind = h264::Kind::Avc444;
+                    // Rendu effectif, pour le libellé : une image qui n'affiche rien le laisse tel quel.
+                    let mut kind = None;
                     let mut gfx = std::cell::RefMut::map(self.inner.borrow_mut(), |i| &mut i.gfx);
                     fn rgba(f: &Option<Decoded>) -> Option<rdp_gfx::Rgba<'_>> {
                         match f {
@@ -569,43 +572,67 @@ impl Engine {
                             _ => None,
                         }
                     }
+                    fn yuv(f: &Option<Decoded>) -> Option<rdp_gfx::Yuv420<'_>> {
+                        match f {
+                            Some(Decoded::Yuv(p)) => Some(p.view()),
+                            _ => None,
+                        }
+                    }
                     let (m_rgb, a_rgb) = (rgba(&decoded[0]), rgba(&decoded[1]));
+                    let mixed = "H.264 (4:4:4) : sous-images en YUV et en RGB, chroma de l'auxiliaire perdue";
                     let more = match (failed, &decoded[0], &decoded[1]) {
                         (Some(e), ..) => {
                             web_sys::console::warn_1(&format!("H.264 (4:4:4) : {e}").into());
                             gfx.skip_frame()
                         }
+                        // Le décodeur a changé de format entre les deux sous-images : la principale
+                        // seule, perte signalée.
+                        (None, Some(Decoded::Yuv(_)), Some(Decoded::Rgba { .. })) => {
+                            web_sys::console::warn_1(&mixed.into());
+                            kind = Some(h264::Kind::Avc444);
+                            gfx.submit_avc444(yuv(&decoded[0]).as_ref(), None)
+                        }
+                        (None, Some(Decoded::Rgba { .. }), Some(Decoded::Yuv(_))) => {
+                            web_sys::console::warn_1(&mixed.into());
+                            kind = Some(h264::Kind::Avc444);
+                            gfx.submit_rgba(m_rgb.as_ref().expect("principale RGB"))
+                        }
                         // Navigateur qui ne rend que du RGB : plans YUV retrouvés en inversant sa
-                        // conversion, puis 4:4:4 comme d'habitude. Si elle ne s'inverse pas, la
-                        // sous-image principale seule (image 4:2:0 complète) ; l'auxiliaire n'a alors
-                        // que nourri le décodeur.
-                        _ if m_rgb.is_some() || (decoded[0].is_none() && a_rgb.is_some()) => {
+                        // conversion, puis 4:4:4. Si elle ne s'inverse pas, la sous-image principale
+                        // seule (image 4:2:0 complète) ; l'auxiliaire n'a alors que nourri le décodeur.
+                        _ if m_rgb.is_some() || a_rgb.is_some() => {
                             match gfx.submit_avc444_rgba(m_rgb.as_ref(), a_rgb.as_ref()) {
-                                Ok(out) => {
-                                    if gfx.rgb_444() {
-                                        kind = h264::Kind::Avc444Rgb;
-                                    }
+                                Ok((out, shown)) => {
+                                    kind = match shown {
+                                        rdp_gfx::Shown::Rebuilt => Some(h264::Kind::Avc444Rgb),
+                                        rdp_gfx::Shown::Main => Some(h264::Kind::Avc444),
+                                        rdp_gfx::Shown::Nothing => None,
+                                    };
                                     Ok(out)
                                 }
-                                Err(_) => match &m_rgb {
-                                    Some(m) => gfx.submit_rgba(m),
+                                // Refus qui laisse la commande en attente : repli.
+                                Err(_) if gfx.waiting_for_avc() => match &m_rgb {
+                                    Some(m) => {
+                                        kind = Some(h264::Kind::Avc444);
+                                        gfx.submit_rgba(m)
+                                    }
                                     None => gfx.skip_frame(),
                                 },
+                                Err(e) => Err(e),
                             }
                         }
                         (None, m, a) => {
-                            fn yuv(f: &Option<Decoded>) -> Option<rdp_gfx::Yuv420<'_>> {
-                                match f {
-                                    Some(Decoded::Yuv(p)) => Some(p.view()),
-                                    _ => None,
-                                }
+                            if m.is_some() || a.is_some() {
+                                kind = Some(h264::Kind::Avc444);
                             }
                             gfx.submit_avc444(yuv(m).as_ref(), yuv(a).as_ref())
                         }
                     }
                     .map_err(|e| e.to_string())?;
                     drop(gfx);
-                    self.set_image(kind, h264.as_ref().and_then(H264::format));
+                    if let Some(kind) = kind {
+                        self.set_image(kind, h264.as_ref().and_then(H264::format));
+                    }
                     self.count_h264(t0);
                     queue.extend(drop_stale_presents(more));
                 }

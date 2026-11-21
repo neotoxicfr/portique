@@ -33,18 +33,51 @@ impl Rgba<'_> {
         if self.width == 0 || self.height == 0 {
             return Err(Error::Invalid("image H.264 vide"));
         }
-        let need = (self.height as u64 - 1) * self.stride as u64 + self.width as u64 * 4;
-        if (self.stride as u64) < self.width as u64 * 4 || (self.data.len() as u64) < need {
+        let row = self.width as u64 * 4;
+        if (self.stride as u64) < row {
+            return Err(Error::Invalid("pas d'image RGBA trop court"));
+        }
+        let need = (self.height as u64 - 1).checked_mul(self.stride as u64).and_then(|n| n.checked_add(row));
+        if need.is_none_or(|n| (self.data.len() as u64) < n) {
             return Err(Error::Truncated("image RGBA"));
         }
         Ok(())
     }
 }
 
-/// Sous-image auxiliaire d'un AVC444 : plans YUV, ou RGB du navigateur à inverser.
-enum AuxIn<'a> {
-    Yuv(&'a Yuv420<'a>),
-    Rgba(&'a Rgba<'a>),
+/// Ce qu'une image AVC444 rendue en RGB a changé à l'écran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    Nothing,
+    /// La principale seule (4:2:0), telle que le navigateur l'a convertie.
+    Main,
+    /// Le 4:4:4 recomposé.
+    Rebuilt,
+}
+
+/// Recomposition 4:4:4 depuis les images RGB du navigateur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rgb444 {
+    /// Conversion pas encore prouvée : la principale seule.
+    Unknown,
+    /// BT.709 pleine plage, chroma répétée : constaté sur une image.
+    Proven,
+    /// Chroma interpolée par le navigateur.
+    Refused,
+}
+
+/// Copie la zone `r` d'une image RGBA sur une surface de largeur `width`.
+fn blit_rgba(frame: &Rgba<'_>, r: Rect, dst: &mut [u8], width: u32) -> Result<(), Error> {
+    if r.x + r.w > frame.width || r.y + r.h > frame.height {
+        return Err(Error::Invalid("zone H.264 hors de l'image décodée"));
+    }
+    for row in r.y..r.y + r.h {
+        let src = (row * frame.stride + r.x * 4) as usize;
+        let src = frame.data.get(src..src + (r.w * 4) as usize).ok_or(Error::Truncated("image RGBA"))?;
+        let o = ((row * width + r.x) * 4) as usize;
+        dst[o..o + (r.w * 4) as usize].copy_from_slice(src);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +182,7 @@ pub struct Gfx {
     surface_bytes: usize,
     cache_bytes: usize,
     queued_bytes: usize,
-    /// La conversion RGB du navigateur ne s'inverse pas (chroma interpolée, autre matrice) : plus
-    /// de recomposition 4:4:4 depuis ses images RGB.
-    rgb_refused: bool,
+    rgb: Rgb444,
 }
 
 // Plafonds : les données viennent du réseau, aucune allocation ni boucle n'est laissée libre.
@@ -193,7 +224,7 @@ impl Gfx {
             surface_bytes: 0,
             cache_bytes: 0,
             queued_bytes: 0,
-            rgb_refused: false,
+            rgb: Rgb444::Unknown,
         }
     }
 
@@ -241,6 +272,9 @@ impl Gfx {
                 for r in &p.rects {
                     if let Some(r) = r.clip(s.width, s.height) {
                         frame.to_rgba(r, &mut s.rgba, s.width)?;
+                        if let Some(planes) = s.p444.as_mut() {
+                            planes.invalidate(r);
+                        }
                         done.push(r);
                     }
                 }
@@ -262,17 +296,11 @@ impl Gfx {
                 origin = s.origin;
                 for r in &p.rects {
                     let Some(r) = r.clip(s.width, s.height) else { continue };
-                    if r.x + r.w > frame.width || r.y + r.h > frame.height {
-                        return Err(Error::Invalid("zone H.264 hors de l'image décodée"));
-                    }
-                    for row in r.y..r.y + r.h {
-                        let src = (row * frame.stride + r.x * 4) as usize;
-                        let src = frame
-                            .data
-                            .get(src..src + (r.w * 4) as usize)
-                            .ok_or(Error::Truncated("image RGBA"))?;
-                        let dst = ((row * s.width + r.x) * 4) as usize;
-                        s.rgba[dst..dst + (r.w * 4) as usize].copy_from_slice(src);
+                    blit_rgba(frame, r, &mut s.rgba, s.width)?;
+                    // Affichée sans les plans 4:4:4 : une vue auxiliaire seule ne doit pas y
+                    // ramener leur ancienne luma.
+                    if let Some(planes) = s.p444.as_mut() {
+                        planes.invalidate(r);
                     }
                     done.push(r);
                 }
@@ -290,66 +318,14 @@ impl Gfx {
         main: Option<&Yuv420<'_>>,
         aux: Option<&Yuv420<'_>>,
     ) -> Result<Vec<Out>, Error> {
-        self.avc444(main, aux.map(AuxIn::Yuv))
-    }
-
-    /// Image AVC444 que le navigateur n'a rendue qu'en RGB : les plans YUV des deux sous-images
-    /// sont retrouvés en inversant sa conversion (BT.709 pleine plage, chroma répétée sur 2×2),
-    /// puis recombinés en 4:4:4. Refusée, l'image restant en attente (l'appelant se rabat sur
-    /// `submit_rgba`), si une image est illisible ou si la conversion du navigateur se révèle
-    /// autre : constaté une fois, plus de recomposition pour la session. Une sous-image
-    /// auxiliaire jugée incohérente est ignorée (la principale reste affichée seule).
-    pub fn submit_avc444_rgba(
-        &mut self,
-        main: Option<&Rgba<'_>>,
-        aux: Option<&Rgba<'_>>,
-    ) -> Result<Vec<Out>, Error> {
-        const REFUSED: Error = Error::Invalid("conversion RGB du navigateur non inversible");
-        if self.rgb_refused {
-            return Err(REFUSED);
-        }
-        for f in main.iter().chain(aux.iter()) {
-            f.check()?;
-        }
-        // Chroma seule : il faut la luma d'une image précédente.
-        let has_planes = |g: &Self| {
-            g.pending_avc.as_ref().and_then(|p| g.surfaces.get(&p.surface)).is_some_and(|s| s.p444.is_some())
-        };
-        if main.is_none() && !has_planes(self) {
-            return Err(Error::Invalid("chroma AVC444 sans luma"));
-        }
-        let rects = self.pending_avc.as_ref().map(|p| p.rects.clone()).unwrap_or_default();
-        let main = main.map(|f| avc444::FromRgb::new(f, &rects, |_, _| None)).transpose()?;
-        if main.as_ref().is_some_and(avc444::FromRgb::interpolated) {
-            self.rgb_refused = true;
-            return Err(REFUSED);
-        }
-        self.avc444(main.as_ref().map(avc444::FromRgb::view).as_ref(), aux.map(AuxIn::Rgba))
-    }
-
-    /// Le 4:4:4 est-il encore recomposé depuis les images RGB du navigateur ?
-    pub fn rgb_444(&self) -> bool {
-        !self.rgb_refused
-    }
-
-    fn avc444(&mut self, main: Option<&Yuv420<'_>>, aux: Option<AuxIn<'_>>) -> Result<Vec<Out>, Error> {
+        self.planes_444()?;
         if let Some(p) = self.pending_avc.take() {
             let mut done = Vec::new();
             let mut origin = None;
             if let Some(s) = self.surfaces.get_mut(&p.surface) {
                 origin = s.origin;
-                if s.p444.is_none() {
-                    let planes = avc444::Planes444::new(s.width, s.height);
-                    let grew = planes.bytes();
-                    if self.surface_bytes + grew > MAX_SURFACE_BYTES {
-                        return Err(Error::Invalid("mémoire de surface épuisée (AVC444)"));
-                    }
-                    // Compté dès qu'ils sont gardés : une image refusée plus bas ne les retire pas.
-                    self.surface_bytes += grew;
-                    s.p444 = Some(planes);
-                }
                 let (sw, sh) = (s.width, s.height);
-                let planes = s.p444.as_mut().unwrap();
+                let planes = s.p444.as_mut().expect("plans créés par planes_444");
                 if let Some(f) = main {
                     planes.apply_main(f, &p.rects)?;
                     for r in &p.rects {
@@ -360,27 +336,12 @@ impl Gfx {
                     }
                 }
                 if let (Some(f), Some((rects, v2))) = (aux, p.aux.as_ref()) {
-                    let applied = match f {
-                        AuxIn::Yuv(f) => {
-                            planes.apply_aux(f, rects, *v2)?;
-                            true
-                        }
-                        AuxIn::Rgba(f) => {
-                            let a = planes.aux_from_rgba(f, rects, *v2)?;
-                            let ok = !a.interpolated() && planes.aux_consistent(&a, rects, *v2);
-                            if ok {
-                                planes.apply_aux_from(&a, rects, *v2);
-                            }
-                            self.rgb_refused |= !ok;
-                            ok
-                        }
-                    };
-                    if applied {
-                        for r in rects {
-                            if let Some(r) = r.clip(sw, sh) {
-                                planes.to_rgba_444(r, &mut s.rgba, sw);
-                                done.push(r);
-                            }
+                    planes.apply_aux(f, rects, *v2)?;
+                    for r in rects {
+                        if let Some(r) = r.clip(sw, sh)
+                            && planes.to_rgba_444(r, &mut s.rgba, sw)
+                        {
+                            done.push(r);
                         }
                     }
                 }
@@ -390,6 +351,98 @@ impl Gfx {
             }
         }
         self.run()
+    }
+
+    /// Image AVC444 que le navigateur n'a rendue qu'en RGB : les plans YUV des deux sous-images
+    /// sont retrouvés en inversant sa conversion (BT.709 pleine plage, chroma répétée sur 2×2),
+    /// puis recombinés en 4:4:4. La principale s'affiche telle que le navigateur l'a rendue ;
+    /// l'auxiliaire ne s'y recombine qu'une fois la conversion prouvée sur une image, et jamais si
+    /// le navigateur interpole la chroma (constaté une fois : plus de recomposition pour la
+    /// session). Refusée, l'image restant en attente (l'appelant se rabat sur `submit_rgba`), si
+    /// une image est illisible, si la chroma n'a pas de luma valable ou si la mémoire manque.
+    pub fn submit_avc444_rgba(
+        &mut self,
+        main: Option<&Rgba<'_>>,
+        aux: Option<&Rgba<'_>>,
+    ) -> Result<(Vec<Out>, Shown), Error> {
+        const REFUSED: Error = Error::Invalid("conversion RGB du navigateur non inversible");
+        if self.rgb == Rgb444::Refused {
+            return Err(REFUSED);
+        }
+        for f in main.iter().chain(aux.iter()) {
+            f.check()?;
+        }
+        let Some(p) = self.pending_avc.as_ref() else { return Ok((self.run()?, Shown::Nothing)) };
+        let has_planes = self.surfaces.get(&p.surface).is_some_and(|s| s.p444.is_some());
+        if main.is_none() && !has_planes {
+            return Err(Error::Invalid("chroma AVC444 sans luma"));
+        }
+        let main_yuv = main.map(|f| avc444::FromRgb::new(f, &p.rects, |_, _| None)).transpose()?;
+        if main_yuv.as_ref().is_some_and(avc444::FromRgb::interpolated) {
+            self.rgb = Rgb444::Refused;
+            return Err(REFUSED);
+        }
+        self.planes_444()?;
+        let p = self.pending_avc.take().expect("commande vérifiée plus haut");
+        let (mut shown, mut done, mut origin, mut rgb) = (Shown::Nothing, Vec::new(), None, self.rgb);
+        if let Some(s) = self.surfaces.get_mut(&p.surface) {
+            origin = s.origin;
+            let (sw, sh) = (s.width, s.height);
+            let planes = s.p444.as_mut().expect("plans créés par planes_444");
+            if let (Some(f), Some(m)) = (main, &main_yuv) {
+                planes.apply_main(&m.view(), &p.rects)?;
+                for r in &p.rects {
+                    if let Some(r) = r.clip(sw.min(f.width), sh.min(f.height)) {
+                        blit_rgba(f, r, &mut s.rgba, sw)?;
+                        done.push(r);
+                        shown = Shown::Main;
+                    }
+                }
+            }
+            if let (Some(f), Some((rects, v2))) = (aux, p.aux.as_ref()) {
+                let a = planes.aux_from_rgba(f, rects, *v2)?;
+                if a.interpolated() {
+                    rgb = Rgb444::Refused;
+                } else if planes.aux_proven(&a, rects, *v2) {
+                    rgb = Rgb444::Proven;
+                }
+                // Sans preuve (petite zone, motif ambigu), une conversion déjà prouvée suffit.
+                if rgb == Rgb444::Proven {
+                    planes.apply_aux_from(&a, rects, *v2);
+                    for r in rects {
+                        if let Some(r) = r.clip(sw, sh)
+                            && planes.to_rgba_444(r, &mut s.rgba, sw)
+                        {
+                            done.push(r);
+                            shown = Shown::Rebuilt;
+                        }
+                    }
+                }
+            }
+        }
+        self.rgb = rgb;
+        for r in done {
+            self.touch(p.surface, r, origin);
+        }
+        Ok((self.run()?, shown))
+    }
+
+    /// Crée les plans 4:4:4 de la surface de la commande en attente, sans la retirer : un refus
+    /// faute de mémoire la laisse au repli.
+    fn planes_444(&mut self) -> Result<(), Error> {
+        let Some(s) = self.pending_avc.as_ref().and_then(|p| self.surfaces.get_mut(&p.surface)) else {
+            return Ok(());
+        };
+        if s.p444.is_none() {
+            let grew = avc444::Planes444::bytes_for(s.width, s.height);
+            if self.surface_bytes + grew > MAX_SURFACE_BYTES {
+                return Err(Error::Invalid("mémoire de surface épuisée (AVC444)"));
+            }
+            // Compté dès qu'ils sont gardés : une image refusée plus bas ne les retire pas.
+            self.surface_bytes += grew;
+            s.p444 = Some(avc444::Planes444::new(s.width, s.height));
+        }
+        Ok(())
     }
 
     /// Abandonne l'image H.264 en attente (décodeur indisponible) et reprend.

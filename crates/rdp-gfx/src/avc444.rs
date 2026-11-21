@@ -19,6 +19,9 @@ pub struct Planes444 {
     /// Chroma pleine résolution ; les positions paires-paires sont reconstruites à la demande.
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    /// Bloc 2×2 dont la luma vient d'une vue principale et correspond encore à l'affichage : une
+    /// vue auxiliaire ne se recombine qu'avec elle.
+    luma_ok: Vec<bool>,
 }
 
 impl Planes444 {
@@ -33,11 +36,42 @@ impl Planes444 {
             mv: vec![128; half],
             u: vec![128; full],
             v: vec![128; full],
+            luma_ok: vec![false; half],
         }
     }
 
+    /// Mémoire qu'occuperaient les plans d'une surface `width`×`height`.
+    pub fn bytes_for(width: u32, height: u32) -> usize {
+        let (full, half) =
+            (width as usize * height as usize, (width.div_ceil(2) * height.div_ceil(2)) as usize);
+        3 * full + 3 * half
+    }
+
     pub fn bytes(&self) -> usize {
-        self.y.len() + self.mu.len() + self.mv.len() + self.u.len() + self.v.len()
+        Self::bytes_for(self.width, self.height)
+    }
+
+    /// Tous les blocs de la zone (découpée à la surface) ont une luma valable.
+    fn luma_all_ok(&self, r: Rect) -> bool {
+        let hw = self.hw();
+        let Some(r) = r.clip(self.width, self.height) else { return true };
+        (r.y / 2..(r.y + r.h).div_ceil(2)).all(|cy| {
+            self.luma_ok[cy as usize * hw..][(r.x / 2) as usize..(r.x + r.w).div_ceil(2) as usize]
+                .iter()
+                .all(|&ok| ok)
+        })
+    }
+
+    /// La zone a été affichée autrement (H.264 4:2:0, RGB du navigateur) : sa luma ne
+    /// correspond plus.
+    pub fn invalidate(&mut self, r: Rect) {
+        let hw = self.hw();
+        let Some(r) = r.clip(self.width, self.height) else { return };
+        for cy in r.y / 2..(r.y + r.h).div_ceil(2) {
+            for cx in r.x / 2..(r.x + r.w).div_ceil(2) {
+                self.luma_ok[cy as usize * hw + cx as usize] = false;
+            }
+        }
     }
 
     fn hw(&self) -> usize {
@@ -58,8 +92,8 @@ impl Planes444 {
             for cy in r.y / 2..(r.y + r.h).div_ceil(2) {
                 for cx in r.x / 2..(r.x + r.w).div_ceil(2) {
                     let s = (cy * f.uv_stride + cx) as usize;
-                    self.mu[cy as usize * hw + cx as usize] = f.u[s];
-                    self.mv[cy as usize * hw + cx as usize] = f.v[s];
+                    let c = cy as usize * hw + cx as usize;
+                    (self.mu[c], self.mv[c], self.luma_ok[c]) = (f.u[s], f.v[s], true);
                 }
             }
         }
@@ -73,14 +107,22 @@ impl Planes444 {
         Ok(())
     }
 
+    /// Les blocs 2×2 entiers sont chargés, même au bord d'une zone : le filtre inverse d'une
+    /// position paire-paire lit ses trois voisins. Seuls les blocs à luma valable sont touchés.
     fn aux_with(&mut self, rects: &[Rect], v2: bool, at: impl Fn(Src) -> Option<(u8, bool)>) {
         let (w, h, hw) = (self.width, self.height, self.hw());
         for r in rects {
             let Some(r) = r.clip(w, h) else { continue };
-            for y in r.y..r.y + r.h {
-                for x in r.x..r.x + r.w {
-                    let Some((su, sv)) = aux_src(x, y, w, v2) else { continue };
+            let (x0, y0) = (r.x & !1, r.y & !1);
+            let (x1, y1) = ((r.x + r.w).div_ceil(2) * 2, (r.y + r.h).div_ceil(2) * 2);
+            let partial = !self.luma_all_ok(r);
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
                     let (i, c) = ((y * w + x) as usize, (y / 2) as usize * hw + (x / 2) as usize);
+                    if partial && !self.luma_ok[c] {
+                        continue;
+                    }
+                    let Some((su, sv)) = aux_src(x, y, w, v2) else { continue };
                     if let Some((u, ok)) = at(su) {
                         self.u[i] = if ok { u } else { self.mu[c] };
                     }
@@ -105,15 +147,29 @@ impl Planes444 {
         }
     }
 
-    /// Conversion 4:4:4 (zones de chroma) avec le filtre inverse des positions paires-paires.
-    pub fn to_rgba_444(&self, r: Rect, dst: &mut [u8], dst_width: u32) {
+    /// Conversion 4:4:4 (zones de chroma) avec le filtre inverse des positions paires-paires. Les
+    /// blocs sans luma valable gardent leurs pixels ; vrai si un pixel a été écrit.
+    pub fn to_rgba_444(&self, r: Rect, dst: &mut [u8], dst_width: u32) -> bool {
+        // Cas courant, toute la zone valable : boucle sans test.
+        if self.luma_all_ok(r) {
+            return self.rgba_444(r, dst, dst_width, |_| true);
+        }
+        self.rgba_444(r, dst, dst_width, |c| self.luma_ok[c])
+    }
+
+    fn rgba_444(&self, r: Rect, dst: &mut [u8], dst_width: u32, keep: impl Fn(usize) -> bool) -> bool {
         let (w, h, hw) = (self.width, self.height, self.hw());
+        let mut wrote = false;
         for y in r.y..r.y + r.h {
             for x in r.x..r.x + r.w {
                 let i = (y * w + x) as usize;
+                let c = (y / 2) as usize * hw + (x / 2) as usize;
+                if !keep(c) {
+                    continue;
+                }
+                wrote = true;
                 let (mut u, mut v) = (self.u[i], self.v[i]);
                 if x.is_multiple_of(2) && y.is_multiple_of(2) && x + 1 < w && y + 1 < h {
-                    let c = (y / 2) as usize * hw + (x / 2) as usize;
                     u = reverse(self.mu[c], &self.u, i, w as usize);
                     v = reverse(self.mv[c], &self.v, i, w as usize);
                 }
@@ -122,6 +178,7 @@ impl Planes444 {
                 dst[o..o + 4].copy_from_slice(&px);
             }
         }
+        wrote
     }
 }
 
@@ -365,6 +422,11 @@ impl FromRgb {
         prior: &impl Fn(u32, u32) -> Option<(u8, u8)>,
     ) {
         let (w, h) = (self.width, self.height);
+        let c = (cy * w.div_ceil(2) + cx) as usize;
+        // Zones qui se recouvrent : un bloc n'est inversé, et compté, qu'une fois.
+        if self.uv_state[c] != 0 {
+            return;
+        }
         let (x, y) = (2 * cx, 2 * cy);
         let (s, i) = ((y * f.stride + x * 4) as usize, (y * w + x) as usize);
         let at = |s: usize, i: usize| (i, [f.data[s], f.data[s + 1], f.data[s + 2]]);
@@ -385,7 +447,6 @@ impl FromRgb {
             n
         };
         let px = &px[..n];
-        let c = (cy * w.div_ceil(2) + cx) as usize;
         if px.iter().all(|(_, p)| p.iter().all(|&v| free(v))) {
             // Cas courant : rien n'est borné, chroma moyenne et luma exactes.
             let (mut su, mut sv) = (0, 0);
@@ -539,11 +600,14 @@ impl Planes444 {
         self.aux_with(rects, v2, |s| aux.at(s));
     }
 
-    /// Contrôle du modèle d'inversion sur les zones unies de la vue principale déjà appliquée : la
-    /// vue auxiliaire doit y porter la même chroma. Un écart moyen systématique pour une couleur
-    /// trahit une autre conversion du navigateur (BT.601, plage limitée…), avec laquelle la
-    /// recomposition ferait pire que la vue principale seule. Le bruit du codage, lui, se moyenne.
-    pub fn aux_consistent(&self, aux: &FromRgb, rects: &[Rect], v2: bool) -> bool {
+    /// Preuve que le navigateur convertit bien en BT.709 pleine plage, tirée des zones unies de la
+    /// vue principale déjà appliquée : la vue auxiliaire doit y porter la même chroma. Un écart
+    /// moyen systématique pour une couleur trahit une autre conversion (BT.601, plage limitée…),
+    /// avec laquelle la recomposition ferait pire que la vue principale seule ; le bruit du codage,
+    /// lui, se moyenne. Il faut aussi une couleur franche : sur le neutre, BT.601 et BT.709 en
+    /// pleine plage se confondent. Faux sans preuve, ou si un motif 2×2 de chroma à moyenne
+    /// constante (indiscernable d'un écart de conversion) occupe la zone.
+    pub fn aux_proven(&self, aux: &FromRgb, rects: &[Rect], v2: bool) -> bool {
         let (w, h, hw) = (self.width, self.height, self.hw());
         // Écarts signés cumulés par classe : couleur (Ũ, Ṽ par pas de 32) et plan source (la luma
         // et la chroma de la vue auxiliaire ne sont pas déformées de la même façon).
@@ -582,9 +646,15 @@ impl Planes444 {
         }
         // Refus si l'écart moyen d'une classe dépasse 1,5 avec une marge pour le bruit de codage,
         // corrélé par macrobloc (24/√n : 4,5 à 64 échantillons, 2,25 à 1 024).
-        sum.iter().zip(&cnt).all(|(&s, &n)| {
-            n < 64 || (s.unsigned_abs() as f64 / n as f64) <= 1.5 + 24.0 / (n as u32).isqrt() as f64
-        })
+        let (mut colored, mut off) = (false, false);
+        for (k, (&s, &n)) in sum.iter().zip(&cnt).enumerate() {
+            if n < 64 {
+                continue;
+            }
+            off |= (s.unsigned_abs() as f64 / n as f64) > 1.5 + 24.0 / (n as u32).isqrt() as f64;
+            colored |= k % 64 != 4 * 8 + 4;
+        }
+        colored && !off
     }
 }
 
@@ -707,6 +777,7 @@ mod tests {
     mod rgb {
         extern crate std;
         use super::*;
+        use crate::Shown;
         use std::{format, println, string::String};
 
         #[derive(Clone, Copy, PartialEq, Debug)]
@@ -879,8 +950,13 @@ mod tests {
         fn views(img: &[[u8; 3]], v2: bool, up: Up, m: Matrix, noise: u8) -> (Vec<u8>, Vec<u8>) {
             let yuv: Vec<[u8; 3]> = img.iter().map(|&p| to_yuv(p)).collect();
             let plane = |k: usize| -> Vec<u8> { yuv.iter().map(|p| p[k]).collect() };
-            let (y, u, v) = (plane(0), plane(1), plane(2));
-            let (mu, mv, ay, au, av) = pack(W, H, &u, &v, v2);
+            views_yuv([&plane(0), &plane(1), &plane(2)], v2, up, m, noise)
+        }
+
+        /// Même chose depuis des plans YUV 4:4:4.
+        fn views_yuv(planes: [&[u8]; 3], v2: bool, up: Up, m: Matrix, noise: u8) -> (Vec<u8>, Vec<u8>) {
+            let [y, u, v] = planes;
+            let (mu, mv, ay, au, av) = pack(W, H, u, v, v2);
             let mut rng = Rng(9);
             let mut noisy = |p: &[u8]| -> Vec<u8> {
                 let span = 2 * noise as i32 + 1;
@@ -889,27 +965,61 @@ mod tests {
                     .collect()
             };
             let (y, mu, mv, ay, au, av) =
-                (noisy(&y), noisy(&mu), noisy(&mv), noisy(&ay), noisy(&au), noisy(&av));
+                (noisy(y), noisy(&mu), noisy(&mv), noisy(&ay), noisy(&au), noisy(&av));
             (browser(W, H, [&y, &mu, &mv], up, m), browser(W, H, [&ay, &au, &av], up, m))
         }
 
-        /// Chemin de `Gfx::submit_avc444_rgba` ; `None` : recomposition refusée.
+        fn rgba(data: &[u8]) -> crate::Rgba<'_> {
+            crate::Rgba { width: W, height: H, data, stride: W * 4 }
+        }
+
+        /// Session avec une surface W×H en 0.
+        fn gfx() -> crate::Gfx {
+            let mut g = crate::Gfx::new();
+            let rgba = vec![0; (W * H * 4) as usize];
+            g.surfaces.insert(0, crate::Surface { width: W, height: H, rgba, origin: None, p444: None });
+            g
+        }
+
+        /// Une commande AVC444 rendue en RGB, avec le repli du moteur (principale seule) si elle
+        /// est refusée.
+        fn submit(
+            g: &mut crate::Gfx,
+            main: Option<&[u8]>,
+            aux: Option<&[u8]>,
+            rects: [&[Rect]; 2],
+            v2: bool,
+        ) -> Shown {
+            let aux_rects = aux.map(|_| (rects[1].to_vec(), v2));
+            g.pending_avc = Some(crate::PendingAvc { surface: 0, rects: rects[0].to_vec(), aux: aux_rects });
+            let (m, a) = (main.map(rgba), aux.map(rgba));
+            match g.submit_avc444_rgba(m.as_ref(), a.as_ref()) {
+                Ok((_, shown)) => shown,
+                Err(_) => {
+                    assert!(g.waiting_for_avc(), "refus sans consommer la commande");
+                    match &m {
+                        Some(m) => {
+                            g.submit_rgba(m).unwrap();
+                            Shown::Main
+                        }
+                        None => {
+                            g.skip_frame().unwrap();
+                            Shown::Nothing
+                        }
+                    }
+                }
+            }
+        }
+
+        fn screen(g: &crate::Gfx) -> Vec<u8> {
+            g.surfaces[&0].rgba.clone()
+        }
+
+        /// `Gfx::submit_avc444_rgba` sur une session neuve ; `None` : pas de recomposition.
         fn recompose(main: &[u8], aux: &[u8], v2: bool) -> Option<Vec<u8>> {
-            let rgba = |data| crate::Rgba { width: W, height: H, data, stride: W * 4 };
-            let m = FromRgb::new(&rgba(main), &[FULL], |_, _| None).unwrap();
-            if m.interpolated() {
-                return None;
-            }
-            let mut p = Planes444::new(W, H);
-            p.apply_main(&m.view(), &[FULL]).unwrap();
-            let a = p.aux_from_rgba(&rgba(aux), &[FULL], v2).unwrap();
-            if a.interpolated() || !p.aux_consistent(&a, &[FULL], v2) {
-                return None;
-            }
-            p.apply_aux_from(&a, &[FULL], v2);
-            let mut out = vec![0u8; (W * H * 4) as usize];
-            p.to_rgba_444(FULL, &mut out, W);
-            Some(out)
+            let mut g = gfx();
+            (submit(&mut g, Some(main), Some(aux), [&[FULL], &[FULL]], v2) == Shown::Rebuilt)
+                .then(|| screen(&g))
         }
 
         fn line(img: &[[u8; 3]], parts: &[Part], got: &[u8]) -> (String, Vec<(i32, f64)>) {
@@ -977,18 +1087,18 @@ mod tests {
                 let mut out = vec![0u8; (w * h * 4) as usize];
                 let (mut inv, mut yuv) = (Vec::new(), Vec::new());
                 for _ in 0..9 {
-                    let mut p = Planes444::new(w, h);
+                    // Plans alloués hors des deux mesures.
+                    let (mut p, mut q) = (Planes444::new(w, h), Planes444::new(w, h));
                     let t0 = Instant::now();
                     let mf = FromRgb::new(&rgba(&m), &full, |_, _| None).unwrap();
                     p.apply_main(&mf.view(), &full).unwrap();
                     let af = p.aux_from_rgba(&rgba(&a), &full, true).unwrap();
                     // (La mosaïque casse la disposition v2 : le contrôle refuse, son coût compte.)
-                    std::hint::black_box(p.aux_consistent(&af, &full, true));
+                    std::hint::black_box(p.aux_proven(&af, &full, true));
                     p.apply_aux_from(&af, &full, true);
                     p.to_rgba_444(full[0], &mut out, w);
                     let t1 = Instant::now();
                     // Chemin YUV actuel sur les mêmes plans, pour comparaison.
-                    let mut q = Planes444::new(w, h);
                     q.apply_main(&mf.view(), &full).unwrap();
                     q.apply_aux(&af.view(), &full, true).unwrap();
                     q.to_rgba_444(full[0], &mut out, w);
@@ -1010,12 +1120,11 @@ mod tests {
         #[test]
         fn partial_update_reads_the_right_aux_area() {
             // Zone aux bords impairs : la vue auxiliaire n'est inversée qu'aux endroits qui portent
-            // sa chroma ; le résultat doit être celui de l'image entière.
+            // sa chroma, blocs 2×2 du bord compris ; le résultat doit être celui de l'image entière.
             let (img, _) = desktop(W, H);
             let zone = Rect { x: 37, y: 21, w: 150, h: 70 };
             for v2 in [false, true] {
                 let (main, aux) = views(&img, v2, Up::Nearest, Matrix::Bt709Full, 0);
-                let rgba = |data| crate::Rgba { width: W, height: H, data, stride: W * 4 };
                 let m = FromRgb::new(&rgba(&main), &[FULL], |_, _| None).unwrap();
                 let mut out = [vec![0u8; (W * H * 4) as usize], vec![0u8; (W * H * 4) as usize]];
                 for (k, rects) in [[FULL], [zone]].iter().enumerate() {
@@ -1023,11 +1132,135 @@ mod tests {
                     p.apply_main(&m.view(), &[FULL]).unwrap();
                     let a = p.aux_from_rgba(&rgba(&aux), rects, v2).unwrap();
                     p.apply_aux_from(&a, rects, v2);
-                    // Sans le bord droit et bas : le filtre inverse y lit des voisins hors zone.
-                    p.to_rgba_444(Rect { w: zone.w - 2, h: zone.h - 2, ..zone }, &mut out[k], W);
+                    // Bords compris : le filtre inverse y lit des voisins hors zone.
+                    p.to_rgba_444(zone, &mut out[k], W);
                 }
                 assert!(out[0] == out[1], "v2={v2}");
             }
+        }
+
+        #[test]
+        fn overlapping_rects_count_a_block_once() {
+            // Blocs 2×2 à chroma variable (interpolée) partout.
+            let px = [[200u8, 100, 50, 255], [50, 100, 200, 255], [100, 200, 50, 255], [50, 50, 200, 255]];
+            let mut data = vec![0u8; (W * H * 4) as usize];
+            for y in 0..H {
+                for x in 0..W {
+                    let o = ((y * W + x) * 4) as usize;
+                    data[o..o + 4].copy_from_slice(&px[((y % 2) * 2 + x % 2) as usize]);
+                }
+            }
+            let one = |x, y| Rect { x, y, w: 1, h: 1 };
+            // Quatre rectangles 1×1 sur le même bloc : un seul bloc.
+            let same = FromRgb::new(&rgba(&data), &[one(0, 0), one(1, 0), one(0, 1), one(1, 1)], |_, _| None)
+                .unwrap();
+            assert_eq!((same.blocks_free, same.blocks_interpolated), (1, 1));
+            assert!(!same.interpolated());
+            // Quatre blocs distincts : refus.
+            let four = FromRgb::new(&rgba(&data), &[one(0, 0), one(2, 0), one(4, 0), one(6, 0)], |_, _| None)
+                .unwrap();
+            assert!(four.interpolated());
+        }
+
+        #[test]
+        fn proof_needed_before_rebuilding_then_kept() {
+            let (img, _) = desktop(W, H);
+            let small = Rect { x: 140, y: 8, w: 8, h: 8 };
+            for v2 in [false, true] {
+                // Première petite mise à jour en plage limitée : rien ne prouve la conversion, la
+                // principale du navigateur s'affiche telle quelle.
+                let (main, aux) = views(&img, v2, Up::Nearest, Matrix::Bt709Limited, 0);
+                let mut g = gfx();
+                assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[small], &[small]], v2), Shown::Main);
+                assert_eq!(screen(&g), {
+                    let mut want = vec![0u8; (W * H * 4) as usize];
+                    blit(&main, small, &mut want);
+                    want
+                });
+                // Bonne conversion : petite zone sans preuve, puis image entière qui prouve, puis la
+                // petite zone se recompose.
+                let (main, aux) = views(&img, v2, Up::Nearest, Matrix::Bt709Full, 0);
+                let mut g = gfx();
+                assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[small], &[small]], v2), Shown::Main);
+                assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[FULL], &[FULL]], v2), Shown::Rebuilt);
+                assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[small], &[small]], v2), Shown::Rebuilt);
+                assert_eq!(submit(&mut g, None, Some(&aux), [&[], &[small]], v2), Shown::Rebuilt);
+            }
+        }
+
+        fn blit(src: &[u8], r: Rect, dst: &mut [u8]) {
+            for y in r.y..r.y + r.h {
+                let o = ((y * W + r.x) * 4) as usize;
+                dst[o..o + (r.w * 4) as usize].copy_from_slice(&src[o..o + (r.w * 4) as usize]);
+            }
+        }
+
+        #[test]
+        fn chroma_pattern_with_flat_average_does_not_disable_for_good() {
+            // Motif 2×2 : Y = 120, V = 128, U = 200 en position paire-paire et 104 ailleurs. La
+            // chroma principale vaut 128 partout, les échantillons auxiliaires 104 : écart que le
+            // contrôle ne distingue pas d'une autre conversion, mais qui est juste.
+            let n = (W * H) as usize;
+            let (y, v) = (vec![120u8; n], vec![128u8; n]);
+            let u: Vec<u8> = (0..n as u32)
+                .map(|i| if (i % W).is_multiple_of(2) && (i / W).is_multiple_of(2) { 200 } else { 104 })
+                .collect();
+            let want: Vec<u8> = (0..n).flat_map(|i| crate::yuv::to_rgb(y[i], u[i], v[i])).collect();
+            let (img, _) = desktop(W, H);
+            for v2 in [false, true] {
+                let (pm, pa) = views_yuv([&y, &u, &v], v2, Up::Nearest, Matrix::Bt709Full, 0);
+                let (dm, da) = views(&img, v2, Up::Nearest, Matrix::Bt709Full, 0);
+                // Session neuve : sans preuve, la principale seule, sans refus définitif.
+                let mut g = gfx();
+                assert_eq!(submit(&mut g, Some(&pm), Some(&pa), [&[FULL], &[FULL]], v2), Shown::Main);
+                assert_eq!(submit(&mut g, Some(&dm), Some(&da), [&[FULL], &[FULL]], v2), Shown::Rebuilt);
+                // Conversion prouvée : le motif se recompose, juste.
+                assert_eq!(submit(&mut g, Some(&pm), Some(&pa), [&[FULL], &[FULL]], v2), Shown::Rebuilt);
+                let got = screen(&g);
+                let err = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+                assert!(err <= 3, "v2={v2} : écart {err}");
+                assert_eq!(submit(&mut g, Some(&dm), Some(&da), [&[FULL], &[FULL]], v2), Shown::Rebuilt);
+            }
+        }
+
+        #[test]
+        fn rejected_aux_keeps_the_browser_main() {
+            // Chroma interpolée : petite principale (2 blocs, sous le seuil), auxiliaire entière
+            // qui la révèle. La principale affichée doit être celle du navigateur, pas son
+            // approximation par l'inversion.
+            let (img, _) = desktop(W, H);
+            let zone = Rect { x: 128, y: 10, w: 4, h: 2 };
+            let (main, aux) = views(&img, false, Up::Bilinear, Matrix::Bt709Full, 0);
+            let m = FromRgb::new(&rgba(&main), &[zone], |_, _| None).unwrap();
+            assert!(!m.interpolated());
+            let mut approx = vec![0u8; (W * H * 4) as usize];
+            let mut p = Planes444::new(W, H);
+            p.apply_main(&m.view(), &[zone]).unwrap();
+            p.to_rgba_420(zone, &mut approx, W);
+            let mut want = vec![0u8; (W * H * 4) as usize];
+            blit(&main, zone, &mut want);
+            assert_ne!(approx, want, "zone choisie sur un bord de chroma");
+            let mut g = gfx();
+            assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[zone], &[FULL]], false), Shown::Main);
+            assert_eq!(screen(&g), want);
+            assert_eq!(g.rgb, crate::Rgb444::Refused);
+        }
+
+        #[test]
+        fn rgba_fallback_invalidates_the_old_luma() {
+            let (img, _) = desktop(W, H);
+            let (main, aux) = views(&img, false, Up::Nearest, Matrix::Bt709Full, 0);
+            let mut g = gfx();
+            assert_eq!(submit(&mut g, Some(&main), Some(&aux), [&[FULL], &[FULL]], false), Shown::Rebuilt);
+            // Principale grise, auxiliaire tronquée : repli sur la principale du navigateur.
+            let gray = [192u8, 192, 192, 255].repeat((W * H) as usize);
+            g.pending_avc =
+                Some(crate::PendingAvc { surface: 0, rects: vec![FULL], aux: Some((vec![FULL], false)) });
+            assert!(g.submit_avc444_rgba(Some(&rgba(&gray)), Some(&rgba(&aux[..100]))).is_err());
+            g.submit_rgba(&rgba(&gray)).unwrap();
+            // Chroma seule ensuite : l'ancienne luma ne doit pas revenir.
+            assert_eq!(submit(&mut g, None, Some(&aux), [&[], &[FULL]], false), Shown::Nothing);
+            assert_eq!(screen(&g), gray);
         }
 
         #[test]

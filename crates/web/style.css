@@ -503,8 +503,10 @@ td.cell-actions { text-align: right; }
   content: ">_"; flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px;
   background: var(--sheen), var(--green); color: #ffffff; font: 700 10px/1 var(--mono);
 }
-/* isolation : les z-index internes de xterm (ascenseur, règle) restent sous l'alerte et son voile. */
-.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; isolation: isolate; }
+/* isolation : les z-index internes de xterm (ascenseur, règle) restent sous l'alerte et son voile.
+   content-box : FitAddon prend la hauteur et la largeur calculées de ce parent sans en retirer le padding ; en
+   border-box elles l'incluaient, et le terminal débordait d'une demi-ligne en bas et de quelques pixels à droite. */
+.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; box-sizing: content-box; isolation: isolate; }
 
 /* Barre de touches façon clavier iOS : 8 touches sur la 1re rangée, combinaisons en dessous. */
 .keybar {

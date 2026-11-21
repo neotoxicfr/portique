@@ -604,6 +604,9 @@ label.line { flex-direction: row; }
 .urow .iconbtn { color: var(--link); background: transparent; }
 .mfa { display: grid; place-items: center; width: 28px; color: var(--orange); }
 .mfa.on { color: var(--green); }
+/* Écran étroit : l'éditeur s'ouvre dans la liste des machines, sous la ligne touchée. */
+section > .editor { margin-top: 12px; }
+.editor + .mlist { margin-top: 16px; }
 .mfa.info { color: var(--link); }
 .sect .line-label { font-weight: 600; }
 .line .val { flex: 1; min-width: 0; text-align: right; font: 13px var(--mono); color: var(--muted); word-break: break-all; }

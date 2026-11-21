@@ -228,23 +228,25 @@ fn Totp(st: Status) -> impl IntoView {
             busy.set(false);
         });
     };
-    // Activation ou désactivation sans réponse dans le délai : le serveur a pu l'appliquer. L'état réel est relu
-    // avant de rendre la main ; s'il ne peut pas l'être, il est dit inconnu.
+    // Activation ou désactivation sans réponse dans le délai : le serveur a pu l'appliquer, ou peut encore le
+    // faire. L'état est relu : atteint, c'est un succès ; sinon il reste incertain (une relecture précoce ne
+    // prouve pas l'échec), et la page le dit au lieu d'annoncer l'ancien état.
     let after_timeout = move |epoch: u32, on: bool| async move {
         match api::bounded(api::get::<Me>("/api/me")).await {
-            Ok(me) => {
-                session.set_totp(epoch, me.totp_enabled);
-                if me.totp_enabled == on {
-                    reset();
-                    st.set(Some(Ok(totp_done(on))));
-                } else {
-                    let now = if on { "désactivé" } else { "actif" };
-                    st.set(Some(Err(format!("le serveur n'a pas répondu : TOTP toujours {now}, réessaie"))));
-                }
+            Ok(me) if me.totp_enabled == on => {
+                session.set_totp(epoch, on);
+                reset();
+                st.set(Some(Ok(totp_done(on))));
             }
-            Err(e) => {
-                session.handle(epoch, &e);
-                st.set(Some(Err("le serveur ne répond pas : état du TOTP inconnu, recharge la page".into())));
+            r => {
+                if let Err(e) = &r {
+                    session.handle(epoch, e);
+                }
+                st.set(Some(Err(
+                    "le serveur n'a pas répondu à temps et la demande peut encore aboutir : recharge la page \
+                     dans un instant pour voir l'état du TOTP"
+                        .into(),
+                )));
             }
         }
     };

@@ -333,10 +333,18 @@ fn Passkeys(st: Status) -> impl IntoView {
     let adding = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let proof = Proof::new();
+    // Seule la dernière lecture lancée met la page à jour : une plus ancienne, revenue après, est dépassée.
+    let generation = StoredValue::new(0u32);
     let reload = move || {
         let epoch = session.epoch.get_untracked();
+        generation.update_value(|g| *g = g.wrapping_add(1));
+        let mine = generation.get_value();
         spawn_local(async move {
-            match crate::within(15_000, api::get("/api/account/passkeys")).await {
+            let result = crate::within(15_000, api::get("/api/account/passkeys")).await;
+            if generation.try_get_value() != Some(mine) {
+                return;
+            }
+            match result {
                 Some(Ok(l)) => {
                     list.set(l);
                     load_err.set(None);

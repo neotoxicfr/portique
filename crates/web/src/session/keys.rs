@@ -143,7 +143,11 @@ pub fn scancode(code: &str) -> Option<(u8, bool)> {
 /// `code` vide, ou « Unidentified » que permet UI Events), le nom de la touche (`key`), que les
 /// touches nommées (Retour arrière, Entrée, flèches…) partagent avec leur position.
 pub fn scancode_of(code: &str, key: &str) -> Option<(u8, bool)> {
-    scancode(code).or_else(|| matches!(code, "" | "Unidentified").then(|| scancode(key)).flatten())
+    // Sans position (clavier virtuel), Entrée, Retour arrière et Suppr passent déjà par `beforeinput`
+    // (insertParagraph, deleteContent…) : les reprendre ici les enverrait deux fois.
+    let by_input = matches!(key, "Enter" | "Backspace" | "Delete");
+    scancode(code)
+        .or_else(|| (matches!(code, "" | "Unidentified") && !by_input).then(|| scancode(key)).flatten())
 }
 
 /// Touches sans code de balayage simple, rendues par une séquence complète. Pause : Ctrl avec
@@ -207,7 +211,9 @@ mod tests {
     fn named_keys_without_a_position() {
         assert_eq!(scancode_of("", "ArrowDown"), scancode("ArrowDown"));
         assert_eq!(scancode_of("Unidentified", "ArrowDown"), scancode("ArrowDown"));
-        assert_eq!(scancode_of("Unidentified", "Enter"), Some((0x1C, false)));
+        assert_eq!(scancode_of("Unidentified", "Enter"), None, "Entrée : par beforeinput seulement");
+        assert_eq!(scancode_of("", "Backspace"), None, "Retour arrière : par beforeinput seulement");
+        assert_eq!(scancode_of("Enter", "Enter"), Some((0x1C, false)), "clavier physique inchangé");
         assert_eq!(scancode_of("Unidentified", "a"), None, "caractère : par Unicode");
         assert_eq!(scancode_of("KeyQ", "a"), scancode("KeyQ"), "la position prime (AZERTY)");
     }

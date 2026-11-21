@@ -60,7 +60,11 @@ impl Session {
     /// connexion avec `notice`, même si la page de la requête a été quittée. Rien si la session est déjà
     /// terminée : la réponse fermerait la suivante.
     pub fn ended_by_server(&self, epoch: u32, notice: &str) {
-        if self.epoch.get_untracked() == epoch {
+        // Même session, ou session déjà close par un 401 arrivé avant cette réponse sans que personne ne se
+        // soit reconnecté depuis : l'avis reste dû. Une reconnexion entre-temps l'emporte.
+        let now = self.epoch.get_untracked();
+        let ended_since = now == epoch.wrapping_add(1) && self.me.with_untracked(Option::is_none);
+        if now == epoch || ended_since {
             self.notice.set(Some(notice.into()));
             self.me.set(None);
         }
@@ -380,6 +384,13 @@ mod tests {
         session.ended_by_server(sent_by_alice, "changé");
         assert_eq!(session.me.get_untracked(), Some(me("bob")));
         assert_eq!(session.notice.get_untracked(), None);
+        // Un 401 a déjà fermé la session de bob (époque avancée, personne de connecté) : l'avis s'affiche.
+        let sent_by_bob = session.epoch.get_untracked();
+        session.me.set(None);
+        session.epoch.update(|e| *e += 1);
+        session.ended_by_server(sent_by_bob, "changé");
+        assert_eq!(session.notice.get_untracked().as_deref(), Some("changé"));
+        session.notice.set(None);
         // Réponse de la session courante : écran de connexion et avis, page quittée ou non.
         session.ended_by_server(session.epoch.get_untracked(), "changé");
         assert_eq!(session.me.get_untracked(), None);

@@ -41,7 +41,14 @@ pub fn Admin() -> impl IntoView {
         spawn_local(load_list("/api/admin/users", users, users_err, current, session, epoch));
         spawn_local(load_list("/api/admin/connections", conns, conns_err, current, session, epoch));
     };
-    let load_err = move || users_err.get().or_else(|| conns_err.get());
+    // Une erreur par liste, côte à côte : l'une ne masque pas l'autre (une liste vide n'est pas un inventaire vide).
+    let load_err = move || {
+        let errs: Vec<String> = [("Comptes", users_err.get()), ("Machines", conns_err.get())]
+            .into_iter()
+            .filter_map(|(what, e)| e.map(|e| format!("{what} : {}", sentence(&e))))
+            .collect();
+        (!errs.is_empty()).then(|| errs.join(" "))
+    };
     reload();
     let f = Form::default();
     f.fill(None);
@@ -50,7 +57,7 @@ pub fn Admin() -> impl IntoView {
         <h1 class="sr-only">"Administration"</h1>
         {move || load_err().map(|m| view! {
             <div class="banner error" role="alert">
-                <span>{sentence(&m)}</span>
+                <span>{m}</span>
                 <button type="button" on:click=move |_| reload()>"Réessayer"</button>
             </div>
         })}

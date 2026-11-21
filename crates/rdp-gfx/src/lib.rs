@@ -134,7 +134,7 @@ pub struct Gfx {
 
 // Plafonds : les données viennent du réseau, aucune allocation ni boucle n'est laissée libre.
 /// Côté maximal d'une surface ou de la sortie.
-const MAX_SIDE: u32 = 8192;
+pub const MAX_SIDE: u32 = 8192;
 /// Nombre de surfaces simultanées et mémoire totale qu'elles occupent.
 const MAX_SURFACES: usize = 64;
 const MAX_SURFACE_BYTES: usize = 512 * 1024 * 1024;

@@ -637,7 +637,9 @@ impl Engine {
             web_sys::console::warn_1(&"multi-écran : disposition non adoptée par le serveur".into());
         }
         let mut fell_back = false;
+        let mut released = Vec::new();
         if i.multi.is_none() || monitors.len() < 2 {
+            released = release_secondary(&mut i.buttons);
             for v in i.views.iter().skip(1) {
                 v.close();
             }
@@ -646,6 +648,7 @@ impl Engine {
         }
         i.views[0].set_rect(Rect { x: 0, y: 0, w: width, h: height });
         drop(i);
+        self.input(&released);
         if fell_back {
             (self.on_single)();
         }
@@ -738,11 +741,14 @@ impl Engine {
     fn disable_multi_views(&self) {
         self.close_staged();
         let mut i = self.inner.borrow_mut();
+        let released = release_secondary(&mut i.buttons);
         for v in i.views.iter().skip(1) {
             v.close();
         }
         i.views.truncate(1);
         i.multi = None;
+        drop(i);
+        self.input(&released);
     }
 
     /// Revient à un seul écran (taille de la fenêtre principale). La disposition à un écran part
@@ -818,15 +824,17 @@ impl Engine {
         let Some(point) = self.desktop_point(idx, e.client_x(), e.client_y()) else {
             return;
         };
-        let event =
-            button_input(&mut self.inner.borrow_mut().buttons, e.pointer_id(), kind, e.button(), point);
-        let Some(event) = event else { return };
+        let events =
+            button_input(&mut self.inner.borrow_mut().buttons, e.pointer_id(), idx, kind, e.buttons(), point);
+        if events.is_empty() {
+            return;
+        }
         if kind == "pointerdown"
             && let Some(v) = self.inner.borrow().views.get(idx)
         {
             let _ = v.canvas.set_pointer_capture(e.pointer_id());
         }
-        self.input(&[event]);
+        self.input(&events);
     }
 
     /// Molette : pixels → crans de 120 (une molette classique envoie ~100 px par cran).
@@ -1215,12 +1223,13 @@ impl Engine {
     }
 
     /// Envoie au PC le contenu du presse-papier local s'il a changé, et attend que Windows l'ait
-    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste, si une liste plus récente
-    /// l'a remplacée avant sa réponse, ou si la lecture plus récente qui a dépassé celle-ci a été
-    /// refusée : il reste à relire, réannoncer ou rejoindre la suivante.
-    pub async fn sync_local_clipboard(&self) -> bool {
+    /// accepté (borné par l'appelant). `Some(false)` si Windows a refusé la liste, si une liste plus
+    /// récente l'a remplacée avant sa réponse, ou si la lecture plus récente qui a dépassé celle-ci
+    /// a été refusée : il reste à relire, réannoncer ou rejoindre la suivante. `None` si rien n'a
+    /// été lu (lecture refusée par le navigateur, presse-papier vide) : rien n'a changé côté PC.
+    pub async fn sync_local_clipboard(&self) -> Option<bool> {
         if !self.is_connected() {
-            return true;
+            return Some(true);
         }
         let t0 = js_sys::Date::now();
         let mark = self.inner.borrow_mut().clip_announces.mark();
@@ -1228,23 +1237,20 @@ impl Engine {
         web_sys::console::debug_1(
             &format!("presse-papier local lu en {:.0} ms", js_sys::Date::now() - t0).into(),
         );
-        let Some(items) = items else { return true };
-        if items.is_empty() {
-            return true;
-        }
+        let items = items.filter(|items| !items.is_empty())?;
         let fp = clip::fingerprint(&items);
         let (tx, rx) = futures::channel::oneshot::channel();
         let events = {
             let mut i = self.inner.borrow_mut();
             // Session fermée pendant la lecture : plus d'accusé à attendre.
             if !i.connected || i.closing {
-                return true;
+                return Some(true);
             }
             let now = js_sys::Date::now();
             let common = i.clip_last;
             match i.clip_announces.after_read(mark, fp, common, now) {
-                clip::AfterRead::Done => return true,
-                clip::AfterRead::Retry => return false,
+                clip::AfterRead::Done => return Some(true),
+                clip::AfterRead::Retry => return Some(false),
                 clip::AfterRead::Join => {
                     i.clip_announces.join(tx);
                     Vec::new()
@@ -1253,7 +1259,7 @@ impl Engine {
                     let events = i.clip.set_local(items);
                     // Canal pas encore prêt : la liste partira avec Monitor Ready.
                     if events.is_empty() {
-                        return true;
+                        return Some(true);
                     }
                     i.clip_announces.sent(Some(fp), now, Some(tx));
                     // Copie locale plus récente : une écriture en attente du contenu du PC est dépassée,
@@ -1267,7 +1273,7 @@ impl Engine {
         };
         self.clip_send(events);
         // Attente abandonnée (session fermée) : rien de plus à tenter.
-        matches!(rx.await, Ok(clip::Ack::Accepted) | Err(_))
+        Some(matches!(rx.await, Ok(clip::Ack::Accepted) | Err(_)))
     }
 
     /// Geste utilisateur : occasion de réussir une écriture locale refusée plus tôt, si son
@@ -1296,14 +1302,7 @@ impl Engine {
         self.inner.borrow_mut().holding = true;
         let e = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let sync = async {
-                for _ in 0..3 {
-                    if e.sync_local_clipboard().await {
-                        return true;
-                    }
-                }
-                false
-            };
+            let sync = paste_attempts(|| e.sync_local_clipboard());
             let timeout = async {
                 let p = js_sys::Promise::new(&mut |resolve, _| {
                     let _ = web_sys::window()
@@ -1410,48 +1409,103 @@ impl Engine {
     }
 }
 
-/// Boutons distants enfoncés, par pointeur (souris, stylet, doigt d'une fenêtre secondaire) :
-/// drapeaux du bouton, étendu (X1/X2), dernière position envoyée.
-type Held = HashMap<i32, (u16, bool, (u16, u16))>;
+/// Essais de synchronisation d'un Ctrl+V (`sync_local_clipboard`, trois au plus). Une lecture
+/// sans résultat ne vaut succès que si aucun essai n'a échoué : après un refus de Windows, le PC
+/// n'a toujours pas le contenu local, l'échec reste jusqu'à un essai accepté.
+async fn paste_attempts<F: std::future::Future<Output = Option<bool>>>(
+    mut attempt: impl FnMut() -> F,
+) -> bool {
+    let mut failed = false;
+    for _ in 0..3 {
+        match attempt().await {
+            Some(true) => return true,
+            None if !failed => return true,
+            _ => failed = true,
+        }
+    }
+    false
+}
 
-/// Entrée RDP d'un événement pointeur hors gestes tactiles. Le bouton enfoncé au `pointerdown`
-/// est relâché une seule fois, au `pointerup` ou au `pointercancel` : après une annulation, le
-/// navigateur n'envoie pas de `pointerup` et Windows garderait le bouton enfoncé. Le relâchement
-/// reprend ce bouton-là, quel que soit celui que signale l'événement (boutons combinés).
-fn button_input(held: &mut Held, id: i32, kind: &str, button: i16, (x, y): (u16, u16)) -> Option<Input> {
+/// Pointeurs suivis depuis leur `pointerdown` (souris, stylet, doigt d'une fenêtre secondaire) :
+/// vue d'origine, boutons transmis au PC (masque `PointerEvent.buttons`), dernière position envoyée.
+type Held = HashMap<i32, (usize, u16, (u16, u16))>;
+
+/// Bits de `PointerEvent.buttons` transmis, et bouton RDP de chacun (étendu : X1/X2).
+const BUTTONS: [(u16, u16, bool); 5] = {
     use rdp_pdu::fastpath::ptr;
-    let (down, (flag, extended, (x, y))) = match kind {
-        "pointermove" => {
-            if let Some(h) = held.get_mut(&id) {
-                h.2 = (x, y);
-            }
-            return Some(Input::Mouse { flags: ptr::MOVE, x, y });
-        }
+    [
+        (1, ptr::BUTTON1, false),
+        (2, ptr::BUTTON2, false),
+        (4, ptr::BUTTON3, false),
+        (8, ptr::X_BUTTON1, true),
+        (16, ptr::X_BUTTON2, true),
+    ]
+};
+
+/// Appuis et relâchements qui font passer le PC du masque `from` au masque `to`, en (x, y).
+fn button_changes(from: u16, to: u16, (x, y): (u16, u16)) -> Vec<Input> {
+    use rdp_pdu::fastpath::ptr;
+    let changes = BUTTONS.iter().filter(|b| (from ^ to) & b.0 != 0);
+    changes
+        .map(|&(bit, flag, extended)| match (extended, to & bit != 0) {
+            (false, true) => Input::Mouse { flags: flag | ptr::DOWN, x, y },
+            (false, false) => Input::Mouse { flags: flag, x, y },
+            (true, true) => Input::MouseX { flags: flag | ptr::X_DOWN, x, y },
+            (true, false) => Input::MouseX { flags: flag, x, y },
+        })
+        .collect()
+}
+
+/// Entrées RDP d'un événement pointeur hors gestes tactiles. Pour un pointeur suivi, `buttons`
+/// est comparé aux boutons transmis : un appui ou un relâchement pendant le geste n'arrive que
+/// par `pointermove` (boutons combinés, Pointer Events). `pointerup` et `pointercancel`
+/// relâchent tout ce qui reste, une seule fois : après une annulation, le navigateur n'envoie
+/// pas de `pointerup` (relâché à la dernière position envoyée, celle d'une annulation n'est pas
+/// fiable). Un pointeur entré déjà enfoncé (appui hors du bureau) ne fait que bouger.
+fn button_input(
+    held: &mut Held,
+    id: i32,
+    view: usize,
+    kind: &str,
+    buttons: u16,
+    at: (u16, u16),
+) -> Vec<Input> {
+    let buttons = buttons & BUTTONS.iter().map(|b| b.0).sum::<u16>();
+    let target = match kind {
         "pointerdown" => {
-            let (flag, extended) = match button {
-                0 => (ptr::BUTTON1, false),
-                1 => (ptr::BUTTON3, false),
-                2 => (ptr::BUTTON2, false),
-                3 => (ptr::X_BUTTON1, true),
-                4 => (ptr::X_BUTTON2, true),
-                _ => return None,
-            };
-            held.insert(id, (flag, extended, (x, y)));
-            (true, (flag, extended, (x, y)))
+            held.entry(id).or_insert((view, 0, at)).0 = view;
+            buttons
         }
-        "pointerup" => {
-            let (flag, extended, _) = held.remove(&id)?;
-            (false, (flag, extended, (x, y)))
-        }
-        // Annulation : sa position n'est pas fiable, le bouton est relâché là où il était.
-        _ => (false, held.remove(&id)?),
+        "pointermove" if held.contains_key(&id) => buttons,
+        "pointermove" => return vec![Input::Mouse { flags: rdp_pdu::fastpath::ptr::MOVE, x: at.0, y: at.1 }],
+        _ => 0,
     };
-    Some(match (extended, down) {
-        (false, true) => Input::Mouse { flags: flag | ptr::DOWN, x, y },
-        (false, false) => Input::Mouse { flags: flag, x, y },
-        (true, true) => Input::MouseX { flags: flag | ptr::X_DOWN, x, y },
-        (true, false) => Input::MouseX { flags: flag, x, y },
-    })
+    let Some(h) = held.get_mut(&id) else { return Vec::new() };
+    if kind != "pointercancel" {
+        h.2 = at;
+    }
+    let out = button_changes(h.1, target, h.2);
+    h.1 = target;
+    if kind == "pointerup" || kind == "pointercancel" {
+        held.remove(&id);
+    }
+    if out.is_empty() && kind == "pointermove" {
+        return vec![Input::Mouse { flags: rdp_pdu::fastpath::ptr::MOVE, x: at.0, y: at.1 }];
+    }
+    out
+}
+
+/// Relâche les boutons des pointeurs partis d'une fenêtre secondaire, avant sa fermeture : son
+/// `pointerup` n'arrivera plus au moteur. Ceux de la fenêtre principale restent.
+fn release_secondary(held: &mut Held) -> Vec<Input> {
+    let mut out = Vec::new();
+    held.retain(|_, &mut (view, mask, at)| {
+        if view != 0 {
+            out.extend(button_changes(mask, 0, at));
+        }
+        view == 0
+    });
+    out
 }
 
 /// Écran seul à envoyer pour `size` (déjà bornée), `None` s'il n'y a rien à envoyer. `desired`
@@ -1552,31 +1606,92 @@ mod tests {
     fn pointer_button_released_once_on_up_or_cancel() {
         use rdp_pdu::fastpath::ptr;
         let mut held = Held::new();
-        let mouse = |flags, (x, y)| Some(Input::Mouse { flags, x, y });
+        let mouse = |flags, (x, y)| vec![Input::Mouse { flags, x, y }];
         // Stylet posé, déplacé, puis geste annulé par le navigateur : relâché où il était, une fois.
         assert_eq!(
-            button_input(&mut held, 7, "pointerdown", 0, (10, 20)),
+            button_input(&mut held, 7, 0, "pointerdown", 1, (10, 20)),
             mouse(ptr::BUTTON1 | ptr::DOWN, (10, 20))
         );
-        assert_eq!(button_input(&mut held, 7, "pointermove", -1, (30, 40)), mouse(ptr::MOVE, (30, 40)));
-        assert_eq!(button_input(&mut held, 7, "pointercancel", -1, (0, 0)), mouse(ptr::BUTTON1, (30, 40)));
-        assert_eq!(button_input(&mut held, 7, "pointercancel", -1, (0, 0)), None);
-        assert_eq!(button_input(&mut held, 7, "pointerup", 0, (30, 40)), None, "déjà relâché");
-        // Boutons combinés : le dernier relâché (droit) termine le geste, c'est le gauche qui part.
-        button_input(&mut held, 1, "pointerdown", 0, (5, 5));
-        assert_eq!(button_input(&mut held, 1, "pointerup", 2, (6, 6)), mouse(ptr::BUTTON1, (6, 6)));
-        // Boutons étendus, et bouton inconnu (gomme) ignoré jusqu'au bout.
+        assert_eq!(button_input(&mut held, 7, 0, "pointermove", 1, (30, 40)), mouse(ptr::MOVE, (30, 40)));
+        assert_eq!(button_input(&mut held, 7, 0, "pointercancel", 0, (0, 0)), mouse(ptr::BUTTON1, (30, 40)));
+        assert_eq!(button_input(&mut held, 7, 0, "pointercancel", 0, (0, 0)), vec![]);
+        assert_eq!(button_input(&mut held, 7, 0, "pointerup", 0, (30, 40)), vec![], "déjà relâché");
+        // Boutons étendus, et bouton inconnu (gomme, 32) ignoré jusqu'au bout.
         assert_eq!(
-            button_input(&mut held, 1, "pointerdown", 3, (1, 2)),
-            Some(Input::MouseX { flags: ptr::X_BUTTON1 | ptr::X_DOWN, x: 1, y: 2 })
+            button_input(&mut held, 1, 0, "pointerdown", 8, (1, 2)),
+            vec![Input::MouseX { flags: ptr::X_BUTTON1 | ptr::X_DOWN, x: 1, y: 2 }]
         );
         assert_eq!(
-            button_input(&mut held, 1, "pointerup", 3, (1, 2)),
-            Some(Input::MouseX { flags: ptr::X_BUTTON1, x: 1, y: 2 })
+            button_input(&mut held, 1, 0, "pointerup", 0, (1, 2)),
+            vec![Input::MouseX { flags: ptr::X_BUTTON1, x: 1, y: 2 }]
         );
-        assert_eq!(button_input(&mut held, 2, "pointerdown", 5, (1, 2)), None);
-        assert_eq!(button_input(&mut held, 2, "pointerup", 5, (1, 2)), None);
+        assert_eq!(button_input(&mut held, 2, 0, "pointerdown", 32, (1, 2)), vec![]);
+        assert_eq!(button_input(&mut held, 2, 0, "pointerup", 0, (1, 2)), vec![]);
+        // Pointeur entré déjà enfoncé (appui hors du bureau) : il ne fait que bouger.
+        assert_eq!(button_input(&mut held, 3, 0, "pointermove", 1, (5, 5)), mouse(ptr::MOVE, (5, 5)));
+        assert_eq!(button_input(&mut held, 3, 0, "pointerup", 0, (5, 5)), vec![]);
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn paste_attempts_keep_a_refusal_over_unread_clipboards() {
+        use futures::FutureExt;
+        let run = |script: &[Option<bool>]| {
+            let mut it = script.iter().copied();
+            paste_attempts(|| std::future::ready(it.next().unwrap())).now_or_never().unwrap()
+        };
+        assert!(run(&[None]), "presse-papier illisible d'emblée : rien à attendre");
+        assert!(run(&[Some(false), Some(true)]));
+        assert!(!run(&[Some(false), None, None]), "refus puis lecture refusée : toujours en échec");
+        assert!(run(&[Some(false), None, Some(true)]));
+        assert!(!run(&[Some(false); 3]));
+    }
+
+    #[test]
+    fn chorded_buttons_follow_pointermove() {
+        use rdp_pdu::fastpath::ptr;
+        let mut held = Held::new();
+        let mouse = |flags, (x, y)| vec![Input::Mouse { flags, x, y }];
+        // Gauche, puis droit (pointermove, buttons = 3), gauche relâché (buttons = 2), puis droit.
+        assert_eq!(
+            button_input(&mut held, 1, 0, "pointerdown", 1, (5, 5)),
+            mouse(ptr::BUTTON1 | ptr::DOWN, (5, 5))
+        );
+        assert_eq!(
+            button_input(&mut held, 1, 0, "pointermove", 3, (6, 6)),
+            mouse(ptr::BUTTON2 | ptr::DOWN, (6, 6))
+        );
+        assert_eq!(button_input(&mut held, 1, 0, "pointermove", 2, (7, 7)), mouse(ptr::BUTTON1, (7, 7)));
+        assert_eq!(button_input(&mut held, 1, 0, "pointerup", 0, (8, 8)), mouse(ptr::BUTTON2, (8, 8)));
+        // Sans les transitions intermédiaires, `pointerup` relâche quand même tout ce qui reste.
+        button_input(&mut held, 1, 0, "pointerdown", 1, (5, 5));
+        button_input(&mut held, 1, 0, "pointermove", 5, (5, 5));
+        assert_eq!(
+            button_input(&mut held, 1, 0, "pointercancel", 0, (0, 0)),
+            vec![
+                Input::Mouse { flags: ptr::BUTTON1, x: 5, y: 5 },
+                Input::Mouse { flags: ptr::BUTTON3, x: 5, y: 5 }
+            ]
+        );
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn closing_secondary_views_releases_only_their_buttons() {
+        use rdp_pdu::fastpath::ptr;
+        let mut held = Held::new();
+        button_input(&mut held, 1, 1, "pointerdown", 1, (2000, 10));
+        button_input(&mut held, 1, 1, "pointermove", 3, (2010, 20));
+        button_input(&mut held, 9, 0, "pointerdown", 1, (10, 10));
+        assert_eq!(
+            release_secondary(&mut held),
+            vec![
+                Input::Mouse { flags: ptr::BUTTON1, x: 2010, y: 20 },
+                Input::Mouse { flags: ptr::BUTTON2, x: 2010, y: 20 }
+            ]
+        );
+        assert_eq!(held.keys().collect::<Vec<_>>(), [&9], "la vue principale garde son bouton");
+        assert_eq!(release_secondary(&mut held), vec![]);
     }
 
     #[test]

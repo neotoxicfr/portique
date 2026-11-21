@@ -259,7 +259,9 @@ impl Announces {
     /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Met à jour
     /// `common`, l'empreinte commune aux deux côtés : toute liste acceptée a remplacé le contenu
     /// du PC, il ne reste commun que si c'est la dernière et que son contenu est connu. Le verdict
-    /// des attentes, lui, reste `Replaced` pour une liste suivie d'une autre.
+    /// des attentes, lui, reste `Replaced` pour une liste suivie d'une autre. Un refus de la
+    /// dernière, au contenu connu, efface aussi `common` : `set_local` a déjà remplacé le contenu
+    /// servi, le PC garde ses formats d'avant mais recevrait le contenu refusé s'il les demandait.
     pub fn answered(&mut self, ok: bool, common: &mut Option<u64>) {
         let Some(a) = self.pending.pop_front() else { return };
         if self.pending.is_empty() {
@@ -272,6 +274,8 @@ impl Announces {
         };
         if ok {
             *common = a.fp.filter(|_| verdict == Ack::Accepted);
+        } else if verdict == Ack::Refused && a.fp.is_some() {
+            *common = None;
         }
         for w in a.waiters {
             let _ = w.send(verdict);
@@ -529,11 +533,17 @@ mod tests {
         assert_eq!(common, Some(2));
         assert_eq!(rb.try_recv(), Ok(Some(Ack::Accepted)));
         assert_eq!(a.latest(), None);
-        // Seule en vol : son propre verdict, refus compris.
+        // Seule en vol : son propre verdict, refus compris. Le contenu servi est déjà le refusé :
+        // plus rien de commun, le réessai réannoncera même le contenu d'avant.
         let (tc, mut rc) = wait();
         a.sent(Some(3), 30.0, Some(tc));
         a.answered(false, &mut common);
         assert_eq!(rc.try_recv(), Ok(Some(Ack::Refused)));
+        assert_eq!(common, None, "refus de la dernière liste connue");
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 2, common, 35.0), AfterRead::Publish, "contenu d'avant réannoncé");
+        a.sent(Some(2), 35.0, None);
+        a.answered(true, &mut common);
         assert_eq!(common, Some(2));
         // A acceptée puis B refusée : le PC a pris A, le contenu commun d'avant n'est plus le sien.
         let (ta, mut ra) = wait();

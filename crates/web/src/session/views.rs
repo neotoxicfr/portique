@@ -130,6 +130,9 @@ pub fn screens(details: &JsValue) -> Result<(Vec<ScreenGeom>, usize), String> {
 /// Écran envoyé au PC : x, y relatifs à l'écran principal, largeur, hauteur.
 pub type Monitor = (i32, i32, u32, u32);
 
+/// Côté maximal du bureau englobant : plafond de la sortie de `rdp-gfx` (`MAX_SIDE`).
+const MAX_DESKTOP_SIDE: u32 = rdp_gfx::MAX_SIDE;
+
 /// Disposition à envoyer (relative à l'écran principal) et rectangles attendus en sortie, ou la
 /// raison pour laquelle le PC l'ignorerait (MS-RDPEDISP 2.2.2.2.1). La largeur doit être paire :
 /// tous les bords verticaux sont ramenés au pair inférieur, si bien que deux écrans voisins le
@@ -152,13 +155,22 @@ pub fn layout(screens: &[ScreenGeom], primary: usize) -> Result<(Vec<Monitor>, V
     check_arrangement(&rel)?;
     let min_x = rel.iter().map(|r| r.0).min().unwrap_or(0);
     let min_y = rel.iter().map(|r| r.1).min().unwrap_or(0);
+    // Le PC enverrait un bureau englobant que `rdp-gfx` refuse (Reset Graphics hors bornes) : la
+    // session se fermerait. Refusé ici, avant toute fenêtre, le mode à un écran reste.
+    let side = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
+    let bw = side(rel.iter().map(|r| i64::from(r.0) + i64::from(r.2)).max().unwrap_or(0) - i64::from(min_x));
+    let bh = side(rel.iter().map(|r| i64::from(r.1) + i64::from(r.3)).max().unwrap_or(0) - i64::from(min_y));
+    if bw > MAX_DESKTOP_SIDE || bh > MAX_DESKTOP_SIDE {
+        return Err(format!("bureau de {bw}×{bh} : au plus {MAX_DESKTOP_SIDE} px par côté"));
+    }
     let rects =
         rel.iter().map(|&(x, y, w, h)| Rect { x: (x - min_x) as u32, y: (y - min_y) as u32, w, h }).collect();
     Ok((rel, rects))
 }
 
-/// Écrans sans recouvrement et reliés entre eux par leurs bords, sans intervalle (un contact par
-/// un coin suffit).
+/// Conditions du PC pour appliquer une disposition (MS-RDPEDISP 3.1.5.2) : aucun recouvrement, et
+/// chaque écran adjacent à au moins un autre, même par un seul point. Rien de plus : deux paires
+/// d'écrans séparées par un intervalle restent valides.
 fn check_arrangement(m: &[Monitor]) -> Result<(), String> {
     let r: Vec<[i64; 4]> = m
         .iter()
@@ -175,15 +187,10 @@ fn check_arrangement(m: &[Monitor]) -> Result<(), String> {
             return Err("écrans qui se recouvrent : disposition refusée par le protocole".into());
         }
     }
-    // Reliés : à partir du premier, on gagne de proche en proche tout écran qui en touche un atteint.
-    let mut reached: Vec<bool> = (0..r.len()).map(|i| i == 0).collect();
-    while let Some(j) =
-        (0..r.len()).find(|&j| !reached[j] && (0..r.len()).any(|i| reached[i] && touch(&r[i], &r[j])))
-    {
-        reached[j] = true;
-    }
-    if reached.contains(&false) {
-        return Err("écrans séparés par un intervalle : disposition refusée par le protocole".into());
+    // Un écran seul n'a pas de voisin à toucher.
+    let isolated = |i: usize| (0..r.len()).all(|j| j == i || !touch(&r[i], &r[j]));
+    if r.len() > 1 && (0..r.len()).any(isolated) {
+        return Err("écran isolé par un intervalle : disposition refusée par le protocole".into());
     }
     Ok(())
 }
@@ -343,6 +350,27 @@ mod tests {
         // Trois écrans en ligne : le troisième n'est relié qu'au deuxième.
         let row = [s(0, 0, 1920, 1080), s(1920, 0, 1920, 1080), s(3840, 0, 1920, 1080)];
         assert!(layout(&row, 1).is_ok());
+    }
+
+    #[test]
+    fn each_screen_needs_one_neighbour_not_one_group() {
+        // MS-RDPEDISP 3.1.5.2 : un voisin par écran. Deux paires séparées par un intervalle passent.
+        let pairs =
+            [s(0, 0, 1920, 1080), s(1920, 0, 1920, 1080), s(4000, 0, 1920, 1080), s(5920, 0, 1920, 1080)];
+        assert!(layout(&pairs, 0).is_ok());
+        // Un écran sans aucun voisin reste refusé, même si les autres se touchent.
+        let lone = [s(0, 0, 1920, 1080), s(1920, 0, 1920, 1080), s(4000, 0, 1920, 1080)];
+        assert!(layout(&lone, 0).is_err(), "écran isolé");
+    }
+
+    #[test]
+    fn bounding_desktop_within_the_graphics_limit() {
+        // Deux 5120×1440 côte à côte : chacun est valide, le bureau de 10240 px ne l'est pas.
+        assert!(layout(&[s(0, 0, 5120, 1440), s(5120, 0, 5120, 1440)], 0).is_err());
+        assert!(layout(&[s(0, 0, 1920, 5000), s(0, 5000, 1920, 5000)], 1).is_err(), "en hauteur");
+        // Deux 4K côte à côte (7680×2160) restent admissibles, de même qu'un bureau de 8192 px.
+        assert!(layout(&[s(0, 0, 3840, 2160), s(3840, 0, 3840, 2160)], 0).is_ok());
+        assert!(layout(&[s(0, 0, 4096, 2160), s(-4096, 0, 4096, 2160)], 0).is_ok());
     }
 
     #[test]

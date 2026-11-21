@@ -45,7 +45,7 @@ struct Inner {
     /// Dernière purge des clés expirées.
     purged: Option<Instant>,
     /// Débordement, table pleine : préfixe grossier (ou « * », seau commun) → tentatives de la fenêtre.
-    overflow: HashMap<String, Vec<Instant>>,
+    overflow: HashMap<String, Vec<(Instant, u64)>>,
 }
 
 /// Réservation d'une tentative : `succeeded` ou `release` rendent à l'IP la place de CETTE tentative,
@@ -57,6 +57,8 @@ pub struct Ticket {
     limiter: Arc<LoginLimiter>,
     n: u64,
     keys: [String; 2],
+    /// Seaux de débordement débités par cette réservation (table saturée).
+    overflow: Vec<String>,
 }
 
 impl Drop for Ticket {
@@ -105,6 +107,15 @@ fn prefix_key(ip: IpAddr) -> String {
     }
 }
 
+/// Retire des seaux de débordement la tentative `n` (et elle seule).
+fn refund_overflow(overflow: &mut HashMap<String, Vec<(Instant, u64)>>, buckets: &[String], n: u64) {
+    for b in buckets {
+        if let Some(v) = overflow.get_mut(b) {
+            v.retain(|(_, id)| *id != n);
+        }
+    }
+}
+
 impl Ticket {
     /// Tentative réussie : échecs conclus du compte effacés, place de cette réservation rendue à l'IP (et à
     /// elle seule : un succès ne rend jamais la place d'une autre tentative). Les autres tentatives du
@@ -120,6 +131,7 @@ impl Ticket {
         if let Some(v) = attempts.get_mut(ip) {
             v.retain(|(_, id)| *id != self.n);
         }
+        refund_overflow(&mut inner.overflow, &self.overflow, self.n);
         drop(inner);
     }
 
@@ -131,6 +143,7 @@ impl Ticket {
                 v.retain(|(_, id)| *id != self.n);
             }
         }
+        refund_overflow(&mut inner.overflow, &self.overflow, self.n);
         drop(inner);
     }
 }
@@ -156,7 +169,7 @@ impl LoginLimiter {
         };
         if !room(map) && purged.is_none_or(|t| now.duration_since(t) >= PURGE_EVERY) {
             map.retain(|_, v| v.iter().any(|(t, _)| now.duration_since(*t) < WINDOW));
-            overflow.retain(|_, v| v.iter().any(|t| now.duration_since(*t) < WINDOW));
+            overflow.retain(|_, v| v.iter().any(|(t, _)| now.duration_since(*t) < WINDOW));
             *purged = Some(now);
         }
         if !room(map) {
@@ -188,17 +201,18 @@ impl LoginLimiter {
             }
             let full = buckets.iter().any(|(b, cap)| {
                 overflow.get_mut(b).is_some_and(|v| {
-                    v.retain(|t| now.duration_since(*t) < WINDOW);
+                    v.retain(|(t, _)| now.duration_since(*t) < WINDOW);
                     v.len() >= *cap
                 })
             });
             if full {
                 return None;
             }
-            for (b, _) in buckets {
-                overflow.entry(b).or_default().push(now);
-            }
             let n = self.next.fetch_add(1, Ordering::Relaxed);
+            let debited: Vec<String> = buckets.into_iter().map(|(b, _)| b).collect();
+            for b in &debited {
+                overflow.entry(b.clone()).or_default().push((now, n));
+            }
             for (k, _) in &keys {
                 if let Some(v) = map.get_mut(k) {
                     v.push((now, n));
@@ -207,7 +221,7 @@ impl LoginLimiter {
             in_flight.insert(n);
             drop(inner);
             let [(account, _), (ip, _)] = keys;
-            return Some(Ticket { limiter: Arc::clone(self), n, keys: [account, ip] });
+            return Some(Ticket { limiter: Arc::clone(self), n, keys: [account, ip], overflow: debited });
         }
         let allowed = room(map)
             && keys.iter().all(|(k, max)| {
@@ -225,7 +239,7 @@ impl LoginLimiter {
         }
         drop(inner);
         let [(account, _), (ip, _)] = keys;
-        n.map(|n| Ticket { limiter: Arc::clone(self), n, keys: [account, ip] })
+        n.map(|n| Ticket { limiter: Arc::clone(self), n, keys: [account, ip], overflow: Vec::new() })
     }
 }
 
@@ -341,6 +355,14 @@ mod tests {
             assert!(l.reserve(IpAddr::from([203, 0, 113, 1]), "victime").is_some());
         }
         assert!(l.reserve(IpAddr::from([203, 0, 113, 2]), "victime").is_none(), "compte plafonné");
+        // Mot de passe bon, code TOTP attendu : la réservation de débordement est rendue, le code passe ensuite.
+        let t = l.reserve(IpAddr::from([198, 51, 100, 7]), "totp").unwrap();
+        for _ in 1..MAX_PER_ACCOUNT {
+            drop(l.reserve(IpAddr::from([198, 51, 100, 7]), "totp").unwrap());
+        }
+        assert!(l.reserve(IpAddr::from([198, 51, 100, 7]), "totp").is_none());
+        t.release();
+        assert!(l.reserve(IpAddr::from([198, 51, 100, 7]), "totp").is_some(), "place rendue");
         assert!(l.reserve(IpAddr::from([198, 51, 100, 1]), "bob").is_some(), "autre préfixe");
         let inner = l.inner.lock().unwrap();
         assert_eq!(inner.attempts.len(), MAX_KEYS);

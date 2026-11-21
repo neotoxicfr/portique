@@ -54,16 +54,18 @@ pub async fn login(
 
     // Le pas TOTP se consomme dans la même transaction que la création de la session : un échec de celle-ci
     // laisse le code utilisable, une connexion aboutie en bloque toujours le rejeu.
+    // Code manquant : demandé avant d'ouvrir la transaction, qui n'a rien à faire dans ce cas.
+    let code = req.totp.as_deref().filter(|c| !c.is_empty());
+    if user.totp_secret.is_some() && code.is_none() {
+        // Mot de passe bon : on demande le code, sans compter d'échec.
+        ticket.release();
+        return Ok((jar, Json(LoginResponse::TotpRequired)));
+    }
     let mut tx = state.db.begin().await?;
-    if let Some(sealed) = &user.totp_secret {
-        let Some(code) = req.totp.as_deref().filter(|c| !c.is_empty()) else {
-            // Mot de passe bon : on demande le code, sans compter d'échec.
-            ticket.release();
-            return Ok((jar, Json(LoginResponse::TotpRequired)));
-        };
-        if !auth::consume_totp(&state, &mut *tx, &user, sealed, code).await? {
-            return Err(AppError::BadRequest("code TOTP invalide".into()));
-        }
+    if let (Some(sealed), Some(code)) = (&user.totp_secret, code)
+        && !auth::consume_totp(&state, &mut *tx, &user, sealed, code).await?
+    {
+        return Err(AppError::BadRequest("code TOTP invalide".into()));
     }
 
     // Mot de passe + TOTP vérifié ci-dessus : second facteur.

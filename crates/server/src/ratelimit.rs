@@ -124,6 +124,24 @@ impl LoginLimiter {
             map.retain(|_, v| v.iter().any(|(t, _)| now.duration_since(*t) < WINDOW));
             *purged = Some(now);
         }
+        // Toujours pleine : on évince les clés dont la dernière tentative est la plus ancienne (hors tentatives
+        // en vol) plutôt que de refuser. Refuser bloquerait les connexions de tout le monde dès qu'une rafale
+        // de préfixes a rempli la table ; évincer ne rend à l'attaquant que ses propres vieux compteurs.
+        while !room(map) {
+            let victim = map
+                .iter()
+                .filter(|(k, v)| {
+                    !keys.iter().any(|(own, _)| own == *k) && !v.iter().any(|(_, n)| in_flight.contains(n))
+                })
+                .min_by_key(|(_, v)| v.iter().map(|(t, _)| *t).max())
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    map.remove(&k);
+                }
+                None => break,
+            }
+        }
         let allowed = room(map)
             && keys.iter().all(|(k, max)| {
                 map.get_mut(k).is_none_or(|v| {
@@ -210,21 +228,32 @@ mod tests {
         fill(expired, MAX_KEYS - 2);
         assert!(l.reserve(ip(2), "bob").is_some(), "clés expirées purgées");
         assert_eq!(len(), 4);
-        // Purge récente : la suivante attend, la table pleine ne prend aucune nouvelle clé.
+        // Purge récente : pas de nouvelle purge, mais les clés les moins récentes (ici expirées) cèdent la place.
         fill(expired, MAX_KEYS - 4);
-        assert!(l.reserve(ip(3), "carol").is_none());
+        assert!(l.reserve(ip(3), "carol").is_some(), "éviction plutôt que refus");
         assert_eq!(len(), MAX_KEYS);
         let again = l.reserve(ip(1), "alice").expect("clés déjà suivies");
         assert_eq!(l.inner.lock().unwrap().attempts["192.0.2.1|alice"].len(), 2, "échec d'alice gardé");
         drop(again);
-        l.inner.lock().unwrap().purged = Instant::now().checked_sub(PURGE_EVERY);
-        assert!(l.reserve(ip(3), "carol").is_some(), "purge passée");
-        assert_eq!(len(), 6);
-        // Pleine de clés actives : rien à purger, toujours aucune nouvelle clé.
-        fill(Instant::now(), MAX_KEYS - 6);
-        l.inner.lock().unwrap().purged = Instant::now().checked_sub(PURGE_EVERY);
-        assert!(l.reserve(ip(4), "dave").is_none());
-        assert_eq!(len(), MAX_KEYS);
+    }
+
+    /// Une table pleine de clés actives n'est jamais fermée à tous : la moins récente part.
+    #[test]
+    fn full_table_evicts_the_least_recent_keys_instead_of_refusing() {
+        let l = Arc::new(LoginLimiter::default());
+        let old = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        {
+            let mut inner = l.inner.lock().unwrap();
+            inner.attempts.insert("ancienne".into(), vec![(old, u64::MAX)]);
+            for k in 1..MAX_KEYS {
+                inner.attempts.insert(format!("x{k}"), vec![(Instant::now(), u64::MAX)]);
+            }
+            inner.purged = Some(Instant::now());
+        }
+        assert!(l.reserve(IpAddr::from([192, 0, 2, 9]), "eve").is_some(), "pleine : éviction, pas de refus");
+        let inner = l.inner.lock().unwrap();
+        assert_eq!(inner.attempts.len(), MAX_KEYS);
+        assert!(!inner.attempts.contains_key("ancienne"), "la moins récente part");
     }
 
     #[test]

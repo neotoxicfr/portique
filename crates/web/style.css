@@ -159,6 +159,11 @@ a { color: var(--link); text-decoration: none; }
 :is(a, button).line:focus-visible { outline-offset: -3px; border-radius: 16px; }
 /* Bouton icône dans une ligne : l'anneau extérieur touchait le bord du groupe sur la dernière ligne ; il passe dedans. */
 .line .iconbtn:focus-visible { outline-offset: -3px; }
+/* Éléments collés les uns aux autres (segments, lignes de la liste des machines, touches des barres) : un anneau
+   extérieur déborderait sur le voisin ; il passe à l'intérieur et suit leur arrondi. */
+:is(.seg > a, .seg > button, .mrow, .keybar .key, .sk-key, .tag button):focus-visible { outline-offset: -3px; }
+/* Touche active (Ctrl, Alt… collants) : son fond a le bleu du focus, l'anneau intérieur passe en blanc pour rester visible. */
+:is(.keybar .key.on, .sk-key.on):focus-visible { outline-color: #ffffff; }
 /* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
 @media (forced-colors: active) {
   :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
@@ -531,7 +536,7 @@ td.cell-actions { text-align: right; }
 /* isolation : les z-index internes de xterm (ascenseur, règle) restent sous l'alerte et son voile.
    content-box : FitAddon prend la hauteur et la largeur calculées de ce parent sans en retirer le padding ; en
    border-box elles l'incluaient, et le terminal débordait d'une demi-ligne en bas et de quelques pixels à droite. */
-.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; box-sizing: content-box; isolation: isolate; }
+.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; box-sizing: content-box; isolation: isolate; overflow: hidden; }
 
 /* Barre de touches façon clavier iOS : 8 touches sur la 1re rangée, combinaisons en dessous. */
 .keybar {

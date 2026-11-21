@@ -1,5 +1,7 @@
 # Exemple : portique derrière Traefik + Authelia (mode proxy), dans l'espace réseau d'un conteneur
 # WireGuard qui joint le réseau du PC (ici `wireguard`). Secrets en fichiers (Docker secrets).
+# Compose résout `./data` et `./secrets` depuis le dossier de ce fichier : les commandes de préparation
+# ci-dessous se lancent dans ce dossier. Docker rootless ou userns-remap : UID décalé sur l'hôte, voir le README.
 services:
   portique:
     image: portique:0.1.0

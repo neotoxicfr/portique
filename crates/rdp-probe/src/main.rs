@@ -262,10 +262,15 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                     break 'outer;
                 }
                 Event::Clipboard(msg) => {
-                    // `receive` rejette un en-tête tronqué : le type se lit ensuite sans risque.
+                    // Un message sans en-tête complet peut encore conclure la demande en vol : type facultatif.
                     let events = clip.receive(&msg).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                    let kind = u16::from_le_bytes([msg[0], msg[1]]);
-                    println!("  {:>6} ms cliprdr ← type {kind} ({} o)", t0.elapsed().as_millis(), msg.len());
+                    let kind = msg.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+                    println!(
+                        "  {:>6} ms cliprdr ← type {} ({} o)",
+                        t0.elapsed().as_millis(),
+                        kind.map_or("?".into(), |k| k.to_string()),
+                        msg.len()
+                    );
                     for ev in events {
                         match ev {
                             rdp_clip::ClipEvent::Send(m) => {
@@ -308,7 +313,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                             ),
                         }
                     }
-                    if env("DRAG").is_some() && !clip_started && kind == 1 {
+                    if env("DRAG").is_some() && !clip_started && kind == Some(1) {
                         clip_started = true;
                         // Win+R puis glisser la boîte Exécuter en cercles : du mouvement continu,
                         // pour voir si Windows passe des zones en H.264.
@@ -365,7 +370,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                         send(tls, &session.input(&[k(0x01, false, false), k(0x01, false, true)])).await?;
                         println!("  glisser terminé : {} images, {} H.264", stats.frames, stats.avc);
                     }
-                    if clip_test && !clip_started && kind == 1 {
+                    if clip_test && !clip_started && kind == Some(1) {
                         clip_started = true;
                         // Win+R, « abc », Ctrl+A, Ctrl+C (scancodes), avec des pauses.
                         use rdp_pdu::fastpath::{Input, kbd};

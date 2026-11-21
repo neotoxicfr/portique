@@ -132,7 +132,8 @@ pub fn validate_username(name: &str) -> Result<(), AppError> {
 }
 
 /// Vérifie un code TOTP et consomme son pas par une écriture conditionnelle : deux requêtes concurrentes
-/// avec le même code lisent le même `totp_last`, une seule l'emporte.
+/// avec le même code lisent le même `totp_last`, une seule l'emporte. L'écriture exige aussi la graine
+/// vérifiée : retirée ou remplacée entre-temps (remise à zéro de la 2FA), le code ne vaut plus rien.
 pub async fn consume_totp(
     state: &AppState,
     u: &UserRow,
@@ -147,11 +148,13 @@ pub async fn consume_totp(
     let Some(step) = crate::totp::verify(&secret, &u.username, code, last)? else {
         return Ok(false);
     };
-    let r = sqlx::query("UPDATE users SET totp_last = ?1 WHERE id = ?2 AND totp_last < ?1")
-        .bind(step)
-        .bind(u.id)
-        .execute(&state.db)
-        .await?;
+    let r =
+        sqlx::query("UPDATE users SET totp_last = ?1 WHERE id = ?2 AND totp_last < ?1 AND totp_secret = ?3")
+            .bind(step)
+            .bind(u.id)
+            .bind(sealed)
+            .execute(&state.db)
+            .await?;
     Ok(r.rows_affected() == 1)
 }
 
@@ -430,6 +433,12 @@ mod tests {
         let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
         let secret = crate::totp::new_secret();
         let sealed = s.vault.seal(&format!("totp:{}", u.id), &secret);
+        sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")
+            .bind(&sealed)
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
         let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
         let (a, b, c) = tokio::join!(
             consume_totp(&s, &u, &sealed, &code),
@@ -438,6 +447,23 @@ mod tests {
         );
         let ok = [a.unwrap(), b.unwrap(), c.unwrap()];
         assert_eq!(ok.iter().filter(|o| **o).count(), 1, "{ok:?}");
+    }
+
+    /// Graine lue avant une remise à zéro de la 2FA : son code n'est plus accepté ni son pas consommé.
+    #[tokio::test]
+    async fn totp_code_of_a_removed_seed_is_refused() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        let sealed = s.vault.seal(&format!("totp:{}", u.id), &secret);
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        assert!(!consume_totp(&s, &u, &sealed, &code).await.unwrap());
+        let last: i64 = sqlx::query_scalar("SELECT totp_last FROM users WHERE id = ?")
+            .bind(u.id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+        assert_eq!(last, 0);
     }
 
     #[tokio::test]

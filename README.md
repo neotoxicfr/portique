@@ -89,6 +89,10 @@ printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password
 chmod 400 secrets/* && sudo chown 10001:10001 data secrets/*   # le conteneur tourne sous l'UID 10001
 ```
 
+Avec Docker rootless ou `userns-remap`, l'UID 10001 du conteneur correspond à un autre UID de l'hôte : donne
+`data` et les secrets au début de ta plage `/etc/subuid` + 10000 en rootless, + 10001 avec `userns-remap`
+(même calcul pour le GID avec `/etc/subgid`).
+
 ```yaml
 # docker-compose.yml
 services:

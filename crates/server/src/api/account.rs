@@ -73,14 +73,18 @@ pub async fn change_password(
 ) -> ApiResult<StatusCode> {
     reauth(&state, ip, &u, &req.auth).await?;
     auth::validate_password(&req.new)?;
-    // N'écrit que sur le hash que `reauth` vient de vérifier : un mot de passe remis par un admin pendant
-    // le hachage (sessions coupées) ne doit pas être écrasé par l'ancien détenteur du compte.
-    let r = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?")
-        .bind(auth::hash_password(&req.new).await?)
-        .bind(u.id)
-        .bind(u.password_hash.as_deref())
-        .execute(&state.db)
-        .await?;
+    // N'écrit que sur le hash et la graine TOTP que `reauth` vient de vérifier : un mot de passe remis par
+    // un admin pendant le hachage (sessions coupées) ne doit pas être écrasé par l'ancien détenteur du
+    // compte, ni un TOTP activé entre-temps contourné par une preuve au mot de passe seul.
+    let r = sqlx::query(
+        "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ? AND totp_secret IS ?",
+    )
+    .bind(auth::hash_password(&req.new).await?)
+    .bind(u.id)
+    .bind(u.password_hash.as_deref())
+    .bind(u.totp_secret.as_deref())
+    .execute(&state.db)
+    .await?;
     if r.rows_affected() == 0 {
         return Err(AppError::Unauthorized);
     }
@@ -330,5 +334,28 @@ mod tests {
         assert!(super::change_password(State(s.clone()), ip, CurrentUser(stale), Json(req())).await.is_ok());
         let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
         assert!(auth::verify_password("nouveau-mot-de-passe", now.password_hash.as_deref().unwrap()).await);
+    }
+
+    /// Un TOTP activé depuis un autre appareil pendant le hachage : la requête vérifiée au mot de passe
+    /// seul ne change plus le mot de passe.
+    #[tokio::test]
+    async fn totp_enabled_meanwhile_blocks_password_only_change() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let stale = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        assert!(stale.totp_secret.is_none());
+        sqlx::query("UPDATE users SET totp_secret = x'01' WHERE id = ?")
+            .bind(stale.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let req = ChangePassword {
+            auth: ReAuth { password: "admin-password-123".into(), totp: None },
+            new: "nouveau-mot-de-passe".into(),
+        };
+        let ip = ClientIp("192.0.2.1".parse().unwrap());
+        let r = super::change_password(State(s.clone()), ip, CurrentUser(stale.clone()), Json(req)).await;
+        assert!(matches!(r, Err(AppError::Unauthorized)));
+        let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        assert_eq!(now.password_hash, stale.password_hash);
     }
 }

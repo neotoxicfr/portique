@@ -97,4 +97,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist && sha256sum ./*.tar.gz > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "" --verify-tag ./*.tar.gz SHA256SUMS
+          # Préversion (vX.Y.Z-rc.N) : marquée comme telle, jamais « Latest ».
+          pre=(); if [[ "$GITHUB_REF_NAME" == *-* ]]; then pre=(--prerelease --latest=false); fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "" --verify-tag "${pre[@]}" \
+            ./*.tar.gz SHA256SUMS

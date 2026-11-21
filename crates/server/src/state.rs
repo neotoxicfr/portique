@@ -51,18 +51,24 @@ pub struct Ceremonies {
 }
 
 const CEREMONY_TTL: Duration = Duration::from_secs(300);
-/// Plafond des défis en attente : une rafale de démarrages ne fait pas grossir la mémoire sans fin.
-const MAX_CEREMONIES: usize = 1000;
+/// Plafonds des défis en attente : une rafale de démarrages ne fait pas grossir la mémoire sans fin. Un
+/// plafond par sorte : les connexions (sans compte) n'évincent jamais une inscription (authentifiée).
+const MAX_LOGINS: usize = 1000;
+const MAX_REGISTRATIONS: usize = 100;
 
 impl Ceremonies {
     pub fn insert(&self, c: Ceremony) -> Result<Uuid, AppError> {
         let id = Uuid::new_v4();
         let mut map = self.pending.lock().unwrap();
         map.retain(|_, (t, _)| t.elapsed() < CEREMONY_TTL);
-        // Plein : on évince le plus ancien plutôt que de refuser. Refuser laisserait une rafale de démarrages
-        // (sans compte) bloquer les passkeys de tout le monde pendant cinq minutes.
-        if map.len() >= MAX_CEREMONIES
-            && let Some(oldest) = map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k)
+        // Plein : on évince le plus ancien de la même sorte plutôt que de refuser. Refuser laisserait une
+        // rafale de démarrages (sans compte) bloquer les passkeys de tout le monde pendant cinq minutes.
+        let login = |c: &Ceremony| matches!(c, Ceremony::Login { .. });
+        let kind = login(&c);
+        let max = if kind { MAX_LOGINS } else { MAX_REGISTRATIONS };
+        let same = || map.iter().filter(|(_, (_, o))| login(o) == kind);
+        if same().count() >= max
+            && let Some(oldest) = same().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k)
         {
             map.remove(&oldest);
         }
@@ -141,4 +147,41 @@ pub type ApiResult<T> = Result<T, AppError>;
 
 pub fn bad(msg: impl Into<String>) -> AppError {
     AppError::BadRequest(msg.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use webauthn_rs::prelude::Passkey;
+
+    use super::*;
+
+    /// Passkey ES256 factice (clé publique de l'exemple de webauthn-rs-core).
+    const PASSKEY: &str = r#"{"cred":{"cred_id":"uZcVDBVS68E_MtAgeQpElJxldF_6cY9sSvbWqx_qRh8wiu42lyRBRmh5yFeD_r9k130dMbFHBHI9RTFgdJQIzQ","cred":{"type_":"ES256","key":{"EC_EC2":{"curve":"SECP256R1","x":[194,126,127,109,252,23,131,21,252,6,223,99,44,254,140,27,230,17,94,5,133,28,104,41,144,69,171,149,161,26,200,243],"y":[143,123,183,156,24,178,21,248,117,159,162,69,171,52,188,252,26,59,6,47,103,92,19,58,117,103,249,0,219,8,95,196]}}},"counter":2,"user_verified":false,"backup_eligible":false,"backup_state":false,"registration_policy":"preferred","extensions":{"cred_protect":"NotRequested","hmac_create_secret":"NotRequested"},"attestation":{"data":"None","metadata":"None"},"attestation_format":"None"}}"#;
+
+    /// Une rafale de démarrages de connexion n'évince pas une inscription en cours ; chaque sorte évince
+    /// d'abord son plus ancien défi.
+    #[tokio::test]
+    async fn logins_never_evict_registrations() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let keys = [serde_json::from_str::<Passkey>(PASSKEY).unwrap()];
+        let register = || {
+            let (_, state) =
+                s.webauthn.start_passkey_registration(Uuid::new_v4(), "alice", "alice", None).unwrap();
+            Ceremony::Register { user_id: 1, state }
+        };
+        let login = || {
+            let (_, state) = s.webauthn.start_passkey_authentication(&keys).unwrap();
+            let ticket = Arc::new(LoginLimiter::default()).reserve("192.0.2.1".parse().unwrap(), "").unwrap();
+            Ceremony::Login { user_id: 1, state, ticket, ip: "192.0.2.1".parse().unwrap() }
+        };
+        let c = Ceremonies::default();
+        let reg = c.insert(register()).unwrap();
+        let first_login = c.insert(login()).unwrap();
+        for _ in 1..MAX_LOGINS + 10 {
+            c.insert(login()).unwrap();
+        }
+        assert_eq!(c.pending.lock().unwrap().len(), MAX_LOGINS + 1);
+        assert!(c.take(first_login).is_none(), "plus ancienne connexion évincée");
+        assert!(matches!(c.take(reg), Some(Ceremony::Register { .. })), "inscription évincée");
+    }
 }

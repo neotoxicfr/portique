@@ -63,14 +63,15 @@ pub async fn login(
         }
     }
 
-    state.limiter.succeeded(ip, name, ticket);
-    tracing::info!(%ip, user = user.username, "connexion");
     // Mot de passe + TOTP vérifié ci-dessus : second facteur.
     let proof = auth::Proof::Password {
         hash: user.password_hash.as_deref().unwrap_or_default(),
         totp: user.totp_secret.as_deref(),
     };
+    // Succès noté une fois la session née : une preuve révoquée entre-temps reste un échec compté.
     let jar = auth::open_session(&state, jar, user.id, proof).await?;
+    state.limiter.succeeded(ip, name, ticket);
+    tracing::info!(%ip, user = user.username, "connexion");
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))
 }
 
@@ -154,9 +155,9 @@ pub async fn passkey_finish(
             .await?;
     }
 
+    let jar = auth::open_session(&state, jar, user.id, auth::Proof::Passkey(id)).await?;
     // Rendue sous l'adresse du démarrage : celle de la fin peut différer (réseau mobile, double pile).
     state.limiter.succeeded(start_ip, &user.username, ticket);
     tracing::info!(%ip, user = user.username, "connexion par passkey");
-    let jar = auth::open_session(&state, jar, user.id, auth::Proof::Passkey(id)).await?;
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))
 }

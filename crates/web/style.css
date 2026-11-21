@@ -60,7 +60,7 @@
   --ok: #1f7a3a;
   --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
   --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
-  --focus: rgba(0, 113, 227, 0.4);
+  --focus: #0071e3; /* opaque : 4,6:1 sur blanc, au-delà du 3:1 exigé pour un indicateur de focus */
   --alert: rgba(242, 242, 247, 0.88);
   --code: rgba(118, 118, 128, 0.12);
   --red-tint: rgba(255, 59, 48, 0.1);
@@ -103,7 +103,7 @@
     --ok: #30d158;
     --card-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
     --btn-shadow: none;
-    --focus: rgba(10, 132, 255, 0.5);
+    --focus: #0a84ff;
     --alert: rgba(44, 44, 46, 0.88);
     --code: rgba(118, 118, 128, 0.24);
     --red-tint: rgba(255, 69, 58, 0.16);
@@ -152,7 +152,7 @@ a { color: var(--link); text-decoration: none; }
 
 /* Focus visible : anneau bleu translucide sur tout élément interactif. Un contour et non une ombre : les ombres
    décoratives (bouton plein, segment actif, touche) ne peuvent pas l'effacer. */
-:is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 3px solid var(--focus); outline-offset: 0; }
+:is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 /* Ligne cliquable : le groupe rogne ce qui dépasse, l'anneau passe à l'intérieur. */
 :is(a, button).line:focus-visible { outline-offset: -3px; }
 /* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
@@ -207,6 +207,10 @@ a { color: var(--link); text-decoration: none; }
   background: var(--thumb); box-shadow: var(--thumb-shadow); font-weight: 600;
 }
 .seg .ico { display: none; }
+/* Mode de réveil : sur écran étroit, les deux boutons passent sous le libellé plutôt que d'être rognés. */
+.line.wake-mode { flex-wrap: wrap; }
+.line.wake-mode .grow { flex: 1 0 auto; }
+.wake-mode .seg { margin-left: auto; }
 
 .footer { text-align: center; padding: 18px 24px max(18px, env(safe-area-inset-bottom)); font-size: 13px; }
 
@@ -285,6 +289,9 @@ a.line, button.line {
 }
 .line.danger { color: var(--red); }
 .line:focus-within:has(input:focus-visible, select:focus-visible, textarea:focus-visible) { background: var(--fill); }
+/* Le fond teinté seul ne se voit presque pas : l'anneau de focus, tracé dedans (le groupe rogne ce qui dépasse).
+   L'interrupteur a le sien. */
+.line:has(input:not([role="switch"]):focus-visible, select:focus-visible, textarea:focus-visible) { box-shadow: inset 0 0 0 3px var(--focus); }
 /* Contour transparent plutôt qu'absent : les couleurs forcées le rendent visible. */
 .line input:focus-visible, .line select:focus-visible, .line textarea:focus-visible { outline-color: transparent; }
 
@@ -562,7 +569,8 @@ label.line { flex-direction: row; }
 /* Admin : liste à gauche, éditeur à droite. */
 .admin { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 0 24px; align-items: start; }
 .admin > * { min-width: 0; }
-.editor { display: flex; flex-direction: column; gap: 16px; margin-top: 24px; }
+/* `fieldset` (figé pendant l'enregistrement) : sans l'habillage des fieldsets ci-dessus. */
+.editor { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 16px; margin-top: 24px; padding: 0; border-radius: 0; background: none; }
 .editor .group { margin: 0; }
 @media (max-width: 900px) { .admin { grid-template-columns: 1fr; } }
 .mlist { list-style: none; margin: 0; padding: 6px; display: flex; flex-direction: column; gap: 2px; background: var(--card); border-radius: 16px; box-shadow: var(--card-shadow); }

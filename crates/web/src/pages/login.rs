@@ -72,15 +72,16 @@ pub fn Login() -> impl IntoView {
                 <div class="group">
                     <label class="line">
                         <span class="line-label">"Identifiant"</span>
+                        // Figés pendant l'envoi : le défi TOTP qui revient vaut pour le compte envoyé.
                         <input type="text" autocomplete="username webauthn" required
-                            readonly=move || need_totp.get()
+                            readonly=move || need_totp.get() || busy.get()
                             prop:value=move || username.get()
                             on:input=move |ev| username.set(event_target_value(&ev))/>
                     </label>
                     <Show when=move || !need_totp.get()>
                         <label class="line">
                             <span class="line-label">"Mot de passe"</span>
-                            <input type="password" autocomplete="current-password"
+                            <input type="password" autocomplete="current-password" readonly=move || busy.get()
                                 prop:value=move || password.get()
                                 on:input=move |ev| password.set(event_target_value(&ev))/>
                         </label>

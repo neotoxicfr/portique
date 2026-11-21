@@ -68,11 +68,12 @@ impl Proof {
         Self { password: RwSignal::new(String::new()), totp: RwSignal::new(String::new()) }
     }
 
-    /// Lit puis efface les champs : un secret ne reste pas affiché après envoi.
+    /// Lit puis efface les champs : un secret ne reste pas affiché après envoi. Appelée aussi après une
+    /// réponse : si la page a été quittée entre-temps, les signaux n'existent plus (lecture tolérante).
     fn take(&self) -> ReAuth {
         let proof = ReAuth {
-            password: self.password.get_untracked(),
-            totp: Some(self.totp.get_untracked()).filter(|c| !c.is_empty()),
+            password: self.password.try_get_untracked().unwrap_or_default(),
+            totp: self.totp.try_get_untracked().filter(|c| !c.is_empty()),
         };
         self.password.set(String::new());
         self.totp.set(String::new());
@@ -118,6 +119,7 @@ fn Password() -> impl IntoView {
         busy.set(true);
         let body = ChangePassword { auth: proof.take(), new: new.get_untracked() };
         new.set(String::new());
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             // Le serveur ferme toutes les sessions du compte, celle-ci comprise.
             match api::send_empty("POST", "/api/account/password", Some(&body)).await {
@@ -126,7 +128,7 @@ fn Password() -> impl IntoView {
                     done.set(true);
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -217,6 +219,7 @@ fn Totp(st: Status) -> impl IntoView {
         }
         busy.set(true);
         let body = proof.take();
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &body).await {
                 Ok(s) => {
@@ -224,7 +227,7 @@ fn Totp(st: Status) -> impl IntoView {
                     st.set(None);
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -240,6 +243,7 @@ fn Totp(st: Status) -> impl IntoView {
         busy.set(true);
         let body = TotpConfirm { code: code.get_untracked() };
         code.set(String::new());
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/confirm", Some(&body)).await {
                 Ok(()) => {
@@ -248,7 +252,7 @@ fn Totp(st: Status) -> impl IntoView {
                     st.set(Some(Ok("TOTP activé.".into())));
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -262,6 +266,7 @@ fn Totp(st: Status) -> impl IntoView {
         }
         busy.set(true);
         let body = proof.take();
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/disable", Some(&body)).await {
                 Ok(()) => {
@@ -270,7 +275,7 @@ fn Totp(st: Status) -> impl IntoView {
                     st.set(Some(Ok("TOTP désactivé.".into())));
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -293,7 +298,7 @@ fn Totp(st: Status) -> impl IntoView {
                 <form on:submit=start>
                     {proof.password_line("Mot de passe")}
                     <div class="line end">
-                        <button type="button" class="secondary" on:click=move |_| reset()>"Annuler"</button>
+                        <button type="button" class="secondary" disabled=move || busy.get() on:click=move |_| reset()>"Annuler"</button>
                         <button type="submit" disabled=move || busy.get()>"Configurer"</button>
                     </div>
                 </form>
@@ -310,7 +315,8 @@ fn Totp(st: Status) -> impl IntoView {
                             prop:value=move || code.get() on:input=move |ev| code.set(event_target_value(&ev))/>
                     </label>
                     <div class="line end">
-                        <button type="button" class="secondary" on:click=move |_| { st.set(None); reset(); intent.set(Some(true)); }>"Recommencer"</button>
+                        <button type="button" class="secondary" disabled=move || busy.get()
+                            on:click=move |_| { st.set(None); reset(); intent.set(Some(true)); }>"Recommencer"</button>
                         <button type="submit" disabled=move || busy.get()>"Activer"</button>
                     </div>
                 </form>
@@ -320,7 +326,7 @@ fn Totp(st: Status) -> impl IntoView {
                     {proof.password_line("Mot de passe")}
                     {proof.totp_line()}
                     <div class="line end">
-                        <button type="button" class="secondary" on:click=move |_| reset()>"Annuler"</button>
+                        <button type="button" class="secondary" disabled=move || busy.get() on:click=move |_| reset()>"Annuler"</button>
                         <button type="submit" class="danger" disabled=move || busy.get()>"Désactiver"</button>
                     </div>
                 </form>
@@ -339,10 +345,11 @@ fn Passkeys(st: Status) -> impl IntoView {
     let busy = RwSignal::new(false);
     let proof = Proof::new();
     let reload = move || {
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::get("/api/account/passkeys").await {
                 Ok(l) => list.set(l),
-                Err(e) => session.handle(&e),
+                Err(e) => session.handle(epoch, &e),
             }
         })
     };
@@ -356,6 +363,7 @@ fn Passkeys(st: Status) -> impl IntoView {
         busy.set(true);
         let n = name.get_untracked();
         let body = proof.take();
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::passkey_register(n, body).await {
                 Ok(()) => {
@@ -365,7 +373,7 @@ fn Passkeys(st: Status) -> impl IntoView {
                     reload();
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -376,11 +384,12 @@ fn Passkeys(st: Status) -> impl IntoView {
         if !confirm(&format!("Supprimer la passkey « {label} » ?")) {
             return;
         }
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::send_empty::<()>("DELETE", &format!("/api/account/passkeys/{id}"), None).await {
                 Ok(()) => reload(),
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
             }
@@ -403,7 +412,7 @@ fn Passkeys(st: Status) -> impl IntoView {
                 }
             }
         </For>
-        <button type="button" class="line" aria-expanded=move || adding.get().to_string()
+        <button type="button" class="line" aria-expanded=move || adding.get().to_string() disabled=move || busy.get()
             on:click=move |_| { adding.update(|a| *a = !*a); st.set(None); }>
             <span class="pick">{icon(glyph::PLUS)}</span>
             "Ajouter une passkey"
@@ -418,7 +427,8 @@ fn Passkeys(st: Status) -> impl IntoView {
                 {proof.password_line("Mot de passe")}
                 {proof.totp_line()}
                 <div class="line end">
-                    <button type="button" class="secondary" on:click=move |_| { let _ = proof.take(); adding.set(false); }>"Annuler"</button>
+                    <button type="button" class="secondary" disabled=move || busy.get()
+                        on:click=move |_| { let _ = proof.take(); adding.set(false); }>"Annuler"</button>
                     <button type="submit" disabled=move || busy.get()>"Ajouter"</button>
                 </div>
             </form>
@@ -461,6 +471,7 @@ fn Terminal() -> impl IntoView {
     // écraserait la saisie, ou un envoi partirait avec un thème vide.
     let fetch = move || {
         load.set(Load::Pending);
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::get::<TerminalPrefs>("/api/account/terminal").await {
                 Ok(p) => {
@@ -469,14 +480,15 @@ fn Terminal() -> impl IntoView {
                     load.set(Load::Ready);
                 }
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     load.set(Load::Failed(e.to_string()));
                 }
             }
         });
     };
     fetch();
-    let locked = move || load.get() != Load::Ready;
+    // Rien ne change pendant l'envoi : le message de réussite doit décrire ce qui est affiché.
+    let locked = move || busy.get() || load.get() != Load::Ready;
 
     // Ajoute la combinaison saisie ; faux si elle est refusée (message affiché).
     let add = move || -> bool {
@@ -503,15 +515,16 @@ fn Terminal() -> impl IntoView {
     };
     let submit = move |ev: SubmitEvent| {
         ev.prevent_default();
-        if busy.get_untracked() || locked() || !add() {
+        if locked() || !add() {
             return;
         }
         busy.set(true);
         let body = TerminalPrefs { theme: theme.get_untracked(), combos: combos.get_untracked() };
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             let r = api::send::<_, TerminalPrefs>("PUT", "/api/account/terminal", &body).await;
             if let Err(e) = &r {
-                session.handle(e);
+                session.handle(epoch, e);
             }
             st.set(Some(
                 r.map(|_| "Préférences du terminal enregistrées.".into()).map_err(|e| e.to_string()),
@@ -576,7 +589,7 @@ fn Terminal() -> impl IntoView {
                     </fieldset>
                 </div>
                 {show_status(st)}
-                <div class="actions"><button type="submit" disabled=move || locked() || busy.get()>"Enregistrer"</button></div>
+                <div class="actions"><button type="submit" disabled=locked>"Enregistrer"</button></div>
             </form>
         </section>
     }

@@ -30,9 +30,10 @@ impl Session {
         expect_context()
     }
 
-    /// À appeler sur une erreur d'API : un 401 renvoie à l'écran de connexion.
-    pub fn handle(&self, e: &api::Error) {
-        if *e == api::Error::Unauthorized {
+    /// À appeler sur une erreur d'API, avec la génération `epoch` relevée à l'émission de la requête : un 401
+    /// renvoie à l'écran de connexion, sauf s'il répond à une session déjà terminée (il fermerait la suivante).
+    pub fn handle(&self, epoch: u32, e: &api::Error) {
+        if *e == api::Error::Unauthorized && self.epoch.get_untracked() == epoch {
             self.me.set(None);
         }
     }
@@ -127,9 +128,12 @@ fn App() -> impl IntoView {
         failure.set(None);
         spawn_local(async move {
             let check = async {
-                if session.info.with_untracked(Option::is_none)
-                    && let Ok(info) = api::get::<ServerInfo>("/api/info").await
-                {
+                // Sans le mode d'authentification, pas de démarrage : un compte du proxy verrait sinon les
+                // commandes du mode intégré. Un 401 ici n'est pas une absence de session.
+                if session.info.with_untracked(Option::is_none) {
+                    let info = api::get::<ServerInfo>("/api/info")
+                        .await
+                        .map_err(|e| api::Error::Message(e.to_string()))?;
                     session.info.set(Some(info));
                 }
                 api::get::<Me>("/api/me").await
@@ -239,5 +243,41 @@ fn Shell(children: Children) -> impl IntoView {
             // rel="external" : page statique, le routeur ne doit pas intercepter le lien.
             <a href="/setup/" rel="external">"Préparer un PC"</a>
         </footer>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_401_from_an_ended_session_keeps_the_next_one() {
+        let session = Session {
+            info: RwSignal::new(None),
+            me: RwSignal::new(None),
+            checked: RwSignal::new(true),
+            logout_error: RwSignal::new(None),
+            epoch: RwSignal::new(1),
+        };
+        let me = |name: &str| Me {
+            id: 1,
+            username: name.into(),
+            is_admin: false,
+            totp_enabled: false,
+            external: false,
+        };
+        session.me.set(Some(me("alice")));
+        let sent_by_alice = session.epoch.get_untracked();
+        // Fin de la session d'alice (l'effet d'`App` avance la génération), puis connexion de bob.
+        session.epoch.update(|e| *e += 1);
+        session.me.set(Some(me("bob")));
+        session.handle(sent_by_alice, &api::Error::Unauthorized);
+        assert_eq!(session.me.get_untracked(), Some(me("bob")));
+        // Un refus d'une autre nature ne ferme rien ; un 401 d'une requête de bob, si.
+        let sent_by_bob = session.epoch.get_untracked();
+        session.handle(sent_by_bob, &api::Error::Message("refus".into()));
+        assert!(session.me.with_untracked(Option::is_some));
+        session.handle(sent_by_bob, &api::Error::Unauthorized);
+        assert_eq!(session.me.get_untracked(), None);
     }
 }

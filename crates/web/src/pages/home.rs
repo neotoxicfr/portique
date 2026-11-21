@@ -43,11 +43,12 @@ pub fn Home() -> impl IntoView {
 
     let load = move || {
         failed.set(None);
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             match api::get("/api/connections").await {
                 Ok(l) => list.set(Some(l)),
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     failed.set(Some(e.to_string()));
                 }
             }
@@ -57,12 +58,13 @@ pub fn Home() -> impl IntoView {
 
     let wake = move |c: ConnectionSummary| {
         notice.set(Some((false, format!("Réveil de « {} »…", c.name))));
+        let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             let r = api::send_empty::<()>("POST", &format!("/api/connections/{}/wake", c.id), None).await;
             notice.set(Some(match r {
                 Ok(()) => (false, format!("Paquet de réveil envoyé à « {} ».", c.name)),
                 Err(e) => {
-                    session.handle(&e);
+                    session.handle(epoch, &e);
                     (true, crate::sentence(&e.to_string()))
                 }
             }));

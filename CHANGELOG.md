@@ -2,6 +2,16 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.5.1] - 2026-11-21
+
+### Corrigé
+
+- Terminal SSH sur iPhone : le bas de l'écran ne recouvre plus la barre de touches (le cadre coupe ce qui dépasse,
+  et le terminal retire des lignes tant que son écran dépasse le cadre).
+- Anneaux de focus des contrôles serrés (segments de navigation, lignes de machines, touches des barres SSH et RDP,
+  boutons des étiquettes de combinaisons) dessinés à l'intérieur au lieu de déborder sur leurs voisins ; blancs sur
+  les touches actives.
+
 ## [v0.5.0] - 2026-11-21
 
 ### Ajouté

@@ -73,7 +73,9 @@ pub async fn send_empty<B: Serialize>(method: &str, url: &str, body: Option<&B>)
     send_empty_abortable(method, url, body, None).await
 }
 
-/// `send_empty` annulable par `signal` : abandonnée, la requête ne livre plus sa réponse (ni ses cookies).
+/// `send_empty` dont `signal` abandonne l'attente : une réponse pas encore reçue n'est plus livrée à l'appelant
+/// ni appliquée par le navigateur (cookies compris). Rien n'est défait de ce qui a déjà eu lieu : le serveur a pu
+/// traiter la requête, et une réponse déjà reçue a pu poser ses cookies.
 pub async fn send_empty_abortable<B: Serialize>(
     method: &str,
     url: &str,

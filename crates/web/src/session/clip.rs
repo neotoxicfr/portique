@@ -192,8 +192,8 @@ enum Concluded {
     Settled,
     /// Elle attend l'accusé de la dernière liste en vol (publiée ou rejointe).
     Awaiting,
-    /// Windows a refusé cette liste : le PC n'a pas ce contenu, il faut relire.
-    Refused,
+    /// Le PC n'a pas ce contenu (liste refusée, ou pas envoyée faute de place) : il faut relire.
+    Missing,
 }
 
 /// Nos listes de formats sans réponse, dans l'ordre d'envoi. Windows répond dans l'ordre : chaque
@@ -320,9 +320,12 @@ impl Announces {
         if self.remote_copies != mark.remote_copies && !overtaken {
             return AfterRead::Done;
         }
-        // Windows muet : une liste de plus resterait sans réponse, une attente aussi.
+        // Windows muet : une liste de plus resterait sans réponse, une attente aussi. La lecture fait
+        // quand même référence : une lecture plus ancienne encore en cours (conversion d'image) ne
+        // publiera pas son contenu à sa place quand une place se libère, elle fera relire.
         if self.pending.len() >= MAX_PENDING {
             if self.is_current(mark) {
+                self.conclude(mark, Concluded::Missing);
                 self.seen(fp, common == Some(fp));
             }
             return AfterRead::Stalled;
@@ -333,14 +336,10 @@ impl Announces {
         if overtaken {
             return match self.concluded {
                 Concluded::Awaiting if !self.pending.is_empty() => AfterRead::Join,
-                Concluded::Refused => AfterRead::Retry,
+                Concluded::Missing => AfterRead::Retry,
                 _ => AfterRead::Done,
             };
         }
-        // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
-        // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
-        self.published_seq = mark.seq;
-        self.published_copies = self.remote_copies;
         // Copie du PC pas encore écrite : relire le contenu local d'avant vaut contenu commun.
         let shared = if self.unwritten && self.local == Some(fp) { Some(fp) } else { common };
         let next = match self.latest() {
@@ -349,9 +348,18 @@ impl Announces {
             None if shared == Some(fp) => AfterRead::Done,
             _ => AfterRead::Publish,
         };
-        self.concluded = if next == AfterRead::Done { Concluded::Settled } else { Concluded::Awaiting };
+        // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
+        // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
+        self.conclude(mark, if next == AfterRead::Done { Concluded::Settled } else { Concluded::Awaiting });
         self.seen(fp, next == AfterRead::Publish || common == Some(fp));
         next
+    }
+
+    /// La lecture `mark` conclut et fait référence : une lecture commencée avant elle la suivra.
+    fn conclude(&mut self, mark: Mark, concluded: Concluded) {
+        self.published_seq = mark.seq;
+        self.published_copies = self.remote_copies;
+        self.concluded = concluded;
     }
 
     /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Met à jour
@@ -363,7 +371,7 @@ impl Announces {
     pub fn answered(&mut self, ok: bool, common: &mut Option<u64>) {
         let Some(a) = self.pending.pop_front() else { return };
         if self.pending.is_empty() && self.concluded == Concluded::Awaiting {
-            self.concluded = if ok { Concluded::Settled } else { Concluded::Refused };
+            self.concluded = if ok { Concluded::Settled } else { Concluded::Missing };
         }
         let verdict = match (self.pending.is_empty(), ok) {
             (false, _) => Ack::Replaced,
@@ -862,6 +870,28 @@ mod tests {
         assert_eq!(a.after_read(mb, 1, common, 30.0), AfterRead::Done);
         a.answered(false, &mut common);
         assert_eq!(a.after_read(ma, 3, common, 40.0), AfterRead::Done);
+    }
+
+    #[test]
+    fn stalled_recent_read_is_not_overtaken_by_an_older_one() {
+        let mut a = Announces::default();
+        let mut common = None;
+        for k in 0..MAX_PENDING {
+            let m = a.mark();
+            let now = k as f64 * 3000.0;
+            assert_eq!(a.after_read(m, 1, common, now), AfterRead::Publish);
+            a.sent(Some(1), now, None);
+        }
+        // Lecture de l'image A commencée (conversion lente), puis lecture du texte B : file pleine.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 20, common, 30_000.0), AfterRead::Stalled);
+        // Un accusé libère une place avant la fin de A : A ne publie pas à la place de B, elle fait
+        // relire ; la relecture rend B, publié.
+        a.answered(true, &mut common);
+        assert_eq!(a.after_read(ma, 10, common, 31_000.0), AfterRead::Retry);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 20, common, 32_000.0), AfterRead::Publish);
     }
 
     #[test]

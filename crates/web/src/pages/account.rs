@@ -1,6 +1,6 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 use portique_proto::{
-    ChangePassword, Combo, PasskeyInfo, ReAuth, TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
+    ChangePassword, Combo, Me, PasskeyInfo, ReAuth, TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
 };
 
 use crate::{Session, api, glyph, icon};
@@ -171,6 +171,10 @@ fn Security() -> impl IntoView {
     }
 }
 
+fn totp_done(on: bool) -> String {
+    if on { "TOTP activé." } else { "TOTP désactivé." }.into()
+}
+
 #[component]
 fn Totp(st: Status) -> impl IntoView {
     let session = Session::get();
@@ -224,6 +228,26 @@ fn Totp(st: Status) -> impl IntoView {
             busy.set(false);
         });
     };
+    // Activation ou désactivation sans réponse dans le délai : le serveur a pu l'appliquer. L'état réel est relu
+    // avant de rendre la main ; s'il ne peut pas l'être, il est dit inconnu.
+    let after_timeout = move |epoch: u32, on: bool| async move {
+        match api::bounded(api::get::<Me>("/api/me")).await {
+            Ok(me) => {
+                session.set_totp(epoch, me.totp_enabled);
+                if me.totp_enabled == on {
+                    reset();
+                    st.set(Some(Ok(totp_done(on))));
+                } else {
+                    let now = if on { "désactivé" } else { "actif" };
+                    st.set(Some(Err(format!("le serveur n'a pas répondu : TOTP toujours {now}, réessaie"))));
+                }
+            }
+            Err(e) => {
+                session.handle(epoch, &e);
+                st.set(Some(Err("le serveur ne répond pas : état du TOTP inconnu, recharge la page".into())));
+            }
+        }
+    };
     // Étape 2 : premier code de l'appli → activation.
     let confirm_code = move |ev: SubmitEvent| {
         ev.prevent_default();
@@ -235,16 +259,19 @@ fn Totp(st: Status) -> impl IntoView {
         code.set(String::new());
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::bounded(api::send_empty("POST", "/api/account/totp/confirm", Some(&body))).await {
-                Ok(()) => {
+            match crate::within(15_000, api::send_empty("POST", "/api/account/totp/confirm", Some(&body)))
+                .await
+            {
+                Some(Ok(())) => {
                     session.set_totp(epoch, true);
                     reset();
-                    st.set(Some(Ok("TOTP activé.".into())));
+                    st.set(Some(Ok(totp_done(true))));
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
+                None => after_timeout(epoch, true).await,
             }
             busy.set(false);
         });
@@ -258,16 +285,19 @@ fn Totp(st: Status) -> impl IntoView {
         let body = proof.take();
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::bounded(api::send_empty("POST", "/api/account/totp/disable", Some(&body))).await {
-                Ok(()) => {
+            match crate::within(15_000, api::send_empty("POST", "/api/account/totp/disable", Some(&body)))
+                .await
+            {
+                Some(Ok(())) => {
                     session.set_totp(epoch, false);
                     reset();
-                    st.set(Some(Ok("TOTP désactivé.".into())));
+                    st.set(Some(Ok(totp_done(false))));
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
                 }
+                None => after_timeout(epoch, false).await,
             }
             busy.set(false);
         });

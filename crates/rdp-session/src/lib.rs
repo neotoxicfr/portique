@@ -117,18 +117,20 @@ pub struct Session {
     desktop: (u16, u16),
     /// Trafic des canaux suspendu par le serveur (CHANNEL_FLAG_SUSPEND, MS-RDPBCGR 2.2.6.1.1) jusqu'à
     /// RESUME. `static_send` et `dvc_send` restent `&self` pour l'appelant : leurs trames sont retenues ici,
-    /// puis rendues dans l'ordre par `feed` à la reprise.
+    /// puis rendues dans l'ordre par `feed` à la reprise. D'où le contrat de `feed` : les événements d'une
+    /// trame partent avant que la suivante soit traitée.
     suspended: bool,
     held: RefCell<Held>,
 }
 
-/// Émissions retenues pendant une suspension, bornées à `MAX_HELD` octets ; au-delà, un message est
-/// abandonné en entier (jamais à moitié) et compté.
+/// Émissions retenues pendant une suspension, bornées à `MAX_HELD` octets. Au-delà (situation anormale),
+/// rien n'est abandonné en silence : l'appelant garderait des attentes armées (demande du presse-papier,
+/// réponse attendue) pour un message jamais parti. La session est coupée au prochain `feed`.
 #[derive(Default)]
 struct Held {
     frames: Vec<Vec<u8>>,
     bytes: usize,
-    dropped: usize,
+    overflowed: bool,
 }
 
 const MAX_HELD: usize = 64 * 1024 * 1024;
@@ -197,11 +199,16 @@ impl Session {
         self.desktop
     }
 
-    /// Traite une trame complète (TPKT ou fast-path).
+    /// Traite une trame complète (TPKT ou fast-path). L'appelant distribue ses événements (`Event::Send`
+    /// compris) AVANT de passer la trame suivante : un RESUME puis un SUSPEND reçus ensemble ne doivent pas
+    /// laisser partir pendant la nouvelle suspension les trames rendues à la reprise.
     pub fn feed(&mut self, frame: &[u8]) -> Result<Vec<Event>, Error> {
         let mut ev = Vec::new();
         if self.state == State::Closed {
             return Ok(ev);
+        }
+        if self.held.get_mut().overflowed {
+            return Err(Error::Invalid("canaux suspendus par le PC : plus de 64 Mio d'envois en attente"));
         }
         if fastpath::is_fastpath(frame) {
             for (code, data) in self.fastpath.feed(frame)? {
@@ -387,12 +394,6 @@ impl Session {
             self.suspended = suspend;
             if !suspend {
                 let held = core::mem::take(self.held.get_mut());
-                if held.dropped > 0 {
-                    ev.push(Event::Ignored(alloc::format!(
-                        "canaux : {} message(s) abandonné(s) pendant la suspension",
-                        held.dropped
-                    )));
-                }
                 ev.extend(held.frames.into_iter().map(Event::Send));
             }
             return Ok(());
@@ -488,11 +489,14 @@ impl Session {
         }
         let mut held = self.held.borrow_mut();
         let size: usize = frames.iter().map(Vec::len).sum();
-        if held.bytes + size <= MAX_HELD {
+        if held.overflowed || held.bytes + size > MAX_HELD {
+            // Plus rien n'est retenu : l'ordre des envois serait rompu. `feed` coupe la session.
+            held.overflowed = true;
+            held.frames = Vec::new();
+            held.bytes = 0;
+        } else {
             held.bytes += size;
             held.frames.extend(frames);
-        } else {
-            held.dropped += 1;
         }
         Vec::new()
     }
@@ -686,5 +690,41 @@ mod tests {
             s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[])).unwrap().is_empty(),
             "rien à rendre"
         );
+
+        // RESUME puis SUSPEND dans un même lot : la reprise rend les trames retenues dans les événements de
+        // SA trame ; la suspension qui suit ne rend rien et retient de nouveau les envois.
+        assert!(s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_SUSPEND, &[])).unwrap().is_empty());
+        assert!(s.static_send(CLIPRDR, &[4, 5]).is_empty());
+        let batch = [
+            incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[]),
+            incoming(1004, 0, vc::CHANNEL_FLAG_SUSPEND, &[]),
+        ];
+        let per_frame: Vec<Vec<Event>> = batch.iter().map(|f| s.feed(f).unwrap()).collect();
+        assert_eq!(sends(&per_frame[0]), s.frames(CLIPRDR, &[4, 5]), "rendu avec la reprise");
+        assert!(per_frame[1].is_empty(), "rien de plus à la suspension");
+        assert!(s.static_send(CLIPRDR, &[1]).is_empty(), "suspendu de nouveau");
+    }
+
+    /// Au-delà de la borne, rien n'est abandonné en silence : plus rien n'est retenu et la session est coupée
+    /// à la trame suivante, avec une erreur lisible.
+    #[test]
+    fn held_traffic_overflow_cuts_the_session() {
+        let mut s = session();
+        s.state = State::Active;
+        s.user = 1007;
+        s.channels.insert(1004, CLIPRDR);
+        s.suspended = true;
+        let big = alloc::vec![0u8; 1 << 20];
+        for _ in 0..MAX_HELD / (1 << 20) - 1 {
+            assert!(s.static_send(CLIPRDR, &big).is_empty());
+        }
+        assert!(!s.held.borrow().overflowed, "encore sous la borne");
+        assert!(s.static_send(CLIPRDR, &big).is_empty());
+        assert!(s.held.borrow().overflowed, "borne dépassée");
+        assert!(s.held.borrow().frames.is_empty(), "plus rien de retenu");
+        assert!(s.static_send(CLIPRDR, &[1]).is_empty(), "après le débordement : pas retenu non plus");
+        assert!(s.held.borrow().frames.is_empty());
+        let r = s.feed(&rdp_pdu::x224::data(&[0x68]));
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("64 Mio")), "{r:?}");
     }
 }

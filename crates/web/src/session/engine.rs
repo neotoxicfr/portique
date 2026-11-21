@@ -364,27 +364,32 @@ impl Engine {
 
     /// Octets RDP reçus : découpe en trames, session, puis graphique.
     async fn stream(&self, data: &[u8], h264: &mut Option<H264>) -> Result<(), String> {
-        let events = {
-            let mut i = self.inner.borrow_mut();
-            i.buf.extend_from_slice(data);
-            let mut events = Vec::new();
-            while let Some(n) = rdp_pdu::x224::frame_len(&i.buf) {
-                if n < 2 {
-                    return Err("trame RDP invalide".into());
-                }
-                if i.buf.len() < n {
-                    break;
-                }
-                let frame: Vec<u8> = i.buf.drain(..n).collect();
-                let session = i.session.as_mut().ok_or("données RDP avant la session")?;
-                events.extend(session.feed(&frame).map_err(|e| e.to_string())?);
+        self.inner.borrow_mut().buf.extend_from_slice(data);
+        // Une trame à la fois : ses événements sont distribués avant que la suivante n'entre dans la
+        // session (ce que rejoue une reprise de canal ne passe pas derrière une suspension arrivée
+        // dans le même bloc).
+        while let Some(events) = self.next_frame()? {
+            for ev in events {
+                self.event(ev, h264).await?;
             }
-            events
-        };
-        for ev in events {
-            self.event(ev, h264).await?;
         }
         Ok(())
+    }
+
+    /// Prochaine trame complète du tampon, passée à la session : ses événements ; `None` tant
+    /// qu'elle n'est pas arrivée en entier.
+    fn next_frame(&self) -> Result<Option<Vec<Event>>, String> {
+        let mut i = self.inner.borrow_mut();
+        let Some(n) = rdp_pdu::x224::frame_len(&i.buf) else { return Ok(None) };
+        if n < 2 {
+            return Err("trame RDP invalide".into());
+        }
+        if i.buf.len() < n {
+            return Ok(None);
+        }
+        let frame: Vec<u8> = i.buf.drain(..n).collect();
+        let session = i.session.as_mut().ok_or("données RDP avant la session")?;
+        session.feed(&frame).map(Some).map_err(|e| e.to_string())
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -782,6 +787,24 @@ impl Engine {
                 let (w, h) = super::viewport();
                 e.disable_multi(w, h);
                 (e.on_single)("Extension non confirmée par le PC");
+            }
+        });
+    }
+
+    /// Taille retenue faute de place (file pleine) : rejouée une fois la file oubliable
+    /// (`forget_unanswered`), si rien n'est parti depuis sur le même canal. Un Reset qui libère une
+    /// place la rejoue plus tôt (`reset_views`).
+    fn watch_parked_size(&self, channel: Option<u32>, sent_at: f64) {
+        let e = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            super::sleep(SIZE_ANSWER_MS as u32 / 1000 + 1).await;
+            let desired = {
+                let i = e.inner.borrow();
+                let current = !i.closing && i.display_channel == channel && i.size_sent_at == sent_at;
+                current.then_some(i.desired).flatten()
+            };
+            if let Some(((w, h), _)) = desired {
+                e.send_size(w, h, false);
             }
         });
     }
@@ -1273,7 +1296,13 @@ impl Engine {
     fn write_local(&self, generation: u32, items: Vec<rdp_clip::LocalData>, fp: u64) {
         let e = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let current = || e.inner.borrow().clip_write_gen == generation;
+            // Relu juste avant l'écriture (après l'encodage PNG) : contenu dépassé, ou déjà dans le
+            // presse-papier local (copié là aussi), l'écrire pourrait écraser une copie locale faite
+            // depuis.
+            let current = || {
+                let i = e.inner.borrow();
+                i.clip_write_gen == generation && i.clip_announces.unwritten()
+            };
             let result = clip::write_local(&items, &current).await;
             if !current() {
                 return;
@@ -1472,7 +1501,7 @@ impl Engine {
 
     /// `force` : envoyer même à taille égale (retour d'une extension multi-écran).
     fn send_size(&self, width: u32, height: u32, force: bool) {
-        let (channel, layout) = {
+        let (channel, layout, parked) = {
             let mut i = self.inner.borrow_mut();
             let Inner {
                 desired, size_sent, size_sent_at, display_channel, display_caps, desktop, multi, ..
@@ -1489,8 +1518,15 @@ impl Engine {
             if matches!(layout, Ok(Some(_))) {
                 *size_sent_at = now;
             }
-            (*display_channel, layout)
+            // Taille retenue faute de place : sans Reset ni nouveau redimensionnement, elle ne
+            // partirait jamais.
+            let parked =
+                matches!(layout, Ok(None)) && caps.is_some() && size_sent.len() >= MAX_SIZES_IN_FLIGHT;
+            (*display_channel, layout, parked.then_some(*size_sent_at))
         };
+        if let Some(sent_at) = parked {
+            self.watch_parked_size(channel, sent_at);
+        }
         match (channel, layout) {
             (Some(channel), Ok(Some(monitor))) => self.dvc_send(channel, &views::layout_pdu(&[monitor], 0)),
             (_, Err(e)) => web_sys::console::warn_1(&format!("contrôle d'affichage : {e}").into()),

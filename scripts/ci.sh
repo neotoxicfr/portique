@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vérifications locales, à lancer avant chaque push (pas de CI GitHub : tout se fait sur le poste).
+# Vérifications à lancer avant chaque push ; la CI GitHub (.github/workflows/ci.yml) lance ce même script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,6 +13,9 @@ step "clippy (front, wasm uniquement)"
 cargo clippy -p portique-web --target wasm32-unknown-unknown --locked -- -D warnings
 step "tests"
 cargo test --workspace --exclude portique-web --locked
+step "tests du front (logique pure, en natif)"
+# Dossier cible à part : RUSTFLAGS différent, il invaliderait le cache des autres étapes.
+CARGO_TARGET_DIR=target/web-natif RUSTFLAGS=--cfg=web_sys_unstable_apis cargo test -p portique-web --locked
 step "front"
 ./scripts/vendor-xterm.sh
 (cd crates/web && trunk build --release --dist ../../dist)

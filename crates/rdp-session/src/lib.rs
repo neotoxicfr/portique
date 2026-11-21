@@ -13,6 +13,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::cell::RefCell;
 
 use rdp_pdu::{
     fastpath::{self, Input, PointerUpdate},
@@ -31,6 +32,9 @@ pub const CLIPRDR: &str = "cliprdr";
 const DRDYNVC: &str = "drdynvc";
 /// STATUS_NOT_SUPPORTED : refus de création d'un canal dynamique inconnu.
 const DVC_REFUSED: i32 = 0xC000_00BBu32 as i32;
+/// Canaux dynamiques ouverts à la fois : deux noms acceptés, et de quoi en recréer un avant la
+/// fermeture de l'ancien. Chaque réassembleur peut garder un message entier (64 Mio au plus).
+const MAX_DVCS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -101,6 +105,8 @@ pub struct Session {
     /// Canaux statiques : identifiant MCS → nom.
     channels: BTreeMap<u16, &'static str>,
     to_join: Vec<u16>,
+    /// Canal dont on attend le Channel Join Confirm.
+    joining: u16,
     /// Le serveur accepte qu'on saute les MCS Channel Join (MS-RDPBCGR 2.2.1.4.2) : un aller-retour de
     /// moins par canal, ce qui compte sur un lien lointain.
     skip_join: bool,
@@ -109,7 +115,25 @@ pub struct Session {
     static_reassembly: BTreeMap<u16, vc::ChannelReassembler>,
     dvcs: BTreeMap<u32, (String, vc::DvcReassembler)>,
     desktop: (u16, u16),
+    /// Trafic des canaux suspendu par le serveur (CHANNEL_FLAG_SUSPEND, MS-RDPBCGR 2.2.6.1.1) jusqu'à
+    /// RESUME. `static_send` et `dvc_send` restent `&self` pour l'appelant : leurs trames sont retenues ici,
+    /// puis rendues dans l'ordre par `feed` à la reprise. D'où le contrat de `feed` : les événements d'une
+    /// trame partent avant que la suivante soit traitée.
+    suspended: bool,
+    held: RefCell<Held>,
 }
+
+/// Émissions retenues pendant une suspension, bornées à `MAX_HELD` octets. Au-delà (situation anormale),
+/// rien n'est abandonné en silence : l'appelant garderait des attentes armées (demande du presse-papier,
+/// réponse attendue) pour un message jamais parti. La session est coupée au prochain `feed`.
+#[derive(Default)]
+struct Held {
+    frames: Vec<Vec<u8>>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+const MAX_HELD: usize = 64 * 1024 * 1024;
 
 const STATIC_CHANNELS: [&str; 2] = [CLIPRDR, DRDYNVC];
 
@@ -123,12 +147,15 @@ impl Session {
             io_channel: 0,
             channels: BTreeMap::new(),
             to_join: Vec::new(),
+            joining: 0,
             skip_join: false,
             share_id: 0,
             fastpath: fastpath::Reassembler::default(),
             static_reassembly: BTreeMap::new(),
             dvcs: BTreeMap::new(),
             desktop,
+            suspended: false,
+            held: RefCell::default(),
         }
     }
 
@@ -172,11 +199,16 @@ impl Session {
         self.desktop
     }
 
-    /// Traite une trame complète (TPKT ou fast-path).
+    /// Traite une trame complète (TPKT ou fast-path). L'appelant distribue ses événements (`Event::Send`
+    /// compris) AVANT de passer la trame suivante : un RESUME puis un SUSPEND reçus ensemble ne doivent pas
+    /// laisser partir pendant la nouvelle suspension les trames rendues à la reprise.
     pub fn feed(&mut self, frame: &[u8]) -> Result<Vec<Event>, Error> {
         let mut ev = Vec::new();
         if self.state == State::Closed {
             return Ok(ev);
+        }
+        if self.held.get_mut().overflowed {
+            return Err(Error::Invalid("canaux suspendus par le PC : plus de 64 Mio d'envois en attente"));
         }
         if fastpath::is_fastpath(frame) {
             for (code, data) in self.fastpath.feed(frame)? {
@@ -211,20 +243,25 @@ impl Session {
                         .collect();
                     self.to_join.reverse();
                 }
-                self.join_next(&mut ev);
+                self.join_next(&mut ev)?;
             }
             State::Joining => {
-                mcs::channel_join_confirm(frame)?;
-                self.join_next(&mut ev);
+                // T.125 : le confirm porte le canal joint ; un autre que celui demandé laisserait un
+                // canal non joint sans qu'on le sache.
+                if mcs::channel_join_confirm(frame)? != self.joining {
+                    return Err(Error::Invalid("MCS : canal confirmé différent du canal demandé"));
+                }
+                self.join_next(&mut ev)?;
             }
             _ => self.domain_pdu(frame, &mut ev)?,
         }
         Ok(ev)
     }
 
-    fn join_next(&mut self, ev: &mut Vec<Event>) {
+    fn join_next(&mut self, ev: &mut Vec<Event>) -> Result<(), Error> {
         match self.to_join.pop() {
             Some(ch) => {
+                self.joining = ch;
                 ev.push(Event::Send(mcs::channel_join_request(self.user, ch)));
                 self.state = State::Joining;
             }
@@ -241,11 +278,12 @@ impl Session {
                         | slowpath::info_flags::LOGONERRORS
                         | slowpath::info_flags::NOAUDIOPLAYBACK,
                     slowpath::perf::ENABLE_FONT_SMOOTHING | slowpath::perf::ENABLE_DESKTOP_COMPOSITION,
-                );
+                )?;
                 ev.push(Event::Send(mcs::send_data_request(self.user, self.io_channel, &info)));
                 self.state = State::License;
             }
         }
+        Ok(())
     }
 
     fn io(&self, payload: &[u8]) -> Event {
@@ -310,6 +348,13 @@ impl Session {
                 let (kind, body) = slowpath::read_data_pdu(sc.body)?;
                 self.data_pdu(kind, body, ev)?;
             }
+            // MS-RDPBCGR 2.2.13.3.1 : redirection vers un autre hôte d'une ferme RDS, non gérée ;
+            // mieux vaut le dire que laisser un écran noir.
+            pdu_type::SERVER_REDIRECT => {
+                return Err(Error::Invalid(
+                    "redirection de ferme RDS non gérée : vise directement l'hôte de session",
+                ));
+            }
             _ => {}
         }
         Ok(())
@@ -344,6 +389,15 @@ impl Session {
 
     fn static_channel(&mut self, channel: u16, data: &[u8], ev: &mut Vec<Event>) -> Result<(), Error> {
         let Some(name) = self.channels.get(&channel).copied() else { return Ok(()) };
+        // Suspension : tout le trafic des canaux, pas seulement celui-ci (2.2.6.1.1).
+        if let Some(suspend) = vc::suspension(data) {
+            self.suspended = suspend;
+            if !suspend {
+                let held = core::mem::take(self.held.get_mut());
+                ev.extend(held.frames.into_iter().map(Event::Send));
+            }
+            return Ok(());
+        }
         let Some(msg) = self.static_reassembly.entry(channel).or_default().feed(data)? else {
             return Ok(());
         };
@@ -363,8 +417,10 @@ impl Session {
                 ev.extend(out.into_iter().map(Event::Send));
             }
             DvcPdu::Create { channel_id, name } => {
-                let accepted =
+                let wanted =
                     name == DVC_GRAPHICS || (name == DVC_DISPLAY_CONTROL && self.cfg.display_control);
+                let room = self.dvcs.contains_key(&channel_id) || self.dvcs.len() < MAX_DVCS;
+                let accepted = wanted && room;
                 let status = if accepted { 0 } else { DVC_REFUSED };
                 let out = self.static_send(DRDYNVC, &vc::dvc_create_response(channel_id, status));
                 ev.extend(out.into_iter().map(Event::Send));
@@ -402,8 +458,23 @@ impl Session {
         Ok(())
     }
 
-    /// Trames à envoyer pour un message de canal statique (`cliprdr`, `drdynvc`).
+    /// Trames à envoyer pour un message de canal statique (`cliprdr`, `drdynvc`). Vide pendant une
+    /// suspension : le message est retenu, puis rendu par `feed` (`Event::Send`) à la reprise.
     pub fn static_send(&self, name: &str, data: &[u8]) -> Vec<Vec<u8>> {
+        self.unless_suspended(self.frames(name, data))
+    }
+
+    /// Trames à envoyer pour un message sur un canal dynamique ouvert (retenues comme `static_send`).
+    pub fn dvc_send(&self, channel_id: u32, data: &[u8]) -> Vec<Vec<u8>> {
+        if !self.dvcs.contains_key(&channel_id) {
+            return Vec::new();
+        }
+        let frames =
+            vc::dvc_data(channel_id, data).iter().flat_map(|pdu| self.frames(DRDYNVC, pdu)).collect();
+        self.unless_suspended(frames)
+    }
+
+    fn frames(&self, name: &str, data: &[u8]) -> Vec<Vec<u8>> {
         let Some((&id, _)) = self.channels.iter().find(|(_, n)| **n == name) else { return Vec::new() };
         vc::chunks(data, name == CLIPRDR)
             .iter()
@@ -411,12 +482,23 @@ impl Session {
             .collect()
     }
 
-    /// Trames à envoyer pour un message sur un canal dynamique ouvert.
-    pub fn dvc_send(&self, channel_id: u32, data: &[u8]) -> Vec<Vec<u8>> {
-        if !self.dvcs.contains_key(&channel_id) {
-            return Vec::new();
+    /// Trames d'un message entier : rendues, ou retenues pendant une suspension.
+    fn unless_suspended(&self, frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if !self.suspended {
+            return frames;
         }
-        vc::dvc_data(channel_id, data).iter().flat_map(|pdu| self.static_send(DRDYNVC, pdu)).collect()
+        let mut held = self.held.borrow_mut();
+        let size: usize = frames.iter().map(Vec::len).sum();
+        if held.overflowed || held.bytes + size > MAX_HELD {
+            // Plus rien n'est retenu : l'ordre des envois serait rompu. `feed` coupe la session.
+            held.overflowed = true;
+            held.frames = Vec::new();
+            held.bytes = 0;
+        } else {
+            held.bytes += size;
+            held.frames.extend(frames);
+        }
+        Vec::new()
     }
 
     pub fn dvc_name(&self, channel_id: u32) -> Option<&str> {
@@ -431,8 +513,12 @@ impl Session {
         fastpath::input_frame(events)
     }
 
-    /// Redemande l'écran entier (après reprise d'affichage).
+    /// Redemande l'écran entier (après reprise d'affichage). Vide tant que la session n'est pas
+    /// active : l'utilisateur MCS et le partage ne sont pas encore connus.
     pub fn refresh(&self) -> Vec<u8> {
+        if self.state != State::Active {
+            return Vec::new();
+        }
         mcs::send_data_request(
             self.user,
             self.io_channel,
@@ -440,8 +526,12 @@ impl Session {
         )
     }
 
-    /// Demande de fermeture propre (le serveur répond par une déconnexion).
+    /// Demande de fermeture propre (le serveur répond par une déconnexion). Vide tant que la
+    /// session n'est pas active.
     pub fn shutdown(&mut self) -> Vec<u8> {
+        if self.state != State::Active {
+            return Vec::new();
+        }
         mcs::send_data_request(
             self.user,
             self.io_channel,
@@ -481,4 +571,160 @@ impl core::fmt::Debug for Session {
 /// Texte lisible d'une erreur de session.
 pub fn describe(e: &Error) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> Session {
+        Session::new(Config {
+            width: 800,
+            height: 600,
+            keyboard_layout: 0x040C,
+            client_name: "test".into(),
+            selected_protocol: 0,
+            username: "alice".into(),
+            domain: String::new(),
+            display_control: true,
+        })
+    }
+
+    #[test]
+    fn join_confirm_must_name_the_requested_channel() {
+        // Channel Join Confirm (T.125) : en-tête, résultat 0, initiateur, canal demandé, canal joint.
+        let confirm = |joined: u16| {
+            rdp_pdu::x224::data(&[&[0x3E, 0, 0, 7, 0x03, 0xEC][..], &joined.to_be_bytes()].concat())
+        };
+        let mut s = session();
+        s.state = State::Joining;
+        s.user = 1007;
+        s.joining = 1004;
+        assert!(s.feed(&confirm(1005)).is_err(), "autre canal : refus");
+        s.state = State::Joining;
+        assert!(s.feed(&confirm(1004)).is_ok());
+    }
+
+    /// Un identifiant démesuré (base antérieure à la borne de saisie) donne une erreur, pas une panique de
+    /// l'encodage PER au moment du Client Info.
+    #[test]
+    fn oversized_username_is_an_error() {
+        let mut s = session();
+        s.cfg.username = "a".repeat(9000);
+        s.state = State::Joining;
+        s.user = 1007;
+        s.joining = 1004;
+        let confirm = rdp_pdu::x224::data(&[0x3E, 0, 0, 7, 0x03, 0xEC, 0x03, 0xEC]);
+        assert!(matches!(s.feed(&confirm), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn refresh_and_shutdown_wait_for_activation() {
+        let mut s = session();
+        assert!(s.refresh().is_empty());
+        assert!(s.shutdown().is_empty());
+    }
+
+    #[test]
+    fn open_dynamic_channels_are_capped() {
+        let mut s = session();
+        // DYNVC_CREATE_REQ (MS-RDPEDYC 2.2.2.1) : identifiant sur un octet, nom terminé par un nul.
+        let create = |id: u8| [&[0x10, id], DVC_GRAPHICS.as_bytes(), &[0]].concat();
+        let opened = |s: &mut Session, id: u8| {
+            let mut ev = Vec::new();
+            s.drdynvc(&create(id), &mut ev).unwrap();
+            ev.iter().any(|e| matches!(e, Event::DvcOpened { .. }))
+        };
+        for id in 1..=MAX_DVCS as u8 {
+            assert!(opened(&mut s, id));
+        }
+        assert!(!opened(&mut s, 9), "au-delà du plafond : refusé");
+        assert!(opened(&mut s, 1), "recréation d'un canal ouvert : acceptée");
+        s.drdynvc(&[0x40, 2], &mut Vec::new()).unwrap(); // DYNVC_CLOSE
+        assert!(opened(&mut s, 9));
+        assert_eq!(s.dvcs.len(), MAX_DVCS);
+    }
+
+    /// SUSPEND retient les émissions des canaux (statiques et dynamiques) ; RESUME les rend dans l'ordre,
+    /// et le message reçu en cours de réassemblage se termine normalement.
+    #[test]
+    fn suspend_holds_channel_traffic_until_resume() {
+        let mut s = session();
+        s.state = State::Active;
+        s.user = 1007;
+        s.io_channel = 1003;
+        s.channels.insert(1004, CLIPRDR);
+        s.channels.insert(1005, DRDYNVC);
+        s.dvcs.insert(3, (DVC_DISPLAY_CONTROL.into(), vc::DvcReassembler::default()));
+        // Morceau de canal reçu : MCS Send Data Indication (T.125) portant l'en-tête de canal.
+        let incoming = |channel: u16, total: u32, flags: u32, data: &[u8]| {
+            let body = [&total.to_le_bytes()[..], &flags.to_le_bytes(), data].concat();
+            let mut pdu = alloc::vec![0x68];
+            pdu.extend(1002u16.to_be_bytes());
+            pdu.extend(channel.to_be_bytes());
+            pdu.extend([0x70, 0x80 | (body.len() >> 8) as u8, body.len() as u8]);
+            pdu.extend(body);
+            rdp_pdu::x224::data(&pdu)
+        };
+        let sends = |ev: &[Event]| -> Vec<Vec<u8>> {
+            ev.iter().filter_map(|e| if let Event::Send(b) = e { Some(b.clone()) } else { None }).collect()
+        };
+        let first = s.static_send(CLIPRDR, &[1, 2, 3]);
+        assert_eq!(first.len(), 1, "hors suspension : envoi direct");
+
+        // Message presse-papier entamé, puis suspension.
+        assert!(s.feed(&incoming(1004, 4, vc::CHANNEL_FLAG_FIRST, &[9, 8])).unwrap().is_empty());
+        assert!(s.feed(&incoming(1005, 0, vc::CHANNEL_FLAG_SUSPEND, &[])).unwrap().is_empty());
+        let clip = s.frames(CLIPRDR, &[4, 5]);
+        let dvc: Vec<_> = vc::dvc_data(3, &[6]).iter().flat_map(|p| s.frames(DRDYNVC, p)).collect();
+        assert!(s.static_send(CLIPRDR, &[4, 5]).is_empty(), "retenu pendant la suspension");
+        assert!(s.dvc_send(3, &[6]).is_empty(), "canal dynamique retenu aussi");
+        // La fin du message reçu passe toujours.
+        let ev = s.feed(&incoming(1004, 4, vc::CHANNEL_FLAG_LAST, &[7, 6])).unwrap();
+        assert_eq!(ev, [Event::Clipboard(alloc::vec![9, 8, 7, 6])]);
+
+        let ev = s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[])).unwrap();
+        assert_eq!(sends(&ev), [clip, dvc].concat(), "rendu dans l'ordre à la reprise");
+        assert_eq!(s.static_send(CLIPRDR, &[1, 2, 3]), first, "après la reprise : envoi direct");
+        assert!(
+            s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[])).unwrap().is_empty(),
+            "rien à rendre"
+        );
+
+        // RESUME puis SUSPEND dans un même lot : la reprise rend les trames retenues dans les événements de
+        // SA trame ; la suspension qui suit ne rend rien et retient de nouveau les envois.
+        assert!(s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_SUSPEND, &[])).unwrap().is_empty());
+        assert!(s.static_send(CLIPRDR, &[4, 5]).is_empty());
+        let batch = [
+            incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[]),
+            incoming(1004, 0, vc::CHANNEL_FLAG_SUSPEND, &[]),
+        ];
+        let per_frame: Vec<Vec<Event>> = batch.iter().map(|f| s.feed(f).unwrap()).collect();
+        assert_eq!(sends(&per_frame[0]), s.frames(CLIPRDR, &[4, 5]), "rendu avec la reprise");
+        assert!(per_frame[1].is_empty(), "rien de plus à la suspension");
+        assert!(s.static_send(CLIPRDR, &[1]).is_empty(), "suspendu de nouveau");
+    }
+
+    /// Au-delà de la borne, rien n'est abandonné en silence : plus rien n'est retenu et la session est coupée
+    /// à la trame suivante, avec une erreur lisible.
+    #[test]
+    fn held_traffic_overflow_cuts_the_session() {
+        let mut s = session();
+        s.state = State::Active;
+        s.user = 1007;
+        s.channels.insert(1004, CLIPRDR);
+        s.suspended = true;
+        let big = alloc::vec![0u8; 1 << 20];
+        for _ in 0..MAX_HELD / (1 << 20) - 1 {
+            assert!(s.static_send(CLIPRDR, &big).is_empty());
+        }
+        assert!(!s.held.borrow().overflowed, "encore sous la borne");
+        assert!(s.static_send(CLIPRDR, &big).is_empty());
+        assert!(s.held.borrow().overflowed, "borne dépassée");
+        assert!(s.held.borrow().frames.is_empty(), "plus rien de retenu");
+        assert!(s.static_send(CLIPRDR, &[1]).is_empty(), "après le débordement : pas retenu non plus");
+        assert!(s.held.borrow().frames.is_empty());
+        let r = s.feed(&rdp_pdu::x224::data(&[0x68]));
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("64 Mio")), "{r:?}");
+    }
 }

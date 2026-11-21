@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Image multi-architecture ghcr.io/neotoxicfr/portique : amd64 construite ici, arm64 construite en natif
 # sur ARM_HOST (pas d'émulation), puis réunies sous chaque tag demandé.
-# À lancer SUR l'hôte Docker connecté à ghcr.io (les scripts publish-dev.sh et release.sh le font par SSH) :
+# À lancer SUR l'hôte Docker connecté à ghcr.io (publish-dev.sh le fait par SSH) :
 #   ARM_HOST=<hôte ssh arm64> scripts/build-image.sh <version> <tag> [tag…]
 set -euo pipefail
 cd "$(dirname "$0")/.."

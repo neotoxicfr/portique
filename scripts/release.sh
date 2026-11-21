@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Release sans CI GitHub : ./scripts/release.sh 0.1.0 [notes.md]
+# Release : ./scripts/release.sh 0.1.0 [notes.md]
 # - vérifications de scripts/ci.sh ;
-# - image ghcr.io/neotoxicfr/portique:X.Y.Z (sans « v ») et :latest, amd64 + arm64 (scripts/build-image.sh) ;
-# - archives binaire + front (linux x86_64 et aarch64, glibc 2.38+) et SHA256SUMS ;
-# - tag vX.Y.Z et release GitHub avec les notes rédigées (jamais générées).
-# Prérequis : .env (voir .env.exemple), gh authentifié, arbre propre sur main.
+# - tag vX.Y.Z poussé : le workflow Release (.github/workflows/release.yml) publie l'image
+#   ghcr.io/neotoxicfr/portique:X.Y.Z (sans « v ») et :latest, les archives et la release, corps vide ;
+# - puis les notes rédigées (jamais générées) sont posées sur cette release.
+# Seul le workflow crée la release : un tag poussé à la main donne le même résultat, notes à ajouter
+# ensuite avec `gh release edit vX.Y.Z --notes-file …`.
+# Prérequis : gh authentifié, arbre propre sur main.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# shellcheck source=/dev/null
-. ./.env
 
 version=${1:?usage: release.sh X.Y.Z [notes.md]}
 notes=${2:-.audit/release-v$version.md}
 repo=neotoxicfr/portique
-image=ghcr.io/$repo
 
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version X.Y.Z attendue (sans v)" >&2; exit 1; }
 [[ -s $notes ]] || { echo "notes absentes : $notes" >&2; exit 1; }
@@ -24,18 +23,18 @@ grep -q "^## \[v$version\]" CHANGELOG.md || { echo "CHANGELOG.md sans entrée v$
 
 ./scripts/ci.sh
 
-ssh "$DOCKER_SSH" "cd '$REMOTE_DIR' && ARM_HOST='$ARM_HOST' scripts/build-image.sh $version $version latest"
-
-# Archives extraites des images publiées, sur l'hôte Docker (release/ est dans le dossier partagé).
-ssh "$DOCKER_SSH" "cd '$REMOTE_DIR' && rm -rf release && mkdir release && for a in amd64:x86_64 arm64:aarch64; do
-    out=release/portique-$version-\${a#*:}-linux; mkdir -p \$out
-    cid=\$(docker create $image:$version-\${a%%:*})
-    docker cp \$cid:/usr/local/bin/portique \$out/portique && docker cp \$cid:/app/web \$out/web; docker rm \$cid >/dev/null
-    cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE \$out/ && tar -C release -czf \$out.tar.gz \${out#release/}
-  done && (cd release && sha256sum ./*.tar.gz > SHA256SUMS) && chown -R \$(stat -c %u:%g .) release"
-
 git tag -a "v$version" -m "v$version"
 git push origin "v$version"
-gh release create "v$version" -R "$repo" --title "v$version" --notes-file "$notes" --verify-tag \
-  release/*.tar.gz release/SHA256SUMS
+
+# Le run du tag peut mettre quelques secondes à apparaître.
+sha=$(git rev-parse HEAD) run=
+for _ in {1..30}; do
+  # Le run déclenché par CE tag (headBranch = nom du tag), pas un autre tag poussé sur le même commit.
+  run=$(gh run list -R "$repo" --workflow release.yml --event push --branch "v$version" --commit "$sha" --json databaseId -q '.[0].databaseId')
+  [[ -n $run ]] && break
+  sleep 10
+done
+[[ -n $run ]] || { echo "workflow Release introuvable pour v$version" >&2; exit 1; }
+gh run watch "$run" -R "$repo" --exit-status --compact --interval 30
+gh release edit "v$version" -R "$repo" --notes-file "$notes"
 echo "release v$version publiée"

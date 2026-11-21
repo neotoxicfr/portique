@@ -15,7 +15,7 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use portique_proto::{AuthMode, Me};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqliteExecutor, SqlitePool};
 use time::OffsetDateTime;
 
 use crate::{
@@ -70,22 +70,51 @@ pub async fn user_by_name(db: &SqlitePool, name: &str) -> sqlx::Result<Option<Us
         .await
 }
 
-pub fn hash_password(pw: &str) -> anyhow::Result<String> {
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Calcul Argon2 (~19 Mio, des dizaines de ms) hors des workers async, quelques-uns à la fois : la mémoire
+/// du conteneur est bornée et une rafale de connexions ne doit pas bloquer les relais en cours.
+async fn argon2<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
+    let permit = ARGON2_PERMITS.acquire().await?;
+    // Le permis suit le calcul : une requête abandonnée (client parti) n'arrête pas la tâche bloquante,
+    // elle ne doit pas non plus rendre sa place avant la fin.
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await?)
+}
+
+fn hash_password_sync(pw: &str) -> anyhow::Result<String> {
     Ok(Argon2::default()
         .hash_password(pw.as_bytes())
         .map_err(|e| anyhow::anyhow!("argon2 : {e}"))?
         .to_string())
 }
 
-pub fn verify_password(pw: &str, hash: &str) -> bool {
+fn verify_password_sync(pw: &str, hash: &str) -> bool {
     PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
 }
 
+pub async fn hash_password(pw: &str) -> anyhow::Result<String> {
+    let pw = pw.to_owned();
+    argon2(move || hash_password_sync(&pw)).await?
+}
+
+pub async fn verify_password(pw: &str, hash: &str) -> bool {
+    let (pw, hash) = (pw.to_owned(), hash.to_owned());
+    argon2(move || verify_password_sync(&pw, &hash)).await.unwrap_or(false)
+}
+
 /// Hash factice pour que la vérification prenne le même temps quand le compte n'existe pas.
-pub fn dummy_verify(pw: &str) {
+pub async fn dummy_verify(pw: &str) {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let h = DUMMY.get_or_init(|| hash_password("portique-dummy").expect("argon2"));
-    let _ = verify_password(pw, h);
+    let pw = pw.to_owned();
+    let _ = argon2(move || {
+        let h = DUMMY.get_or_init(|| hash_password_sync("portique-dummy").expect("argon2"));
+        verify_password_sync(&pw, h)
+    })
+    .await;
 }
 
 pub fn validate_password(pw: &str) -> Result<(), AppError> {
@@ -102,23 +131,85 @@ pub fn validate_username(name: &str) -> Result<(), AppError> {
     if ok { Ok(()) } else { Err(AppError::BadRequest("identifiant invalide".into())) }
 }
 
-/// Ouvre une session et renvoie le cookie à poser. `mfa` : ouverte avec un second facteur (TOTP ou passkey).
+/// Vérifie un code TOTP et consomme son pas par une seule écriture conditionnelle, sans lecture préalable :
+/// un pas déjà consommé est refusé par l'écriture même, et de deux requêtes concurrentes avec le même code,
+/// une seule l'emporte. Dans une transaction (connexion), elle en est ainsi la première instruction : une
+/// lecture d'abord y deviendrait une écriture sur un instantané périmé (SQLITE_BUSY sous concurrence).
+/// L'écriture exige aussi la graine vérifiée : retirée ou remplacée entre-temps (remise à zéro de la 2FA),
+/// le code ne vaut plus rien.
+pub async fn consume_totp(
+    state: &AppState,
+    db: impl SqliteExecutor<'_>,
+    u: &UserRow,
+    sealed: &[u8],
+    code: &str,
+) -> Result<bool, AppError> {
+    let secret = state.vault.open(&format!("totp:{}", u.id), sealed)?;
+    let Some(step) = crate::totp::verify(&secret, &u.username, code, 0)? else {
+        return Ok(false);
+    };
+    let r =
+        sqlx::query("UPDATE users SET totp_last = ?1 WHERE id = ?2 AND totp_last < ?1 AND totp_secret = ?3")
+            .bind(step)
+            .bind(u.id)
+            .bind(sealed)
+            .execute(db)
+            .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Preuve vérifiée sur laquelle repose une nouvelle session.
+pub enum Proof<'a> {
+    /// Mot de passe, et graine TOTP s'il y en avait une, tels qu'ils étaient lors de la vérification.
+    Password { hash: &'a str, totp: Option<&'a [u8]> },
+    /// Passkey utilisée (ligne de `passkeys`).
+    Passkey(i64),
+}
+
+/// Ouvre une session et renvoie le cookie à poser ; elle est marquée `mfa` si la preuve comprend un second
+/// facteur (TOTP ou passkey). La preuve est revérifiée dans l'INSERT même : un changement de mot de passe,
+/// une remise à zéro de la 2FA ou une passkey retirée pendant la connexion ne laisse pas naître de session
+/// après la révocation (SQLite sérialise les écritures : avant, la révocation l'efface ; après, l'INSERT échoue).
+/// `db` : la transaction de la connexion, qui consomme aussi le code TOTP.
 pub async fn open_session(
     state: &AppState,
+    db: &mut SqliteConnection,
     jar: CookieJar,
     user_id: i64,
-    mfa: bool,
+    proof: Proof<'_>,
 ) -> Result<CookieJar, AppError> {
     let (token, hash) = crypto::new_session_token();
     let expires = OffsetDateTime::now_utc() + time::Duration::days(SESSION_DAYS);
-    sqlx::query("DELETE FROM sessions WHERE expires_at < unixepoch()").execute(&state.db).await?;
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, ?, ?)")
-        .bind(hash)
-        .bind(user_id)
-        .bind(expires.unix_timestamp())
-        .bind(mfa)
-        .execute(&state.db)
-        .await?;
+    sqlx::query("DELETE FROM sessions WHERE expires_at < unixepoch()").execute(&mut *db).await?;
+    let insert =
+        |sql: &'static str| sqlx::query(sql).bind(hash.clone()).bind(user_id).bind(expires.unix_timestamp());
+    let r = match proof {
+        Proof::Password { hash: pw, totp } => {
+            insert(
+                "INSERT INTO sessions (token_hash, user_id, expires_at, mfa) SELECT ?1, ?2, ?3, ?4
+                 WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND password_hash IS ?5 AND totp_secret IS ?6)",
+            )
+            .bind(totp.is_some())
+            .bind(pw)
+            .bind(totp)
+            .execute(&mut *db)
+            .await?
+        }
+        Proof::Passkey(id) => {
+            insert(
+                "INSERT INTO sessions (token_hash, user_id, expires_at, mfa) SELECT ?1, ?2, ?3, 1
+                 WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ?4 AND user_id = ?2)",
+            )
+            .bind(id)
+            .execute(&mut *db)
+            .await?
+        }
+    };
+    // Facteurs bons mais révoqués entre-temps : 409 distinct d'un 401, pour que la page de connexion
+    // ne parle pas de mauvais mot de passe. Il n'apprend rien à qui n'a pas déjà prouvé ces facteurs.
+    if r.rows_affected() == 0 {
+        return Err(AppError::Conflict("réglages du compte changés pendant la connexion, recommence".into()));
+    }
     let cookie = Cookie::build((SESSION_COOKIE, token))
         .path("/")
         .http_only(true)
@@ -288,10 +379,141 @@ mod tests {
         assert_eq!(ip, "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
-    #[test]
-    fn password_roundtrip() {
-        let h = hash_password("correct horse battery").unwrap();
-        assert!(verify_password("correct horse battery", &h));
-        assert!(!verify_password("wrong", &h));
+    /// La preuve est revérifiée à l'INSERT : une révocation survenue après la vérification gagne.
+    #[tokio::test]
+    async fn stale_proof_opens_no_session() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let hash = u.password_hash.clone().unwrap();
+        let (st, uid) = (&s, u.id);
+        let open = move |proof| async move {
+            let mut db = st.db.acquire().await.unwrap();
+            open_session(st, &mut db, CookieJar::new(), uid, proof).await
+        };
+        assert!(open(Proof::Password { hash: &hash, totp: None }).await.is_ok());
+        // Mot de passe changé (et sessions supprimées) entre la vérification et l'INSERT.
+        sqlx::query("UPDATE users SET password_hash = 'autre' WHERE id = ?")
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let r = open(Proof::Password { hash: &hash, totp: None }).await;
+        assert!(matches!(r, Err(AppError::Conflict(_))), "ancien mot de passe");
+        // 2FA remise à zéro par un admin pendant la connexion « mot de passe + TOTP ».
+        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(&hash)
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let r = open(Proof::Password { hash: &hash, totp: Some(&[1]) }).await;
+        assert!(matches!(r, Err(AppError::Conflict(_))), "TOTP retiré");
+        // Passkey retirée après l'émission du défi.
+        assert!(matches!(open(Proof::Passkey(42)).await, Err(AppError::Conflict(_))), "passkey retirée");
+        sqlx::query("INSERT INTO passkeys (id, user_id, name, credential) VALUES (42, ?, 'clé', '{}')")
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        assert!(open(Proof::Passkey(42)).await.is_ok());
+        let mfa: Vec<bool> =
+            sqlx::query_scalar("SELECT mfa FROM sessions ORDER BY rowid").fetch_all(&s.db).await.unwrap();
+        assert_eq!(mfa, [false, true]);
+        // L'identifiant d'une passkey supprimée n'est jamais redonné à la suivante (migration 0007).
+        let add = || async {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'k', '{}') RETURNING id",
+            )
+            .bind(u.id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap()
+        };
+        let first = add().await;
+        sqlx::query("DELETE FROM passkeys WHERE id = ?").bind(first).execute(&s.db).await.unwrap();
+        assert_ne!(add().await, first, "identifiant réattribué");
+    }
+
+    /// Deux requêtes avec le même code lisent le même `totp_last` : une seule consomme le pas.
+    #[tokio::test]
+    async fn totp_step_consumed_once_under_concurrency() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        let sealed = s.vault.seal(&format!("totp:{}", u.id), &secret);
+        sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")
+            .bind(&sealed)
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        let (a, b, c) = tokio::join!(
+            consume_totp(&s, &s.db, &u, &sealed, &code),
+            consume_totp(&s, &s.db, &u, &sealed, &code),
+            consume_totp(&s, &s.db, &u, &sealed, &code)
+        );
+        let ok = [a.unwrap(), b.unwrap(), c.unwrap()];
+        assert_eq!(ok.iter().filter(|o| **o).count(), 1, "{ok:?}");
+    }
+
+    /// Graine lue avant une remise à zéro de la 2FA : son code n'est plus accepté ni son pas consommé.
+    #[tokio::test]
+    async fn totp_code_of_a_removed_seed_is_refused() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        let sealed = s.vault.seal(&format!("totp:{}", u.id), &secret);
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        assert!(!consume_totp(&s, &s.db, &u, &sealed, &code).await.unwrap());
+        let last: i64 = sqlx::query_scalar("SELECT totp_last FROM users WHERE id = ?")
+            .bind(u.id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+        assert_eq!(last, 0);
+    }
+
+    #[tokio::test]
+    async fn argon2_permit_held_until_computation_ends() {
+        // Chaque calcul bloque jusqu'à la fermeture de son canal `gates`.
+        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gates, tasks): (Vec<_>, Vec<_>) = (0..4)
+            .map(|_| {
+                let (gate, wait) = std::sync::mpsc::channel::<()>();
+                let started = started.clone();
+                let task = tokio::spawn(argon2(move || {
+                    started.send(()).unwrap();
+                    let _ = wait.recv();
+                }));
+                (gate, task)
+            })
+            .unzip();
+        // Délai borné : un calcul qui ne démarre pas fait échouer le test (et l'abandon de `gates` libère
+        // ceux qui ont démarré) au lieu de le bloquer.
+        let all_started = async {
+            for _ in 0..4 {
+                started_rx.recv().await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), all_started).await.expect("calculs démarrés");
+        // Requêtes abandonnées pendant le calcul : les calculs continuent, leurs permis aussi.
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            assert!(t.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(ARGON2_PERMITS.available_permits(), 0);
+        drop(gates);
+        let all = tokio::time::timeout(std::time::Duration::from_secs(5), ARGON2_PERMITS.acquire_many(4));
+        assert!(all.await.is_ok(), "permis rendus à la fin des calculs");
+    }
+
+    #[tokio::test]
+    async fn password_roundtrip() {
+        let h = hash_password("correct horse battery").await.unwrap();
+        assert!(verify_password("correct horse battery", &h).await);
+        assert!(!verify_password("wrong", &h).await);
     }
 }

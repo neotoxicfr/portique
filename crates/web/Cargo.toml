@@ -25,6 +25,8 @@ wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"
 web-sys = { version = "0.3.106", features = [
     "Window",
+    "AbortController",
+    "AbortSignal",
     "Navigator",
     "HtmlScriptElement",
     "HtmlLinkElement",
@@ -55,6 +57,11 @@ web-sys = { version = "0.3.106", features = [
     "PointerEvent",
     "WheelEvent",
     "FocusEvent",
+    "FocusOptions",
+    "InputEvent",
+    "CompositionEvent",
+    "HtmlTextAreaElement",
+    "HtmlButtonElement",
     "DomRect",
     "DomRectReadOnly",
     "AddEventListenerOptions",

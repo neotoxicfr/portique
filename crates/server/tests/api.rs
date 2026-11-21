@@ -126,7 +126,8 @@ async fn builtin_login_and_admin_flow() {
     assert_eq!(r.body["has_password"], true);
     assert_eq!(r.body["wol_mac"], "00:1A:2B:3C:4D:5E");
     assert!(r.body.get("password").is_none(), "le mot de passe ne ressort jamais");
-    call(
+    let pc_id = r.body["id"].as_i64().unwrap();
+    let r = call(
         &app,
         "POST",
         "/api/admin/connections",
@@ -135,10 +136,13 @@ async fn builtin_login_and_admin_flow() {
         &[],
     )
     .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let other_id = r.body["id"].as_i64().unwrap();
 
     let alice = login(&app, "alice", "alice-password-1").await;
     let list = call(&app, "GET", "/api/connections", Some(&alice), None, &[]).await.body;
-    assert_eq!(list.as_array().unwrap().len(), 1, "alice ne voit que sa connexion");
+    let ids: Vec<i64> = list.as_array().unwrap().iter().map(|c| c["id"].as_i64().unwrap()).collect();
+    assert!(ids.contains(&pc_id) && !ids.contains(&other_id), "alice ne voit que sa connexion : {ids:?}");
     assert_eq!(list[0]["can_wake"], true);
 
     let r = call(&app, "GET", "/api/admin/users", Some(&alice), None, &[]).await;
@@ -151,10 +155,10 @@ async fn builtin_login_and_admin_flow() {
 
     // 2FA remise à zéro par un admin (facteur perdu ou volé) : les sessions ouvertes tombent.
     let alice = login(&app, "alice", "alice-password-1").await;
-    let path = format!("/api/admin/users/{alice_id}");
-    let r =
-        call(&app, "PUT", &path, Some(&admin), Some(json!({"username": "alice", "reset_2fa": true})), &[])
-            .await;
+    let path = format!("/api/admin/users/{alice_id}/reset-2fa");
+    let r = call(&app, "POST", &path, Some(&alice), None, &[]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "réservé aux admins");
+    let r = call(&app, "POST", &path, Some(&admin), None, &[]).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
     let r = call(&app, "GET", "/api/me", Some(&alice), None, &[]).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
@@ -414,8 +418,27 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let rdp_only = post(json!({"name": "RDP seul", "host": "10.0.0.3"})).await.body["id"].as_i64().unwrap();
     let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "jump_id": rdp_only}})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = post(
+        json!({"name": "X", "host": "10.0.0.4", "rdp": false, "ssh": {"user": "a", "jump_id": rdp_only}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
     let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "theme": "fluo"}})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // Un refus ne laisse rien en base : ni hôte créé à moitié, ni renommage d'un hôte existant.
+    let r = call(
+        &app,
+        "PUT",
+        &format!("/api/admin/connections/{rdp_only}"),
+        Some(&admin),
+        Some(json!({"name": "Renommé", "host": "10.0.0.3", "ssh": {"user": "a", "jump_id": rdp_only}})),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let all = call(&app, "GET", "/api/admin/connections", Some(&admin), None, &[]).await.body;
+    let names: Vec<&str> = all.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(!names.contains(&"X") && !names.contains(&"Renommé"), "{names:?}");
 
     let list = call(&app, "GET", "/api/connections", Some(&admin), None, &[]).await.body;
     let pc = list.as_array().unwrap().iter().find(|c| c["name"] == "PC").unwrap();
@@ -453,6 +476,12 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.body["error"].as_str().unwrap().contains("n'a pas de SSH"), "{:?}", r.body);
+    // Hôte de réveil supprimé (wol_via_id remis à NULL) : pas de repli silencieux sur le paquet UDP.
+    let r = call(&app, "DELETE", &format!("/api/admin/connections/{gw_id}"), Some(&admin), None, &[]).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    assert!(r.body["error"].as_str().unwrap().contains("sans hôte de réveil"), "{:?}", r.body);
 
     // Clé du service : créée une fois, stable ensuite.
     let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;
@@ -484,6 +513,28 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // Ctrl+C et Ctrl+c envoient le même octet : doublon. Alt+B et Alt+b, non.
+    let dup = json!({"theme": "nord", "combos": ["Ctrl+C", "Ctrl+c"]});
+    let r = call(&app, "PUT", "/api/account/terminal", Some(&admin), Some(dup), &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "combinaison en double");
+    let alt = json!({"theme": "nord", "combos": ["Alt+B", "Alt+b"]});
+    let r = call(&app, "PUT", "/api/account/terminal", Some(&admin), Some(alt), &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let back = json!({"theme": "nord", "combos": ["Ctrl+C", "Alt+B"]});
+    assert_eq!(
+        call(&app, "PUT", "/api/account/terminal", Some(&admin), Some(back), &[]).await.status,
+        StatusCode::OK
+    );
     let p = call(&app, "GET", "/api/account/terminal", Some(&admin), None, &[]).await.body;
     assert_eq!(p, json!({"theme": "nord", "combos": ["Ctrl+C", "Alt+B"]}));
+}
+
+/// Un nom empreinté absent du disque reçoit le repli (index.html ou 404) : jamais `immutable`.
+#[tokio::test]
+async fn missing_fingerprinted_asset_is_not_cached_forever() {
+    let app = setup(&[], "203.0.113.10:4000").await;
+    let req = Request::builder().uri("/portique-web-0123456789abcdef_bg.wasm").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert!(!res.status().is_success());
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
 }

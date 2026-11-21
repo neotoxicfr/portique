@@ -88,7 +88,7 @@ pub async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
         "INSERT INTO users (username, password_hash, is_admin, webauthn_id) VALUES ('admin', ?, 1, ?)
          ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash, is_admin = 1",
     )
-    .bind(auth::hash_password(pw)?)
+    .bind(auth::hash_password(pw).await?)
     .bind(uuid::Uuid::new_v4().to_string())
     .execute(&state.db)
     .await?;
@@ -201,7 +201,16 @@ pub fn app(state: AppState) -> Router {
             async move {
                 let mut res = next.run(req).await;
                 res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, value);
-                if let Some(c) = cache {
+                if let Some(mut c) = cache {
+                    // Nom empreinté absent du disque (onglet ancien, déploiement en cours) : la réponse est
+                    // le repli index.html ou une erreur, à ne pas garder un an sous l'URL de l'asset.
+                    let html = res
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+                    if !res.status().is_success() || html {
+                        c = "no-cache";
+                    }
                     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
                 }
                 res
@@ -216,6 +225,68 @@ pub fn app(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    /// 0008 : comptes et hôtes reconstruits sans perdre ce qui les référence (sessions, passkeys, droits,
+    /// rebonds), clés étrangères rétablies ; un identifiant supprimé, avant comme après la migration, n'est
+    /// plus redonné.
+    #[tokio::test]
+    async fn rebuild_keeps_children_and_ids_are_never_reused() {
+        use super::*;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:").unwrap().foreign_keys(true);
+        let db = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(7, &db).await.unwrap();
+        // dave et l'hôte 3 portent les plus grands identifiants et sont supprimés avant la migration.
+        sqlx::raw_sql(
+            "INSERT INTO users (username, webauthn_id) VALUES ('alice', 'a'), ('bob', 'b'), ('dave', 'd');
+             INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (x'01', 1, 0, 1), (x'02', 2, 0, 0);
+             INSERT INTO passkeys (user_id, name, credential) VALUES (2, 'clé', '{}');
+             INSERT INTO connections (name, host, port)
+                 VALUES ('pc', '192.0.2.1', 3389), ('rebond', '192.0.2.2', 22), ('vieux', '192.0.2.4', 22);
+             UPDATE connections SET ssh_jump_id = 2, wol_via_id = 2 WHERE id = 1;
+             INSERT INTO connection_access (connection_id, user_id) VALUES (1, 1), (2, 2);
+             DELETE FROM users WHERE id = 3; DELETE FROM connections WHERE id = 3;",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        migrator.run(&db).await.unwrap();
+        let n = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(&db);
+        assert_eq!(n("PRAGMA foreign_keys").await.unwrap(), 1, "clés étrangères rétablies");
+        let kept = "SELECT (SELECT count(*) FROM users) * 1000 + (SELECT count(*) FROM sessions) * 100
+                    + (SELECT count(*) FROM passkeys) * 10 + (SELECT count(*) FROM connection_access)";
+        assert_eq!(n(kept).await.unwrap(), 2212, "comptes, sessions, passkeys, droits");
+        assert_eq!(n("SELECT ssh_jump_id + wol_via_id FROM connections WHERE id = 1").await.unwrap(), 4);
+
+        // bob porte le plus grand identifiant : supprimé, il emporte ses lignes, et carol ne prend pas sa place.
+        sqlx::raw_sql(
+            "DELETE FROM users WHERE id = 2; INSERT INTO users (username, webauthn_id) VALUES ('carol', 'c');
+             DELETE FROM connections WHERE id = 2; INSERT INTO connections (name, host, port) VALUES ('nas', '192.0.2.3', 22);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        // Ni l'identifiant de bob ni celui de dave (supprimé avant) : une action restée sur l'un ou l'autre
+        // ne vise pas carol.
+        assert_eq!(n("SELECT id FROM users WHERE username = 'carol'").await.unwrap(), 10_003);
+        assert_eq!(n("SELECT id FROM connections WHERE name = 'nas'").await.unwrap(), 10_003);
+        assert_eq!(n(kept).await.unwrap(), 2101, "lignes de bob et du rebond supprimées en cascade");
+        assert_eq!(
+            n("SELECT count(*) FROM connections WHERE ssh_jump_id IS NULL AND wol_via_id IS NULL")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Installation neuve : aucun saut, le premier compte et le premier hôte portent l'identifiant 1.
+        let fresh = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        migrator.run(&fresh).await.unwrap();
+        let first = "INSERT INTO users (username, webauthn_id) VALUES ('admin', 'x') RETURNING id";
+        assert_eq!(sqlx::query_scalar::<_, i64>(first).fetch_one(&fresh).await.unwrap(), 1);
+        let first =
+            "INSERT INTO connections (name, host, port) VALUES ('pc', '192.0.2.1', 3389) RETURNING id";
+        assert_eq!(sqlx::query_scalar::<_, i64>(first).fetch_one(&fresh).await.unwrap(), 1);
+    }
+
     #[test]
     fn static_cache_control_by_name() {
         use super::static_cache_control as c;

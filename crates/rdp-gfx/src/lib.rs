@@ -134,7 +134,7 @@ pub struct Gfx {
 
 // Plafonds : les données viennent du réseau, aucune allocation ni boucle n'est laissée libre.
 /// Côté maximal d'une surface ou de la sortie.
-const MAX_SIDE: u32 = 8192;
+pub const MAX_SIDE: u32 = 8192;
 /// Nombre de surfaces simultanées et mémoire totale qu'elles occupent.
 const MAX_SURFACES: usize = 64;
 const MAX_SURFACE_BYTES: usize = 512 * 1024 * 1024;
@@ -192,10 +192,11 @@ impl Gfx {
             if len < 8 || len > rest.len() {
                 return Err(Error::Invalid("longueur de PDU RDPGFX"));
             }
-            self.queued_bytes += len;
-            if self.queued_bytes > MAX_QUEUED_BYTES {
+            // Compté seulement si la PDU entre dans la file : `run` ne décompte que ce qu'il dépile.
+            if self.queued_bytes + len > MAX_QUEUED_BYTES {
                 return Err(Error::Invalid("trop de commandes en attente"));
             }
+            self.queued_bytes += len;
             self.queue.push_back(rest[..len].to_vec());
             rest = &rest[len..];
         }
@@ -269,15 +270,16 @@ impl Gfx {
         if let Some(p) = self.pending_avc.take() {
             let mut done = Vec::new();
             let mut origin = None;
-            let mut grew = 0usize;
             if let Some(s) = self.surfaces.get_mut(&p.surface) {
                 origin = s.origin;
                 if s.p444.is_none() {
                     let planes = avc444::Planes444::new(s.width, s.height);
-                    grew = planes.bytes();
+                    let grew = planes.bytes();
                     if self.surface_bytes + grew > MAX_SURFACE_BYTES {
                         return Err(Error::Invalid("mémoire de surface épuisée (AVC444)"));
                     }
+                    // Compté dès qu'ils sont gardés : une image refusée plus bas ne les retire pas.
+                    self.surface_bytes += grew;
                     s.p444 = Some(planes);
                 }
                 let (sw, sh) = (s.width, s.height);
@@ -301,7 +303,6 @@ impl Gfx {
                     }
                 }
             }
-            self.surface_bytes += grew;
             for r in done {
                 self.touch(p.surface, r, origin);
             }

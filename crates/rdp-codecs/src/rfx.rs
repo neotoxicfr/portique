@@ -285,7 +285,8 @@ pub fn ycbcr_to_rgba(
     dst: &mut [u8],
     stride: usize,
 ) {
-    if w == 0 || h == 0 || sx + w > TILE || sy + h > TILE {
+    // Comparé à la place restante : `sx + w` pourrait déborder.
+    if w == 0 || h == 0 || sx >= TILE || sy >= TILE || w > TILE - sx || h > TILE - sy {
         return;
     }
     match (h - 1).checked_mul(stride).and_then(|n| n.checked_add(w * 4)) {
@@ -583,6 +584,8 @@ mod tests {
         let mut small = vec![7u8; 8];
         ycbcr_to_rgba(&y, &cb, &cr, (62, 0, 4, 1), &mut small, 16);
         ycbcr_to_rgba(&y, &cb, &cr, (0, 0, 4, 1), &mut small, 16);
+        ycbcr_to_rgba(&y, &cb, &cr, (usize::MAX, 0, 2, 1), &mut small, 16);
+        ycbcr_to_rgba(&y, &cb, &cr, (0, usize::MAX, 1, 2), &mut small, 16);
         assert!(small.iter().all(|&b| b == 7));
     }
 

@@ -34,9 +34,26 @@ pub fn html_to_cf_html(fragment: &str) -> Vec<u8> {
     out
 }
 
-/// Valeur entière d'une clé de l'en-tête (`Clé:valeur`), si présente et positive.
+/// Valeur entière d'une clé de l'en-tête (`Clé:valeur`), si présente et positive. Les lignes
+/// finissent par CR, LF ou CRLF.
 fn offset(header: &str, key: &str) -> Option<usize> {
-    header.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix(':')?.trim().parse().ok())
+    header
+        .split(['\r', '\n'])
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix(':')?.trim().parse().ok())
+}
+
+/// Position (début, fin) du commentaire `<!--name-->`, espaces tolérés autour du nom.
+fn marker(s: &str, name: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(i) = s[from..].find("<!--") {
+        let open = from + i + 4;
+        let close = open + s[open..].find("-->")?;
+        if s[open..close].trim() == name {
+            return Some((from + i, close + 3));
+        }
+        from = close + 3;
+    }
+    None
 }
 
 /// Fragment d'un CF_HTML. Les offsets de l'en-tête priment s'ils sont cohérents (après
@@ -58,13 +75,10 @@ pub fn cf_html_fragment(data: &[u8]) -> String {
         return f.to_string();
     }
     let body = &text[header_end..];
-    if let Some(i) = body.find("<!--StartFragment") {
-        let rest = &body[i..];
-        if let Some(open) = rest.find("-->") {
-            let rest = &rest[open + 3..];
-            let close = rest.find("<!--EndFragment").unwrap_or(rest.len());
-            return rest[..close].to_string();
-        }
+    if let Some((_, start)) = marker(body, "StartFragment") {
+        let rest = &body[start..];
+        let close = marker(rest, "EndFragment").map_or(rest.len(), |(c, _)| c);
+        return rest[..close].to_string();
     }
     slice(offset(header, "StartHTML"), offset(header, "EndHTML")).unwrap_or(body).to_string()
 }
@@ -112,5 +126,18 @@ mod tests {
         let bad = "StartFragment:35\r\nEndFragment:36\r\n<é>";
         assert_eq!(cf_html_fragment(bad.as_bytes()), "<é>");
         let _ = cf_html_fragment(&[0xFF, b'<', 0xC3]);
+    }
+
+    #[test]
+    fn header_with_cr_only() {
+        // Offsets exacts (en-tête de 60 octets), fragment hors marqueurs : seuls les offsets le trouvent.
+        let cf = "Version:0.9\rStartFragment:0000000066\rEndFragment:0000000067\r<html>x</html>";
+        assert_eq!(cf_html_fragment(cf.as_bytes()), "x");
+    }
+
+    #[test]
+    fn markers_with_inner_spaces_and_exact_names() {
+        let cf = "<html><!-- StartFragmentX --><!-- StartFragment -->y<!--  EndFragment  --></html>";
+        assert_eq!(cf_html_fragment(cf.as_bytes()), "y");
     }
 }

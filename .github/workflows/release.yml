@@ -1,0 +1,103 @@
+# Release : le push d'un tag vX.Y.Z construit l'image (amd64 et arm64, chacune sur un runner natif),
+# la publie sur ghcr en X.Y.Z (et latest pour une version stable, jamais pour une préversion -rc), et crée
+# la release GitHub (corps vide : les notes, écrites à la main, s'ajoutent ensuite avec `gh release edit`)
+# avec les archives binaire + front et SHA256SUMS.
+name: Release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+jobs:
+  image:
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, triple: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, triple: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: VERSION=${{ steps.v.outputs.version }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Archive (binaire + front)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          out=portique-$version-${{ matrix.triple }}-linux
+          docker pull -q "$IMAGE"
+          mkdir -p "$out" dist
+          cid=$(docker create "$IMAGE")
+          docker cp "$cid:/usr/local/bin/portique" "$out/portique"
+          docker cp "$cid:/app/web" "$out/web"
+          docker rm "$cid" >/dev/null
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$out/"
+          tar -czf "dist/$out.tar.gz" "$out"
+          echo "$DIGEST" > "dist/digest-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+  publish:
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+      - name: Manifeste multi-arch
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          image=ghcr.io/${{ github.repository }}
+          args=(); while read -r t; do [ -n "$t" ] && args+=(-t "$t"); done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$image@$(cat dist/digest-amd64)" "$image@$(cat dist/digest-arm64)"
+      - name: Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum ./*.tar.gz > SHA256SUMS
+          # Préversion (vX.Y.Z-rc.N) : marquée comme telle, jamais « Latest ».
+          pre=(); if [[ "$GITHUB_REF_NAME" == *-* ]]; then pre=(--prerelease --latest=false); fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "" --verify-tag "${pre[@]}" \
+            ./*.tar.gz SHA256SUMS

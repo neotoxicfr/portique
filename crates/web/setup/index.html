@@ -4,15 +4,34 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Préparer un PC Windows</title>
+<meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <style>
-:root{--bg:#fff;--fg:#1c1f24;--mut:#5b6470;--card:#f3f5f8;--ac:#1f5fd1}
-@media (prefers-color-scheme:dark){:root{--bg:#14171c;--fg:#e6e9ee;--mut:#9aa4b2;--card:#1d222a;--ac:#6ea3ff}}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,sans-serif}
-main{max-width:40rem;margin:0 auto;padding:1.5rem 1rem 3rem}
-h1{font-size:1.5rem;margin:.2rem 0 1rem}
-.card{background:var(--card);border-radius:.6rem;padding:.9rem 1rem;margin:.8rem 0}
-a{color:var(--ac)} code{font-size:.92em} ul{padding-left:1.2rem}
-p.mut{color:var(--mut);font-size:.92rem}
+:root{--bg:#f2f2f7;--card:#fff;--sep:rgba(60,60,67,.2);--fill:rgba(118,118,128,.12);--text:#1d1d1f;--muted:#636366;--link:#0066cc;--accent:#0071e3;--code:rgba(118,118,128,.12);--focus:#0071e3;--shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--sep:rgba(84,84,88,.6);--fill:rgba(118,118,128,.24);--text:#f5f5f7;--muted:#9a9a9f;--link:#2997ff;--code:rgba(118,118,128,.24);--focus:#0a84ff;--shadow:inset 0 .5px 0 rgba(255,255,255,.08)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;-webkit-text-size-adjust:100%}
+main{max-width:40rem;margin:0 auto;padding:max(24px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(40px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+h1{font-size:28px;line-height:1.15;margin:8px 0 12px;letter-spacing:-.01em}
+h2{font-size:13px;font-weight:600;color:var(--muted);margin:28px 16px 8px}
+p{margin:0 0 12px}
+.card{background:var(--card);border-radius:16px;padding:16px;margin:12px 0;box-shadow:var(--shadow)}
+.card strong{display:block;font-size:17px;margin-bottom:8px}
+.card ul{margin:0}
+ul{padding-left:1.2rem;margin:0 0 12px}
+li+li{margin-top:6px}
+.group{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:4px 16px}
+.group p,.group li{margin:0}
+.group ul{list-style:none;padding:0;margin:0}
+.group li{padding:11px 0}
+.group li+li{border-top:.5px solid var(--sep);margin-top:0}
+a{color:var(--link)}
+a.button{display:inline-flex;align-items:center;min-height:44px;padding:0 18px;border-radius:999px;background:var(--accent);color:#fff;font-weight:600;text-decoration:none;margin:2px 6px 2px 0}
+a.button.secondary{background:var(--fill);color:var(--link)}
+a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}a:not(.button):focus-visible{border-radius:6px}
+code{font:13px ui-monospace,"SF Mono",Menlo,monospace;background:var(--code);padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
+.group p.pad{padding:11px 0}
+p.mut{color:var(--muted);font-size:13px;margin:16px 16px 0}
 </style>
 </head>
 <body>
@@ -22,27 +41,27 @@ p.mut{color:var(--mut);font-size:.92rem}
 <div class="card">
 <strong>Option A : fichiers .reg + .cmd</strong>
 <ul>
-<li>Télécharge les trois fichiers dans le même dossier : <a href="portique.reg" download>portique.reg</a>, <a href="portique.cmd" download>portique.cmd</a>, <a href="annuler.reg" download>annuler.reg</a>.</li>
+<li>Télécharge les trois fichiers dans le même dossier : <a class="button" href="portique.reg" download>portique.reg</a> <a class="button" href="portique.cmd" download>portique.cmd</a> <a class="button secondary" href="annuler.reg" download>annuler.reg</a></li>
 <li>Clic droit sur <code>portique.cmd</code> puis « Exécuter en tant qu'administrateur » : il importe le .reg et fait le reste.</li>
 </ul>
 </div>
 <div class="card">
 <strong>Option B : un seul script PowerShell</strong>
 <ul>
-<li>Télécharge <a href="portique.ps1" download>portique.ps1</a>, puis dans PowerShell administrateur : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1</code></li>
+<li>Télécharge <a class="button" href="portique.ps1" download>portique.ps1</a> puis dans PowerShell administrateur : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1</code></li>
 </ul>
 </div>
 <h2>Ce que ça change</h2>
-<ul>
+<div class="group"><ul>
 <li>Bureau à distance activé, authentification NLA obligatoire.</li>
 <li>Graphiques : H.264 AVC 4:4:4, encodage matériel et GPU pour toutes les sessions, 60 images/s, qualité d'image haute.</li>
 <li>Presse-papier, lecteurs, son et micro autorisés ; plus de déconnexion automatique.</li>
 <li>Pare-feu : règles « Bureau à distance » activées.</li>
 <li>Empreinte du certificat RDP affichée à la fin : à la première connexion, Portique montre une empreinte à l'admin, elle doit être <strong>identique</strong> avant de l'approuver.</li>
 <li>Réveil à distance : carte réseau autorisée à réveiller le PC, démarrage rapide désactivé, adresse MAC affichée (à recopier dans Portique). Active aussi Wake-on-LAN dans le BIOS/UEFI.</li>
-</ul>
+</ul></div>
 <h2>Annuler</h2>
-<p>Option A : importe <code>annuler.reg</code> puis lance <code>portique.cmd annuler</code> (ou seulement la seconde commande, elle importe le .reg). Option B : <code>.\portique.ps1 -Annuler</code>.</p>
+<div class="group"><p class="pad">Option A : importe <code>annuler.reg</code> puis lance <code>portique.cmd annuler</code> (ou seulement la seconde commande, elle importe le .reg). Option B : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1 -Annuler</code>.</p></div>
 <p class="mut">Un redémarrage peut être nécessaire pour que les réglages graphiques s'appliquent.</p>
 </main>
 </body>

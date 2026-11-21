@@ -2,6 +2,11 @@
 //! Windows applique ensuite sa propre disposition (AZERTY…) : on transmet des positions, pas
 //! des caractères, comme un vrai clavier.
 
+use rdp_pdu::fastpath::{
+    Input,
+    kbd::{EXTENDED, EXTENDED1, RELEASE},
+};
+
 /// (code de balayage, touche étendue E0).
 pub fn scancode(code: &str) -> Option<(u8, bool)> {
     Some(match code {
@@ -132,4 +137,101 @@ pub fn scancode(code: &str) -> Option<(u8, bool)> {
         "MediaTrackNext" => (0x19, true),
         _ => return None,
     })
+}
+
+/// Code de balayage d'un événement clavier : sa position (`code`) ; à défaut (clavier virtuel :
+/// `code` vide, ou « Unidentified » que permet UI Events), le nom de la touche (`key`), que les
+/// touches nommées (Retour arrière, Entrée, flèches…) partagent avec leur position.
+pub fn scancode_of(code: &str, key: &str) -> Option<(u8, bool)> {
+    // Sans position (clavier virtuel), Entrée, Retour arrière et Suppr passent déjà par `beforeinput`
+    // (insertParagraph, deleteContent…) : les reprendre ici les enverrait deux fois.
+    let by_input = matches!(key, "Enter" | "Backspace" | "Delete");
+    scancode(code)
+        .or_else(|| (matches!(code, "" | "Unidentified") && !by_input).then(|| scancode(key)).flatten())
+}
+
+/// Touches sans code de balayage simple, rendues par une séquence complète. Pause : Ctrl avec
+/// EXTENDED1 puis Verr num (MS-RDPBCGR 2.2.8.1.2.2.1), appui et relâchement envoyés à l'appui
+/// (la touche n'a pas de relâchement propre).
+pub fn sequence(code: &str, down: bool) -> Option<Vec<Input>> {
+    match code {
+        "Pause" if down => Some(vec![
+            Input::Scancode { code: 0x1D, flags: EXTENDED1 },
+            Input::Scancode { code: 0x45, flags: 0 },
+            Input::Scancode { code: 0x1D, flags: EXTENDED1 | RELEASE },
+            Input::Scancode { code: 0x45, flags: RELEASE },
+        ]),
+        "Pause" => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Appui puis relâchement d'une touche.
+pub fn tap(code: u8, extended: bool) -> [Input; 2] {
+    let ext = if extended { EXTENDED } else { 0 };
+    [Input::Scancode { code, flags: ext }, Input::Scancode { code, flags: ext | RELEASE }]
+}
+
+/// Texte tapé au clavier virtuel : caractères en Unicode (une paire de substitution est appuyée
+/// puis relâchée d'un bloc), fins de ligne (CRLF, CR ou LF) en une touche Entrée.
+pub fn text_events(text: &str) -> Vec<Input> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\n' || c == '\r' {
+            if c == '\r' {
+                chars.next_if_eq(&'\n');
+            }
+            out.extend(tap(0x1C, false));
+            continue;
+        }
+        let mut buf = [0u16; 2];
+        let units = c.encode_utf16(&mut buf);
+        out.extend(units.iter().map(|u| Input::Unicode { code: *u, release: false }));
+        out.extend(units.iter().map(|u| Input::Unicode { code: *u, release: true }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_sends_extended1_sequence_on_press_only() {
+        let frame = rdp_pdu::fastpath::input_frame(&sequence("Pause", true).unwrap());
+        // En-tête (4 événements), longueur, puis (drapeaux, code) × 4.
+        assert_eq!(frame, [4 << 2, 10, 0x04, 0x1D, 0x00, 0x45, 0x05, 0x1D, 0x01, 0x45]);
+        assert_eq!(sequence("Pause", false), Some(Vec::new()));
+        assert_eq!(sequence("KeyA", true), None);
+        assert_eq!(scancode("Pause"), None, "jamais par la table : (code, E0) ne peut la représenter");
+    }
+
+    #[test]
+    fn named_keys_without_a_position() {
+        assert_eq!(scancode_of("", "ArrowDown"), scancode("ArrowDown"));
+        assert_eq!(scancode_of("Unidentified", "ArrowDown"), scancode("ArrowDown"));
+        assert_eq!(scancode_of("Unidentified", "Enter"), None, "Entrée : par beforeinput seulement");
+        assert_eq!(scancode_of("", "Backspace"), None, "Retour arrière : par beforeinput seulement");
+        assert_eq!(scancode_of("Enter", "Enter"), Some((0x1C, false)), "clavier physique inchangé");
+        assert_eq!(scancode_of("Unidentified", "a"), None, "caractère : par Unicode");
+        assert_eq!(scancode_of("KeyQ", "a"), scancode("KeyQ"), "la position prime (AZERTY)");
+    }
+
+    #[test]
+    fn virtual_keyboard_text() {
+        let u = |code, release| Input::Unicode { code, release };
+        assert_eq!(text_events("é"), [u(0xE9, false), u(0xE9, true)]);
+        assert_eq!(
+            text_events("a\n"),
+            [u(0x61, false), u(0x61, true), tap(0x1C, false)[0], tap(0x1C, false)[1]]
+        );
+        assert_eq!(text_events("😀"), [u(0xD83D, false), u(0xDE00, false), u(0xD83D, true), u(0xDE00, true)]);
+        let enter = tap(0x1C, false);
+        let ab = |eol: &str| text_events(&format!("a{eol}b"));
+        let one = [u(0x61, false), u(0x61, true), enter[0], enter[1], u(0x62, false), u(0x62, true)];
+        assert_eq!(ab("\r\n"), one, "CRLF = une seule Entrée");
+        assert_eq!(ab("\r"), one);
+        assert_eq!(ab("\n\r").len(), one.len() + 2, "LF puis CR : deux lignes");
+    }
 }

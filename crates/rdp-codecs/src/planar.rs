@@ -6,8 +6,8 @@
 //! facultatif termine le flux. Les lignes vont de haut en bas (pas de retournement en EGFX).
 //! Ce que la surface fait de l'alpha (ignoré hors codec Alpha) relève de l'appelant.
 
+use alloc::borrow::Cow;
 use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::Error;
 
@@ -40,21 +40,22 @@ pub fn decode(src: &[u8], width: u32, height: u32, out: &mut [u8]) -> Result<(),
     let (cw, ch) = if cs { (w.div_ceil(2), h.div_ceil(2)) } else { (w, h) };
     let dims = [(w, h), (w, h), (cw, ch), (cw, ch)]; // A, Y/R, Co/G, Cg/B
 
-    let mut planes: [Vec<u8>; 4] = Default::default();
+    // Plans bruts empruntés au flux, plans RLE décodés dans un tampon.
+    let mut planes: [Cow<[u8]>; 4] = Default::default();
     for (i, &(pw, ph)) in dims.iter().enumerate() {
         if i == 0 && !alpha {
             continue;
         }
-        let mut plane = vec![0u8; pw * ph];
-        if header & RLE != 0 {
+        planes[i] = if header & RLE != 0 {
+            let mut plane = vec![0u8; pw * ph];
             let used = rle_plane(rest, pw, ph, &mut plane)?;
             rest = &rest[used..];
+            Cow::Owned(plane)
         } else {
-            let raw = rest.get(..plane.len()).ok_or(Error::Truncated("plan Planar brut"))?;
-            plane.copy_from_slice(raw);
-            rest = &rest[plane.len()..];
-        }
-        planes[i] = plane;
+            let (raw, tail) = rest.split_at_checked(pw * ph).ok_or(Error::Truncated("plan Planar brut"))?;
+            rest = tail;
+            Cow::Borrowed(raw)
+        };
     }
     // Reste : l'octet de bourrage du mode brut, ignoré comme tout octet en trop.
 
@@ -149,6 +150,7 @@ fn put(line: &mut [u8], above: Option<&[u8]>, x: usize, v: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn run(src: &[u8], w: u32, h: u32) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; (w * h * 4) as usize];

@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 pub use tokio_rustls::client::TlsStream;
 
@@ -129,6 +129,8 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
     buf: &mut Vec<u8>,
     len_of: fn(&[u8]) -> Option<usize>,
 ) -> Result<Vec<u8>, ConnectError> {
+    // Une échéance pour toute la trame : des lectures partielles ne réarment pas le délai.
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
     loop {
         if let Some(n) = len_of(buf) {
             if !(2..1 << 20).contains(&n) {
@@ -139,7 +141,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
             }
         }
         let mut chunk = [0u8; 8192];
-        let got = timeout(STEP_TIMEOUT, s.read(&mut chunk)).await.map_err(|_| ConnectError::Timeout)??;
+        let got = timeout_at(deadline, s.read(&mut chunk)).await.map_err(|_| ConnectError::Timeout)??;
         if got == 0 {
             return Err(ConnectError::Protocol("connexion fermée par le PC".into()));
         }
@@ -148,7 +150,14 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
 }
 
 async fn send<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> Result<(), ConnectError> {
-    timeout(STEP_TIMEOUT, s.write_all(data)).await.map_err(|_| ConnectError::Timeout)??;
+    // `flush` : TLS peut garder la fin du message en tampon alors que `write_all` a réussi, et le
+    // PC attendrait la suite pendant qu'on attend sa réponse.
+    timeout(STEP_TIMEOUT, async {
+        s.write_all(data).await?;
+        s.flush().await
+    })
+    .await
+    .map_err(|_| ConnectError::Timeout)??;
     Ok(())
 }
 
@@ -186,7 +195,9 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
     timings.tcp = lap();
 
     let requested = protocol::SSL | protocol::HYBRID | protocol::HYBRID_EX;
-    send(&mut tcp, &x224::connection_request(Some(&target.credentials.username), requested)).await?;
+    // Pas de cookie `mstshash` (facultatif, 2.2.1.1) : il partirait en clair, avant TLS, avec
+    // le nom du compte Windows.
+    send(&mut tcp, &x224::connection_request(None, requested)).await?;
     let mut buf = Vec::new();
     let cc = x224::connection_confirm(&read_frame(&mut tcp, &mut buf, x224::frame_len).await?)
         .map_err(|e| ConnectError::Negotiation(e.to_string()))?;
@@ -263,4 +274,89 @@ pub async fn connect(target: &Target, pinned: Option<[u8; 32]>) -> Result<Connec
         cert_sha256,
         timings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_deadline_is_not_rearmed_by_partial_reads() {
+        let (mut pc, mut us) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            for part in [&[0x03, 0x00, 0x00, 0x08][..], &[0, 0], &[0, 0]] {
+                pc.write_all(part).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            pc
+        });
+        let mut buf = Vec::new();
+        assert!(matches!(read_frame(&mut us, &mut buf, x224::frame_len).await, Err(ConnectError::Timeout)));
+        // Trame déjà entière en tampon : rendue sans lecture.
+        let mut buf = vec![0x03, 0x00, 0x00, 0x04, 0x03];
+        assert_eq!(read_frame(&mut us, &mut buf, x224::frame_len).await.unwrap(), [3, 0, 0, 4]);
+        assert_eq!(buf, [3]);
+    }
+
+    /// Flux qui ne transmet qu'au `flush`, comme TLS quand le socket est plein.
+    #[derive(Default)]
+    struct Buffered {
+        pending: Vec<u8>,
+        sent: Vec<u8>,
+    }
+
+    impl AsyncWrite for Buffered {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(b);
+            Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let s = &mut *self;
+            s.sent.append(&mut s.pending);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_flushes() {
+        let mut s = Buffered::default();
+        send(&mut s, b"TSRequest").await.unwrap();
+        assert_eq!(s.sent, b"TSRequest");
+    }
+
+    #[tokio::test]
+    async fn connection_request_without_account_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            credentials: Credentials {
+                username: "alice".into(),
+                domain: String::new(),
+                password: "x".into(),
+            },
+        };
+        let client = tokio::spawn(async move { connect(&target, None).await.map(|_| ()) });
+        let (mut pc, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let req = read_frame(&mut pc, &mut buf, x224::frame_len).await.unwrap();
+        assert_eq!(
+            req,
+            x224::connection_request(None, protocol::SSL | protocol::HYBRID | protocol::HYBRID_EX)
+        );
+        drop(pc);
+        assert!(client.await.unwrap().is_err());
+    }
 }

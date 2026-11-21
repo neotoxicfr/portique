@@ -34,7 +34,97 @@ fn password() -> anyhow::Result<String> {
 }
 
 async fn send<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(15), s.write_all(data)).await.context("délai dépassé")??;
+    // Vidé aussi : un reste dans le tampon TLS ferait attendre une réponse à un message incomplet.
+    let write = async {
+        s.write_all(data).await?;
+        s.flush().await
+    };
+    tokio::time::timeout(Duration::from_secs(15), write).await.context("délai dépassé")??;
+    Ok(())
+}
+
+/// Compteurs du rendu EGFX.
+#[derive(Default)]
+struct Stats {
+    frames: u32,
+    avc: u32,
+    ignored: std::collections::BTreeMap<String, u32>,
+}
+
+/// Message EGFX : enregistré dans le dump AVANT le rendu (le rejeu suit le même ordre), rendu,
+/// accusés renvoyés. Commun à la boucle principale et au glissement.
+async fn egfx<S: AsyncWrite + Unpin>(
+    tls: &mut S,
+    session: &Session,
+    channel_id: u32,
+    data: &[u8],
+    gfx: &mut rdp_gfx::Gfx,
+    dump: &mut Option<std::io::BufWriter<std::fs::File>>,
+    stats: &mut Stats,
+) -> anyhow::Result<()> {
+    if let Some(f) = dump.as_mut() {
+        use std::io::Write;
+        f.write_all(&(data.len() as u32).to_le_bytes())?;
+        f.write_all(data)?;
+    }
+    let mut queue: std::collections::VecDeque<rdp_gfx::Out> =
+        gfx.process(data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
+    while let Some(o) = queue.pop_front() {
+        match o {
+            rdp_gfx::Out::Send(m) => {
+                for f in session.dvc_send(channel_id, &m) {
+                    send(tls, &f).await?;
+                }
+            }
+            rdp_gfx::Out::Present { .. } => stats.frames += 1,
+            rdp_gfx::Out::Reset { width, height, .. } => println!("  EGFX : sortie {width}×{height}"),
+            rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {
+                // Pas de décodeur H.264 natif dans la sonde : image sautée.
+                stats.avc += 1;
+                queue.extend(gfx.skip_frame().map_err(|e| anyhow::anyhow!("{e}"))?);
+            }
+            rdp_gfx::Out::Ignored(t) => {
+                *stats.ignored.entry(t.split(" (").next().unwrap_or(&t).to_owned()).or_default() += 1
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Empreinte SHA-256 en hexadécimal (64 caractères ASCII).
+fn parse_pin(h: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()),
+        "PORTIQUE_PROBE_PIN : 64 caractères hexa"
+    );
+    let mut pin = [0u8; 32];
+    for (i, b) in pin.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16)?;
+    }
+    Ok(pin)
+}
+
+/// Disposition « 1920x1080,1280x1024 » (écrans côte à côte, le premier principal) vérifiée
+/// contre DISPLAYCONTROL_CAPS_PDU (MS-RDPEDISP 2.2.2.1) et les bornes de 2.2.2.2.1.
+fn check_layout(caps: &[u8], mons: &[(u32, u32)]) -> Result<(), String> {
+    let field = |i: usize| caps.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (Some(5), Some(n), Some(a), Some(b)) = (field(0), field(2), field(3), field(4)) else {
+        return Err("capacités DisplayControl illisibles".into());
+    };
+    if mons.is_empty() || mons.len() > n as usize {
+        return Err(format!("{} écran(s) demandé(s), le serveur en accepte {n}", mons.len()));
+    }
+    if let Some((w, h)) =
+        mons.iter().find(|(w, h)| !(200..=8192).contains(w) || !(200..=8192).contains(h) || w % 2 != 0)
+    {
+        return Err(format!("écran {w}×{h} hors bornes (200 à 8192, largeur paire)"));
+    }
+    // Trois facteurs u32 : leur produit peut dépasser u64.
+    let area: u128 = mons.iter().map(|&(w, h)| u128::from(w) * u128::from(h)).sum();
+    let max = u128::from(n) * u128::from(a) * u128::from(b);
+    if area > max {
+        return Err(format!("aire totale {area} px au-delà de {max}"));
+    }
     Ok(())
 }
 
@@ -52,18 +142,7 @@ async fn main() -> anyhow::Result<()> {
     println!("→ connexion à {host}:{port}");
     // PORTIQUE_PROBE_PIN : empreinte SHA-256 attendue ; sans elle, la sonde s'arrête avant NLA et
     // affiche l'empreinte à vérifier.
-    let pin = env("PIN")
-        .map(|h| {
-            (0..h.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-        })
-        .transpose()?
-        .map(|v| {
-            <[u8; 32]>::try_from(v).map_err(|_| anyhow::anyhow!("PORTIQUE_PROBE_PIN : 64 caractères hexa"))
-        })
-        .transpose()?;
+    let pin = env("PIN").map(|h| parse_pin(&h)).transpose()?;
     let mut c = rdp_connect::connect(&target, pin).await?;
     println!(
         "✓ NLA réussie pour {user} ({}, drapeaux 0x{:02x}), certificat SHA-256 {}",
@@ -103,8 +182,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     // PORTIQUE_PROBE_DUMP : enregistre les messages EGFX bruts (longueur u32 + octets) pour le rejeu
     // hors ligne (`gfx-replay`). Contient l'écran : à garder hors du dépôt.
     let mut dump = env("DUMP").map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
-    let mut ignored = std::collections::BTreeMap::<String, u32>::new();
-    let (mut frames, mut avc) = (0u32, 0u32);
+    let mut stats = Stats::default();
     let t0 = std::time::Instant::now();
     let mut deadline: Option<tokio::time::Instant> = None;
     'outer: loop {
@@ -134,6 +212,10 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 m.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                             })
                             .collect();
+                        if let Err(why) = check_layout(&data, &mons) {
+                            println!("  ✗ disposition non envoyée : {why}");
+                            continue;
+                        }
                         let mut p = Vec::new();
                         p.extend_from_slice(&2u32.to_le_bytes());
                         p.extend_from_slice(&((16 + 40 * mons.len()) as u32).to_le_bytes());
@@ -165,35 +247,11 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                 Event::DvcData { channel_id, data }
                     if session.dvc_name(channel_id) == Some(rdp_session::DVC_GRAPHICS) =>
                 {
-                    if let Some(f) = dump.as_mut() {
-                        use std::io::Write;
-                        f.write_all(&(data.len() as u32).to_le_bytes())?;
-                        f.write_all(&data)?;
-                    }
-                    let mut queue: std::collections::VecDeque<rdp_gfx::Out> =
-                        gfx.process(&data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
-                    while let Some(o) = queue.pop_front() {
-                        match o {
-                            rdp_gfx::Out::Send(m) => {
-                                for f in session.dvc_send(channel_id, &m) {
-                                    send(tls, &f).await?;
-                                }
-                            }
-                            rdp_gfx::Out::Present { .. } => frames += 1,
-                            rdp_gfx::Out::Reset { width, height, .. } => {
-                                println!("  EGFX : sortie {width}×{height}")
-                            }
-                            rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {
-                                // Pas de décodeur H.264 natif dans la sonde : image sautée.
-                                avc += 1;
-                                queue.extend(gfx.skip_frame().map_err(|e| anyhow::anyhow!("{e}"))?);
-                            }
-                            rdp_gfx::Out::Ignored(t) => {
-                                *ignored.entry(t.split(" (").next().unwrap_or(&t).to_owned()).or_default() +=
-                                    1
-                            }
-                        }
-                    }
+                    egfx(tls, &session, channel_id, &data, &mut gfx, &mut dump, &mut stats).await?;
+                }
+                // Avant `Connected`, aucun bureau n'a été ouvert : c'est un échec du diagnostic.
+                Event::ServerError(t) | Event::Disconnected(t) if deadline.is_none() => {
+                    bail!("le serveur a interrompu l'ouverture du bureau : {t}")
                 }
                 Event::ServerError(t) => {
                     println!("✗ erreur serveur : {t}");
@@ -204,9 +262,16 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                     break 'outer;
                 }
                 Event::Clipboard(msg) => {
-                    let kind = u16::from_le_bytes([msg[0], msg[1]]);
-                    println!("  {:>6} ms cliprdr ← type {kind} ({} o)", t0.elapsed().as_millis(), msg.len());
-                    for ev in clip.receive(&msg).map_err(|e| anyhow::anyhow!("{e:?}"))? {
+                    // Un message sans en-tête complet peut encore conclure la demande en vol : type facultatif.
+                    let events = clip.receive(&msg).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    let kind = msg.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+                    println!(
+                        "  {:>6} ms cliprdr ← type {} ({} o)",
+                        t0.elapsed().as_millis(),
+                        kind.map_or("?".into(), |k| k.to_string()),
+                        msg.len()
+                    );
+                    for ev in events {
                         match ev {
                             rdp_clip::ClipEvent::Send(m) => {
                                 println!(
@@ -218,6 +283,10 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                     send(tls, &f).await?;
                                 }
                             }
+                            // Contenu du PC demandé seulement pour le test explicite.
+                            rdp_clip::ClipEvent::RemoteChanged(f) if !clip_test => {
+                                println!("  le PC propose {f:?}")
+                            }
                             rdp_clip::ClipEvent::RemoteChanged(f) => {
                                 println!("  le PC propose {f:?}");
                                 for ev in clip.request(&[rdp_clip::ClipFormat::Text]) {
@@ -228,10 +297,23 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                 }
                             }
-                            rdp_clip::ClipEvent::RemoteData(d) => println!("  données du PC : {d:?}"),
+                            // Jamais la valeur (elle peut être un secret copié sur le PC) : sa nature et sa taille.
+                            rdp_clip::ClipEvent::RemoteData(d) => println!(
+                                "  données du PC : {}",
+                                match d {
+                                    None => "aucune (refus ou illisible)".into(),
+                                    Some(rdp_clip::LocalData::Text(t)) =>
+                                        format!("texte, {} caractères", t.chars().count()),
+                                    Some(rdp_clip::LocalData::Html(h)) => format!("HTML, {} o", h.len()),
+                                    Some(rdp_clip::LocalData::Png(p)) => format!("PNG, {} o", p.len()),
+                                    Some(rdp_clip::LocalData::Rgba { width, height, .. }) => {
+                                        format!("image {width}×{height}")
+                                    }
+                                }
+                            ),
                         }
                     }
-                    if env("DRAG").is_some() && !clip_started && kind == 1 {
+                    if env("DRAG").is_some() && !clip_started && kind == Some(1) {
                         clip_started = true;
                         // Win+R puis glisser la boîte Exécuter en cercles : du mouvement continu,
                         // pour voir si Windows passe des zones en H.264.
@@ -273,26 +355,10 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                     if let Event::DvcData { channel_id, ref data } = ev
                                         && session.dvc_name(channel_id) == Some(rdp_session::DVC_GRAPHICS)
                                     {
-                                        let mut q: std::collections::VecDeque<rdp_gfx::Out> =
-                                            gfx.process(data).map_err(|e| anyhow::anyhow!("{e}"))?.into();
-                                        while let Some(o) = q.pop_front() {
-                                            match o {
-                                                rdp_gfx::Out::Send(m) => {
-                                                    for fr in session.dvc_send(channel_id, &m) {
-                                                        send(tls, &fr).await?;
-                                                    }
-                                                }
-                                                rdp_gfx::Out::Avc420 { .. } | rdp_gfx::Out::Avc444 { .. } => {
-                                                    avc += 1;
-                                                    q.extend(
-                                                        gfx.skip_frame()
-                                                            .map_err(|e| anyhow::anyhow!("{e}"))?,
-                                                    );
-                                                }
-                                                rdp_gfx::Out::Present { .. } => frames += 1,
-                                                _ => {}
-                                            }
-                                        }
+                                        egfx(
+                                            tls, &session, channel_id, data, &mut gfx, &mut dump, &mut stats,
+                                        )
+                                        .await?;
                                     } else if let Event::Send(b) = ev {
                                         send(tls, &b).await?;
                                     }
@@ -302,9 +368,9 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                         send(tls, &session.input(&[Input::Mouse { flags: ptr::BUTTON1, x, y }])).await?;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         send(tls, &session.input(&[k(0x01, false, false), k(0x01, false, true)])).await?;
-                        println!("  glisser terminé : {frames} images, {avc} H.264");
+                        println!("  glisser terminé : {} images, {} H.264", stats.frames, stats.avc);
                     }
-                    if clip_test && !clip_started && kind == 1 {
+                    if clip_test && !clip_started && kind == Some(1) {
                         clip_started = true;
                         // Win+R, « abc », Ctrl+A, Ctrl+C (scancodes), avec des pauses.
                         use rdp_pdu::fastpath::{Input, kbd};
@@ -373,8 +439,8 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-    println!("  {frames} images rendues, {avc} images H.264 sautées en {seconds} s");
-    for (k, n) in &ignored {
+    println!("  {} images rendues, {} images H.264 sautées en {seconds} s", stats.frames, stats.avc);
+    for (k, n) in &stats.ignored {
         println!("  ignoré ×{n} : {k}");
     }
     if clip_test {
@@ -394,4 +460,32 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
         println!("  capture : {path}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_validated_before_slicing() {
+        assert!(parse_pin("abc").is_err());
+        assert!(parse_pin(&"é".repeat(32)).is_err());
+        assert!(parse_pin(&"zz".repeat(32)).is_err());
+        assert_eq!(parse_pin(&"0f".repeat(32)).unwrap(), [0x0F; 32]);
+    }
+
+    #[test]
+    fn layout_checked_against_display_control_caps() {
+        // DISPLAYCONTROL_CAPS_PDU : type 5, longueur 20, 1 écran, facteurs 3840 × 2160.
+        let caps: Vec<u8> = [5u32, 20, 1, 3840, 2160].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(check_layout(&caps, &[(1920, 1080)]).is_ok());
+        assert!(check_layout(&caps, &[(1920, 1080), (1280, 1024)]).is_err(), "un seul écran permis");
+        assert!(check_layout(&caps, &[(1921, 1080)]).is_err(), "largeur impaire");
+        assert!(check_layout(&caps, &[(100, 1080)]).is_err());
+        assert!(check_layout(&caps[..12], &[(1920, 1080)]).is_err());
+        let caps: Vec<u8> = [5u32, 20, 2, 1000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(check_layout(&caps, &[(1920, 1080), (1920, 1080)]).is_err(), "aire totale dépassée");
+        let caps: Vec<u8> = [5u32, 20, 16, 1 << 30, 1 << 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(check_layout(&caps, &[(1920, 1080)]).is_ok(), "produit de 2^64");
+    }
 }

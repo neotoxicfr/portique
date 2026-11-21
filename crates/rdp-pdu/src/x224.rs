@@ -120,15 +120,18 @@ pub fn connection_confirm(frame: &[u8]) -> Result<ConnectionConfirm, Error> {
         return Err(Error::Invalid("X.224 Connection Confirm attendu"));
     }
     r.skip(5, "X.224")?;
-    if r.remaining() < 8 {
+    if r.remaining() == 0 {
         // Pas de RDP_NEG_RSP : vieux serveur, sécurité RDP standard.
         return Ok(ConnectionConfirm { selected_protocol: protocol::RDP, flags: 0 });
     }
+    // Une réponse présente mais incomplète est tronquée, pas absente.
     let kind = r.u8("RDP_NEG")?;
     let flags = r.u8("RDP_NEG")?;
     r.skip(2, "RDP_NEG")?;
     let value = r.u32_le("RDP_NEG")?;
     match kind {
+        // selectedProtocol : un seul protocole (2.2.1.2.1).
+        0x02 if value.count_ones() > 1 => Err(Error::Invalid("RDP_NEG_RSP : plusieurs protocoles retenus")),
         0x02 => Ok(ConnectionConfirm { selected_protocol: value, flags }),
         0x03 => Err(Error::NegotiationFailure(value)),
         _ => Err(Error::Invalid("RDP_NEG inconnu")),
@@ -140,9 +143,9 @@ pub fn negotiation_failure_text(code: u32) -> &'static str {
         0x1 => "le serveur exige TLS",
         0x2 => "le serveur n'accepte pas TLS (certificat absent ?)",
         0x3 => "le serveur n'a pas de certificat utilisable",
-        0x4 => "chiffrement RDP standard refusé",
+        0x4 => "protocoles demandés incompatibles avec la sécurité déjà en place",
         0x5 => "le serveur exige NLA (CredSSP)",
-        0x6 => "le serveur exige TLS avec certificat",
+        0x6 => "le serveur exige TLS avec un certificat client",
         _ => "refus de négociation inconnu",
     }
 }
@@ -181,6 +184,14 @@ mod tests {
         fail[11] = 0x03;
         fail[15] = 0x05;
         assert_eq!(connection_confirm(&fail), Err(Error::NegotiationFailure(5)));
+        // RDP_NEG_RSP entamée puis coupée : tronquée, pas « sans négociation ».
+        for cut in 12..rsp.len() {
+            assert_eq!(connection_confirm(&hybrid[..cut]), Err(Error::Truncated("RDP_NEG")), "{cut} octets");
+        }
+        assert_eq!(connection_confirm(&hybrid[..11]).unwrap().selected_protocol, protocol::RDP);
+        let mut both = hybrid;
+        both[15] = (protocol::HYBRID | protocol::HYBRID_EX) as u8;
+        assert!(matches!(connection_confirm(&both), Err(Error::Invalid(_))));
     }
 
     #[test]

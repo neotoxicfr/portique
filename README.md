@@ -10,7 +10,7 @@
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Images](https://img.shields.io/badge/images-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.3.0-green)
+![Version](https://img.shields.io/badge/version-v0.4.0-green)
 
 </div>
 
@@ -52,6 +52,8 @@ navigateur côté client, ordinateur ou téléphone.
   fenêtre par écran) ; plein écran avec capture du clavier (Alt+Tab, touche Windows) ; Ctrl+Alt+Suppr.
 - Reconnexion automatique ; ouverture rapide même sur un lien lointain (jointure des canaux évitée quand
   Windows le permet).
+- **Sur iPhone et iPad** : bouton clavier (texte, saisie IME, coller), toucher pour cliquer, appui long pour le
+  clic droit, deux doigts pour défiler, pincer pour zoomer la vue.
 - **Wake-on-LAN** : paquet magique direct, ou commande lancée par un hôte SSH du réseau du PC (un routeur, par
   exemple), indispensable à travers un VPN.
 - Préparation du PC **sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
@@ -70,12 +72,14 @@ navigateur côté client, ordinateur ou téléphone.
 
 - Comptes intégrés : mot de passe Argon2id, TOTP, passkeys ; rôles admin et utilisateur ; accès par machine.
 - Ou **mode proxy** : Authelia, Authentik… devant, connexion intégrée désactivée, comptes créés à la volée.
-- Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur.
+- Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur, en clair et en
+  sombre selon l'appareil : une carte par machine, trois boutons toujours à la même place (Terminal, Bureau,
+  Réveil).
 
 <p align="center">
   <img src="docs/images/accueil-mobile.png" width="24%" alt="Accueil sur téléphone">
   <img src="docs/images/terminal-mobile.png" width="24%" alt="Terminal et barre de touches sur téléphone">
-  <img src="docs/images/connexion.png" width="49%" alt="Écran de connexion">
+  <img src="docs/images/accueil-sombre.png" width="49%" alt="Accueil en thème sombre">
 </p>
 
 ## Démarrer
@@ -83,10 +87,49 @@ navigateur côté client, ordinateur ou téléphone.
 ### 1. Lancer le conteneur
 
 ```sh
-mkdir -p portique/secrets && cd portique
-openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
-printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password
+mkdir -p portique && cd portique
+(umask 077; mkdir -p secrets data                   # rien de lisible par un autre compte
+ if [ ! -s secrets/master_key ]; then               # jamais régénérée : la base en dépend
+   sudo test -e data/portique.db && { echo "base existante : restaure secrets/master_key" >&2; exit 1; }
+   openssl rand -base64 32 > secrets/master_key     # chiffre les identifiants en base
+ fi
+ [ -s secrets/admin_password ] ||
+   openssl rand -base64 18 > secrets/admin_password) && # mot de passe du premier compte admin
+sudo chmod 700 secrets data &&                      # aussi si les dossiers existaient déjà
+sudo chmod 400 secrets/* && sudo cat secrets/admin_password && # à noter : il sert à la première connexion
+sudo chown 10001:10001 data secrets/*               # le conteneur tourne sous l'UID 10001
 ```
+
+Sur une installation existante, ces commandes gardent les secrets en place (et se relancent sans erreur) : une
+nouvelle clé ne déchiffrerait plus les identifiants enregistrés, d'où l'arrêt si la clé manque alors que la base
+existe (restaure-la d'une sauvegarde) ; `admin_password` ne sert qu'au premier démarrage (base sans admin), le
+modifier ensuite ne change rien au compte. Mot de passe admin perdu : un autre admin le remet dans **Admin**.
+Sinon, conteneur arrêté, retire les droits admin, puis remets à zéro la double authentification du compte
+`admin` (TOTP ou passkey perdus) et ferme ses sessions (un cookie volé ne doit pas retrouver le rôle admin),
+depuis un conteneur jetable (ses UID sont remappés
+comme ceux de Portique, Docker rootless et `userns-remap` compris ; le `chown` final rend la base à l'UID 10001) :
+
+```sh
+docker run --rm -v "$PWD/data:/data" alpine:3.20 sh -c \
+  'apk add -q sqlite && sqlite3 /data/portique.db "BEGIN;
+     UPDATE users SET is_admin = 0;
+     UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0 WHERE username = '\''admin'\'';
+     DELETE FROM passkeys WHERE user_id = (SELECT id FROM users WHERE username = '\''admin'\'');
+     DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = '\''admin'\'');
+     COMMIT;" && chown 10001:10001 /data/portique.db*'
+```
+
+Remplace ensuite
+`secrets/admin_password` (avec `sudo`) et redémarre : le compte `admin` reçoit ce mot de passe et redevient
+admin ; réactive sa double authentification dans **Compte**, puis rends leurs droits aux autres comptes dans
+**Admin**.
+
+L'UID 10001 ne doit être celui d'aucun compte de l'hôte : ce compte lirait la clé et la base. S'il est pris,
+isole le conteneur avec `userns-remap`.
+
+Avec Docker rootless ou `userns-remap`, l'UID 10001 du conteneur correspond à un autre UID de l'hôte : donne
+`data` et les secrets au début de ta plage `/etc/subuid` + 10000 en rootless, + 10001 avec `userns-remap`
+(même calcul pour le GID avec `/etc/subgid`).
 
 ```yaml
 # docker-compose.yml
@@ -109,14 +152,14 @@ secrets:
   admin_password: { file: ./secrets/admin_password }
 ```
 
-Place-le derrière un reverse proxy HTTPS : passkeys, presse-papier et WebCodecs exigent un contexte sécurisé.
+Puis `docker compose up -d`. Place-le derrière un reverse proxy HTTPS : passkeys, presse-papier et WebCodecs exigent un contexte sécurisé.
 Un exemple complet (Traefik, Authelia, conteneur dans le réseau d'un tunnel WireGuard) est dans
 [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml). Pour construire l'image toi-même :
 `docker build -t portique .`
 
 ### 2. Ajouter des machines
 
-Connecte-toi en `admin`, active un TOTP ou une passkey dans **Compte** (le SSH l'exige), puis ajoute tes
+Connecte-toi en `admin` avec le mot de passe affiché à l'étape 1, change-le dans **Compte**, active un TOTP ou une passkey dans **Compte** (le SSH l'exige), puis ajoute tes
 machines dans **Admin** : RDP, SSH ou les deux. Pour le SSH, la page Admin donne la ligne `authorized_keys` de
 la clé du service, à ajouter sur chaque hôte.
 
@@ -155,7 +198,8 @@ tu utilises le SSH.
 
 **Haute disponibilité.** Portique ne gère pas plusieurs instances : chacune a sa base. Pour une instance de
 secours, laisse le reverse proxy basculer (par exemple un service `failover` de Traefik, healthcheck sur
-`/api/info`).
+`/api/info`). Rien n'est répliqué : l'instance de secours se prépare à part, avec sa clé maîtresse, ses
+comptes (ou le mode proxy), ses machines et ses approbations de certificats et de clés d'hôte.
 
 ## Sécurité
 
@@ -208,20 +252,25 @@ séquence de connexion et les comportements mesurés sur Windows : [`docs/rdp-co
 
 ## Développer
 
-Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl` et `openssl`
-(xterm.js est téléchargé et vérifié au build).
+Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl`, `openssl` et
+`flock` (xterm.js est téléchargé et vérifié au build ; détail dans [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ```sh
 ./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
 (cd crates/web && trunk build --release --dist ../../dist)
+(umask 077; mkdir -p secrets; [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key)
+chmod 600 secrets/master_key             # clé stable : ./data en dépend
 PORTIQUE_PUBLIC_URL=http://localhost:18431 PORTIQUE_LISTEN=127.0.0.1:18431 PORTIQUE_DATA_DIR=./data \
-PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY=$(openssl rand -base64 32) \
+PORTIQUE_STATIC_DIR=./dist PORTIQUE_INSECURE_COOKIES=1 PORTIQUE_MASTER_KEY_FILE=secrets/master_key \
 PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 
-Les images amd64 et arm64 se construisent en natif (`scripts/build-image.sh`, sans émulation) ; les versions se
-publient par `scripts/release.sh X.Y.Z`. Les contributions sont bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md),
-[code de conduite](CODE_OF_CONDUCT.md).
+Les images amd64 et arm64 se construisent en natif, sans émulation : runners GitHub des deux architectures pour
+les releases, `scripts/build-image.sh` pour l'image `dev`. Une version se publie depuis `main` : version de
+`Cargo.toml` et entrée `## [vX.Y.Z]` de `CHANGELOG.md` à jour, notes rédigées à la main dans un fichier (par
+défaut `.audit/release-vX.Y.Z.md`, ignoré par Git), puis `scripts/release.sh X.Y.Z [chemin/notes.md]` :
+contrôles, tag poussé, release créée par le workflow, puis notes posées dessus. Les contributions sont
+bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md), [code de conduite](CODE_OF_CONDUCT.md).
 
 ## Feuille de route
 

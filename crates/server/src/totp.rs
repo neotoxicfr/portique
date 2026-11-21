@@ -9,7 +9,7 @@ pub fn new_secret() -> Vec<u8> {
     crate::crypto::random_bytes::<20>().to_vec()
 }
 
-fn build(secret: &[u8], account: &str) -> anyhow::Result<Totp> {
+pub(crate) fn build(secret: &[u8], account: &str) -> anyhow::Result<Totp> {
     Builder::new()
         .with_algorithm(Algorithm::SHA1)
         .with_digits(6)

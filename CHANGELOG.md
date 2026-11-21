@@ -2,7 +2,30 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
-## [Non publié]
+## [v0.4.0] - 2026-11-21
+
+### Ajouté
+
+- **Nouvelle interface** dans l'esprit des apps système d'Apple : couleurs système, fonds groupés, barres
+  translucides, pastilles façon icône d'app, interrupteurs ; clair et sombre selon l'appareil.
+- **Accueil** : une carte de taille fixe par machine, trois emplacements d'icônes fixes (Terminal, Bureau,
+  Réveil) ; une fonction absente laisse un rond vide. Hôtes au thème « alerte » en rouge. Recherche.
+- **RDP sur iPhone et iPad** : bouton clavier (texte, Retour arrière, Entrée, Suppr, coller, saisie IME),
+  gestes (toucher = clic, appui long = clic droit, glisser, deux doigts = molette, pincer = zoom local).
+- **Admin** en vue partagée (liste et éditeur côte à côte) ; route dédiée de remise à zéro de la 2FA
+  (`POST /api/admin/users/{id}/reset-2fa`) qui ne touche jamais au rôle.
+- CI et releases sur GitHub Actions (images amd64 et arm64 construites en natif), tests natifs du front en CI.
+
+### Modifié
+
+- Navigation en contrôle segmenté sur ordinateur, barre d'onglets en bas sur téléphone ; déconnexion en icône ;
+  plus aucun texte de remplissage.
+- Compte et admin en groupes façon Réglages ; terminal avec barre fine, barre de touches et alerte de clé
+  d'hôte façon iOS.
+- PWA : zones sûres respectées, couleur de barre claire et sombre, nouvelle icône (variante adaptative plein
+  cadre), page hors ligne dès le premier lancement.
+- L'API des connexions expose `alert` ; le champ `reset_2fa` de la mise à jour d'un compte est retiré.
+- Les scripts « Préparer un PC » contrôlent chaque étape et gardent des fins de ligne Windows.
 
 ### Sécurité
 
@@ -10,6 +33,33 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   session ouverte avec lui. Un compte à passkey seule se connecte encore au mot de passe, et ce mot de passe
   suffisait à enrôler un nouveau facteur, puis à ouvrir le SSH.
 - La remise à zéro de la double authentification par un admin coupe les sessions du compte.
+- Pas TOTP consommé de façon atomique et lié à la graine vérifiée ; preuve de connexion revérifiée à la
+  création de la session ; un changement de mot de passe ne peut plus écraser une remise à zéro simultanée ;
+  un admin rétrogradé ne peut plus finir de créer ou promouvoir un compte.
+- Limitation des tentatives réservée avant tout travail coûteux, IPv6 comptée par /64, défis passkey plafonnés
+  sans bloquer tout le monde, identifiants de passkeys, de comptes et de machines jamais réattribués
+  (migrations 0007 et 0008 : sauvegarder `/data` avant la mise à jour).
+- Une confirmation TOTP ou une passkey inscrite pendant une remise à zéro de la 2FA ne la réactive plus ; le
+  compteur de signature d'une passkey ne recule plus ; les identifiants comptent sans casse pour la limitation.
+- Activer ou couper le TOTP et supprimer une passkey exigent une session encore ouverte au moment de l'écriture :
+  déconnecter tout le monde (changement de mot de passe) arrête aussi une configuration TOTP lancée par un tiers.
+  Une preuve de connexion révoquée en cours de route répond 409 avec son propre message, plus « mauvais mot de passe ».
+- NTLM exige 128 bits, signature et chiffrement ; Argon2 hors des workers de requêtes ; attentes SSH et WoL
+  bornées.
+
+### Corrigé
+
+- Revue complète du code par CodeRabbit : trames RDP malformées refusées (X.224, fast-path, MCS, licence,
+  capacités, canaux virtuels, tuiles progressives), presse-papier fiabilisé dans les deux sens (accusé par
+  annonce, réponses tardives jetées, repli DIB), redirection de ferme et identifiants trop longs signalés
+  clairement, relais RDP vidé après chaque écriture.
+- Session : refus durable (accès, identifiants, certificat changé) sans reconnexion en boucle, échec passager
+  toujours reconnecté ; boutons relâchés à l'annulation d'un geste et suivis par fenêtre ; dispositions
+  multi-écran validées avant d'ouvrir les fenêtres, extension annulée si Windows ne la confirme pas ; bureau,
+  clavier et menu inactifs derrière une alerte, de même pour le terminal SSH ; trafic des canaux retenu pendant
+  une suspension (SUSPEND/RESUME) ; le bureau suit encore la fenêtre quand le PC ignore des demandes de taille.
+- PWA : ouvrir un fichier (icône…) ne remplace plus la page hors ligne. Préparation du PC : un nouvel essai après
+  une annulation ratée ne touche plus au réveil d'une autre carte réseau.
 
 ## [v0.3.0] - 2026-11-20
 

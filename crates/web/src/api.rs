@@ -70,13 +70,30 @@ pub async fn send<B: Serialize, T: DeserializeOwned>(method: &str, url: &str, bo
 
 /// Requête dont la réponse n'a pas de corps utile.
 pub async fn send_empty<B: Serialize>(method: &str, url: &str, body: Option<&B>) -> Result<()> {
-    let b = builder(method, url);
+    send_empty_abortable(method, url, body, None).await
+}
+
+/// `send_empty` dont `signal` abandonne l'attente : une réponse pas encore reçue n'est plus livrée à l'appelant
+/// ni appliquée par le navigateur (cookies compris). Rien n'est défait de ce qui a déjà eu lieu : le serveur a pu
+/// traiter la requête, et une réponse déjà reçue a pu poser ses cookies.
+pub async fn send_empty_abortable<B: Serialize>(
+    method: &str,
+    url: &str,
+    body: Option<&B>,
+    signal: Option<&web_sys::AbortSignal>,
+) -> Result<()> {
+    let b = builder(method, url).abort_signal(signal);
     let res = match body {
         Some(body) => b.json(body).map_err(net)?.send().await,
         None => b.send().await,
     }
     .map_err(net)?;
     check(res).await.map(|_| ())
+}
+
+/// `fut` borné à 15 s : l'expiration rend une erreur, par le même chemin de fin qu'une panne réseau.
+pub async fn bounded<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    crate::within(15_000, fut).await.unwrap_or_else(|| Err(Error::Message("le serveur ne répond pas".into())))
 }
 
 fn credentials() -> Result<web_sys::CredentialsContainer> {

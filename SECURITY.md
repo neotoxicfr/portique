@@ -4,7 +4,8 @@
 
 | Version | Correctifs de sécurité |
 |---|---|
-| 0.1.x | oui |
+| 0.4.x | oui |
+| < 0.4 | non : mets à jour vers la dernière version |
 
 ## Signaler une faille
 

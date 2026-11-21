@@ -57,8 +57,18 @@ fn header(out: &mut Vec<u8>, kind: u16, body_len: usize) {
     out.extend_from_slice(&((body_len + 4) as u16).to_le_bytes());
 }
 
+/// Chaîne UTF-16LE dans un champ fixe, terminateur compris ; tronquée caractère par caractère
+/// pour ne jamais couper une paire de substitution.
 fn fixed_utf16(s: &str, bytes: usize) -> Vec<u8> {
-    let mut v: Vec<u8> = s.encode_utf16().take(bytes / 2 - 1).flat_map(u16::to_le_bytes).collect();
+    let mut v = Vec::with_capacity(bytes);
+    for c in s.chars() {
+        let mut units = [0u16; 2];
+        let units = c.encode_utf16(&mut units);
+        if v.len() + units.len() * 2 > bytes - 2 {
+            break;
+        }
+        v.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+    }
     v.resize(bytes, 0);
     v
 }
@@ -82,7 +92,9 @@ impl ClientData {
         core.extend_from_slice(&0xCA01u16.to_le_bytes()); // postBeta2ColorDepth
         core.extend_from_slice(&1u16.to_le_bytes()); // clientProductId
         core.extend_from_slice(&0u32.to_le_bytes()); // serialNumber
-        core.extend_from_slice(&32u16.to_le_bytes()); // highColorDepth
+        // highColorDepth : 32 n'y existe pas ; 24 en repli, le 32 bpp se demande par
+        // RNS_UD_CS_WANT_32BPP_SESSION dans earlyCapabilityFlags (2.2.1.3.2).
+        core.extend_from_slice(&24u16.to_le_bytes());
         core.extend_from_slice(&0x000Fu16.to_le_bytes()); // supportedColorDepths : 24/16/15/32
         core.extend_from_slice(&c.early_capability_flags.to_le_bytes());
         core.extend_from_slice(&[0; 64]); // clientDigProductId
@@ -98,6 +110,8 @@ impl ClientData {
         header(&mut out, 0xC002, 8);
         out.extend_from_slice(&[0; 8]);
 
+        // 31 canaux statiques au plus (2.2.1.3.4) ; la liste vient du code, pas du réseau.
+        assert!(self.channels.len() <= 31, "plus de 31 canaux statiques");
         let mut net = Vec::new();
         net.extend_from_slice(&(self.channels.len() as u32).to_le_bytes());
         for ch in &self.channels {
@@ -140,6 +154,9 @@ pub mod server_early_caps {
 impl ServerData {
     pub fn parse(mut buf: &[u8]) -> Result<Self, Error> {
         let mut d = ServerData::default();
+        // SC_CORE, SC_SECURITY et SC_NET sont obligatoires (2.2.1.4) : leur absence ne se
+        // déduit pas de valeurs nulles.
+        let (mut core, mut security, mut net) = (false, false, false);
         while buf.len() >= 4 {
             let kind = u16::from_le_bytes([buf[0], buf[1]]);
             let len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
@@ -149,6 +166,7 @@ impl ServerData {
             let mut r = Reader::new(&buf[4..len]);
             match kind {
                 0x0C01 => {
+                    core = true;
                     d.version = r.u32_le("SC_CORE")?;
                     if r.remaining() >= 4 {
                         d.client_requested_protocols = Some(r.u32_le("SC_CORE")?);
@@ -158,10 +176,12 @@ impl ServerData {
                     }
                 }
                 0x0C02 => {
+                    security = true;
                     d.encryption_method = r.u32_le("SC_SECURITY")?;
                     d.encryption_level = r.u32_le("SC_SECURITY")?;
                 }
                 0x0C03 => {
+                    net = true;
                     d.io_channel = r.u16_le("SC_NET")?;
                     let n = r.u16_le("SC_NET")?;
                     for _ in 0..n {
@@ -174,10 +194,12 @@ impl ServerData {
             }
             buf = &buf[len..];
         }
-        if d.version == 0 {
-            return Err(Error::Invalid("bloc SC_CORE absent"));
+        match (core, security, net) {
+            (false, _, _) => Err(Error::Invalid("bloc SC_CORE absent")),
+            (_, false, _) => Err(Error::Invalid("bloc SC_SECURITY absent")),
+            (_, _, false) => Err(Error::Invalid("bloc SC_NET absent")),
+            _ => Ok(d),
         }
-        Ok(d)
     }
 }
 
@@ -220,6 +242,23 @@ mod tests {
         assert_eq!(d.client_requested_protocols, Some(0));
         assert_eq!(d.io_channel, 1003);
         assert_eq!(d.channel_ids, [1004, 1005, 1006]);
+        // Chaque bloc obligatoire retiré à son tour : SC_CORE (0..12), SC_NET (12..28), SC_SECURITY.
+        for (range, block) in [(0..12, "SC_CORE"), (12..28, "SC_NET"), (28..40, "SC_SECURITY")] {
+            let mut b = blocks.to_vec();
+            b.drain(range);
+            assert!(matches!(ServerData::parse(&b), Err(Error::Invalid(m)) if m.contains(block)), "{block}");
+        }
+    }
+
+    #[test]
+    fn client_name_keeps_surrogate_pairs_whole() {
+        let v = fixed_utf16("abcdefghijklmn😀", 32);
+        assert_eq!(v.len(), 32);
+        let units: Vec<u16> = v.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(String::from_utf16(&units).unwrap().trim_end_matches('\0'), "abcdefghijklmn");
+        let v = fixed_utf16("abcdefghijklm😀z", 32);
+        let units: Vec<u16> = v.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(String::from_utf16(&units).unwrap().trim_end_matches('\0'), "abcdefghijklm😀");
     }
 
     #[test]
@@ -232,7 +271,7 @@ mod tests {
                 keyboard_layout: 0x040C,
                 client_build: 1,
                 client_name: "portique".into(),
-                early_capability_flags: early_caps::SUPPORT_ERRINFO_PDU,
+                early_capability_flags: early_caps::SUPPORT_ERRINFO_PDU | early_caps::WANT_32BPP_SESSION,
                 selected_protocol: 2,
             },
             channels: alloc::vec![Channel { name: "cliprdr", options: channel_opts::INITIALIZED }],
@@ -241,5 +280,8 @@ mod tests {
         // CS_CORE complet jusqu'à serverSelectedProtocol : 216 octets avec l'en-tête.
         assert_eq!(u16::from_le_bytes([enc[2], enc[3]]), 216);
         assert_eq!(&enc[216..218], &0xC002u16.to_le_bytes());
+        // highColorDepth = 24 (HIGH_COLOR_24BPP), le 32 bpp passe par earlyCapabilityFlags.
+        assert_eq!(u16::from_le_bytes([enc[140], enc[141]]), 24);
+        assert_ne!(u16::from_le_bytes([enc[144], enc[145]]) & early_caps::WANT_32BPP_SESSION, 0);
     }
 }

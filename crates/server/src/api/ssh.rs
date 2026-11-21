@@ -45,6 +45,8 @@ pub async fn service_key(State(state): State<AppState>, _: AdminUser) -> ApiResu
 /// La clé du service ouvre toutes les machines : en mode intégré, la session doit avoir été ouverte
 /// avec un second facteur (TOTP ou passkey) ; avoir une 2FA enregistrée ne suffit pas (un mot de passe
 /// volé permettrait d'en enregistrer une). En mode proxy, c'est au proxy d'exiger la 2FA.
+/// Exception voulue : le réveil par un hôte SSH (`connections::wake`), qui ne lance que la commande de
+/// l'admin avec une MAC de la base.
 pub(crate) async fn session_has_mfa(
     state: &AppState,
     user: &UserRow,
@@ -54,12 +56,13 @@ pub(crate) async fn session_has_mfa(
         return Ok(true);
     }
     let Some(token) = token else { return Ok(false) };
-    let mfa: Option<bool> =
-        sqlx::query_scalar("SELECT mfa FROM sessions WHERE token_hash = ? AND user_id = ?")
-            .bind(token)
-            .bind(user.id)
-            .fetch_optional(&state.db)
-            .await?;
+    let mfa: Option<bool> = sqlx::query_scalar(
+        "SELECT mfa FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at >= unixepoch()",
+    )
+    .bind(token)
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
     Ok(mfa == Some(true))
 }
 
@@ -95,6 +98,11 @@ pub async fn open(
         }
     }))
 }
+
+/// Durée maximale d'ouverture de toute la chaîne, shell compris.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Octets reçus du navigateur pendant l'ouverture, gardés pour l'hôte.
+const MAX_PENDING: usize = 64 * 1024;
 
 type Prepared = (Vec<Hop>, Option<String>, Option<(i64, String)>);
 
@@ -173,6 +181,32 @@ async fn send(socket: &mut WebSocket, msg: &SshMessage) {
     }
 }
 
+/// Épingle les clés d'hôte approuvées à cette ouverture, si l'adresse et le port du saut n'ont pas changé
+/// depuis sa lecture : sinon la clé de l'ancien hôte serait épinglée sur le nouveau.
+async fn pin(state: &AppState, user: &UserRow, hops: &[Hop], pinned: &[(i64, String)]) {
+    for (id, fp) in pinned {
+        let Some(hop) = hops.iter().find(|h| h.id == *id) else { continue };
+        let done = sqlx::query(
+            "UPDATE connections SET ssh_hostkey = ? WHERE id = ? AND ssh_hostkey IS NULL AND host = ? AND ssh_port = ?",
+        )
+        .bind(fp)
+        .bind(id)
+        .bind(&hop.host)
+        .bind(i64::from(hop.port))
+        .execute(&state.db)
+        .await
+        .is_ok_and(|r| r.rows_affected() == 1);
+        if done {
+            tracing::info!(
+                user = user.username,
+                host = id,
+                fingerprint = fp,
+                "clé SSH d'hôte approuvée et épinglée"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     state: AppState,
@@ -194,9 +228,49 @@ async fn run(
     let started = Instant::now();
     tracing::info!(user = user.username, %ip, connection = target.1, hops = hops.len(), "ouverture SSH");
     let trust_ref = trust.as_ref().map(|(id, fp)| (*id, fp.as_str()));
-    let opened = match ssh::open(&hops, &key, trust_ref, cols, rows).await {
+    // Ouverture bornée dans le temps et abandonnée si l'onglet se ferme : sinon la tâche et les connexions
+    // de la chaîne resteraient pendues sur un hôte muet, à chaque nouvelle tentative.
+    // Ce que le navigateur envoie entre-temps (saisie, redimensionnement) est gardé pour l'hôte ; au-delà
+    // de `MAX_PENDING`, l'ouverture échoue plutôt que de perdre une partie de la saisie.
+    let opening = tokio::time::timeout(OPEN_TIMEOUT, ssh::open(&hops, &key, trust_ref, cols, rows));
+    let mut pending = Vec::new();
+    // Fin de l'attente côté navigateur : `true` si la saisie dépasse la limite, `false` si l'onglet se ferme.
+    let gone = async {
+        let mut kept = 0;
+        while let Some(Ok(msg)) = socket.recv().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+            // Chaque message coûte au moins 64 octets : des messages vides ne font pas grossir la file sans fin.
+            kept += 64
+                + match &msg {
+                    Message::Binary(b) => b.len(),
+                    Message::Text(t) => t.len(),
+                    _ => 0,
+                };
+            if kept > MAX_PENDING {
+                return true;
+            }
+            pending.push(Ok::<_, axum::Error>(msg));
+        }
+        false
+    };
+    let opened = tokio::select! {
+        r = opening => r.unwrap_or_else(|_| Err(anyhow::anyhow!("ouverture SSH trop longue (délai dépassé)").into())),
+        overflow = gone => {
+            if overflow {
+                tracing::info!(user = user.username, connection = target.1, "saisie trop abondante pendant l'ouverture SSH");
+                let message = "trop de saisie pendant l'ouverture du terminal, rien n'a été envoyé : réessaie".into();
+                return send(&mut socket, &fail(message)).await;
+            }
+            tracing::info!(user = user.username, connection = target.1, "onglet fermé pendant l'ouverture SSH");
+            return;
+        }
+    };
+    let opened = match opened {
         Ok(o) => o,
-        Err(OpenError::Unapproved { id, name, fingerprint }) => {
+        Err(OpenError::Unapproved { id, name, fingerprint, pinned }) => {
+            pin(&state, &user, &hops, &pinned).await;
             let msg = SshMessage::UntrustedHostKey {
                 connection_id: id,
                 name,
@@ -212,19 +286,7 @@ async fn run(
             return send(&mut socket, &fail(format!("{e:#}"))).await;
         }
     };
-    for (id, fp) in &opened.pinned {
-        let _ = sqlx::query("UPDATE connections SET ssh_hostkey = ? WHERE id = ? AND ssh_hostkey IS NULL")
-            .bind(fp)
-            .bind(id)
-            .execute(&state.db)
-            .await;
-        tracing::info!(
-            user = user.username,
-            host = id,
-            fingerprint = fp,
-            "clé SSH d'hôte approuvée et épinglée"
-        );
-    }
+    pin(&state, &user, &hops, &opened.pinned).await;
     let prefs = terminal_prefs(&state.db, user.id).await.unwrap_or_else(|_| portique_proto::TerminalPrefs {
         theme: portique_proto::TERMINAL_THEMES[0].into(),
         combos: portique_proto::DEFAULT_COMBOS.iter().map(|c| (*c).into()).collect(),
@@ -238,12 +300,16 @@ async fn run(
         },
     )
     .await;
+    if !opened.early.is_empty() {
+        let _ = socket.send(Message::Binary(opened.early.into())).await;
+    }
 
     let _sessions = opened.sessions;
     let (mut from_host, to_host) = opened.channel.split();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let upstream = async {
-        while let Some(Ok(msg)) = ws_rx.next().await {
+        let mut incoming = futures_util::stream::iter(pending).chain(&mut ws_rx);
+        while let Some(Ok(msg)) = incoming.next().await {
             match msg {
                 Message::Binary(b) => {
                     if to_host.data(&b[..]).await.is_err() {
@@ -270,7 +336,8 @@ async fn run(
                         break;
                     }
                 }
-                ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitStatus { .. } => break,
+                // Pas `ExitStatus` : la fin du processus peut précéder ses derniers octets.
+                ChannelMsg::Eof | ChannelMsg::Close => break,
                 _ => {}
             }
         }
@@ -281,7 +348,7 @@ async fn run(
         tick.tick().await;
         loop {
             tick.tick().await;
-            if !still_allowed(&state, user.id, target.0, token.as_deref()).await {
+            if !still_allowed(&state, user.id, target.0, token.as_deref(), |r| r.ssh_enabled).await {
                 tracing::info!(user = user.username, connection = target.1, "session révoquée : coupure SSH");
                 break;
             }
@@ -301,7 +368,7 @@ async fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::session_has_mfa;
     use crate::config::{Config, Env};
 
@@ -312,7 +379,8 @@ mod tests {
         }
     }
 
-    async fn state(mode: &'static str) -> crate::state::AppState {
+    /// État complet sur une base en mémoire, compte `admin` créé (servi aussi aux tests des autres modules).
+    pub(crate) async fn state(mode: &'static str) -> crate::state::AppState {
         let mut env = vec![
             ("PORTIQUE_PUBLIC_URL", "https://portique.example.com"),
             ("PORTIQUE_MASTER_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="), // gitleaks:allow (octets 0..31, factice)
@@ -348,6 +416,12 @@ mod tests {
         assert!(session_has_mfa(&s, &user, Some(b"avec")).await.unwrap());
         assert!(!session_has_mfa(&s, &user, None).await.unwrap(), "pas de session : refusé");
         assert!(!session_has_mfa(&s, &user, Some(b"inconnue")).await.unwrap());
+        sqlx::query("UPDATE sessions SET expires_at = unixepoch() - 1 WHERE token_hash = ?")
+            .bind(b"avec".as_slice())
+            .execute(&s.db)
+            .await
+            .unwrap();
+        assert!(!session_has_mfa(&s, &user, Some(b"avec")).await.unwrap(), "session expirée : refusée");
         // Mode proxy : la 2FA est l'affaire du proxy.
         let p = state("proxy").await;
         assert!(session_has_mfa(&p, &user, None).await.unwrap());

@@ -1,5 +1,7 @@
 # Exemple : portique derrière Traefik + Authelia (mode proxy), dans l'espace réseau d'un conteneur
 # WireGuard qui joint le réseau du PC (ici `wireguard`). Secrets en fichiers (Docker secrets).
+# Compose résout `./data` et `./secrets` depuis le dossier de ce fichier : les commandes de préparation
+# ci-dessous se lancent dans ce dossier. Docker rootless ou userns-remap : UID décalé sur l'hôte, voir le README.
 services:
   portique:
     image: portique:0.1.0
@@ -15,7 +17,7 @@ services:
     secrets:
       - master_key
     volumes:
-      - ./data:/data
+      - ./data:/data                     # à créer avant : sudo install -d -m 700 -o 10001 -g 10001 data (UID de l'image)
     read_only: true
     security_opt:
       - no-new-privileges=true
@@ -28,7 +30,16 @@ services:
 
 secrets:
   master_key:
-    file: ./secrets/master_key           # openssl rand -base64 32 > secrets/master_key ; chmod 600
+    # Compose monte le fichier avec les droits de l'hôte : il doit être lisible par l'UID 10001 de l'image,
+    # qui ne doit être celui d'aucun compte de l'hôte (ce compte lirait la clé et la base ; sinon userns-remap).
+    # Jamais régénérée sur une installation existante : une nouvelle clé ne déchiffrerait plus la base. Clé
+    # perdue avec une base en place : la préparation s'arrête, restaure la clé d'origine. Relançable (sudo).
+    # (umask 077; mkdir -p secrets
+    #  if [ ! -s secrets/master_key ]; then
+    #    sudo test -e data/portique.db && { echo "base existante : restaure secrets/master_key" >&2; exit 1; }
+    #    openssl rand -base64 32 > secrets/master_key
+    #  fi) && sudo chmod 400 secrets/master_key && sudo chown 10001 secrets/master_key
+    file: ./secrets/master_key
 
 # Route Traefik (fichier dynamique, le conteneur partageant le réseau de wireguard) :
 # http:

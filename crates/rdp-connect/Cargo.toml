@@ -14,3 +14,6 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 sha2 = "0.11.1"
 rand = "0.10.3"
 thiserror = "2.0.21"
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt", "test-util"] }

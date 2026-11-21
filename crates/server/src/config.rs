@@ -13,7 +13,7 @@ use portique_proto::AuthMode;
 
 pub const PREFIX: &str = "PORTIQUE_";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
@@ -25,6 +25,23 @@ pub struct Config {
     pub proxy: ProxyConfig,
     /// Cookies `Secure` : désactivable seulement pour du développement en HTTP local.
     pub secure_cookies: bool,
+}
+
+// Debug à la main : la clé maîtresse et le mot de passe admin ne doivent jamais finir dans un journal.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("data_dir", &self.data_dir)
+            .field("static_dir", &self.static_dir)
+            .field("public_url", &self.public_url)
+            .field("master_key", &"<masquée>")
+            .field("admin_password", &self.admin_password.as_ref().map(|_| "<masqué>"))
+            .field("auth_mode", &self.auth_mode)
+            .field("proxy", &self.proxy)
+            .field("secure_cookies", &self.secure_cookies)
+            .finish()
+    }
 }
 
 /// Résultat d'une résolution de noms de proxys : instant et adresses.
@@ -156,7 +173,10 @@ fn is_hostname(s: &str) -> bool {
 impl ProxyConfig {
     /// Adresse d'un proxy de confiance (CIDR configurés ou noms résolus récemment) ?
     pub fn is_trusted(&self, ip: &std::net::IpAddr) -> bool {
-        if self.trusted.iter().any(|n| n.contains(ip)) {
+        // Écoute double pile (`[::]`) : un proxy IPv4 arrive en `::ffff:a.b.c.d`. On compare les deux
+        // formes : un CIDR IPv4 vise la forme canonique, un CIDR `::ffff:…` l'adresse telle quelle.
+        let ips = [*ip, ip.to_canonical()];
+        if self.trusted.iter().any(|n| ips.iter().any(|ip| n.contains(ip))) {
             return true;
         }
         // Une adresse résolue n'est fiable que peu de temps : un conteneur peut hériter de
@@ -165,7 +185,7 @@ impl ProxyConfig {
             .read()
             .unwrap()
             .as_ref()
-            .is_some_and(|(at, ips)| at.elapsed() < RESOLVED_TTL && ips.contains(ip))
+            .is_some_and(|(at, known)| at.elapsed() < RESOLVED_TTL && ips.iter().any(|ip| known.contains(ip)))
     }
 
     /// Résout les noms de proxys (au démarrage puis toutes les `RESOLVE_EVERY`). Une résolution
@@ -275,6 +295,27 @@ mod tests {
         let old = std::time::Instant::now() - RESOLVED_TTL - std::time::Duration::from_secs(1);
         *c.proxy.resolved.write().unwrap() = Some((old, vec![ip]));
         assert!(!c.proxy.is_trusted(&ip), "résolution périmée : refus");
+    }
+
+    #[test]
+    fn mapped_ipv4_proxy_is_trusted_and_debug_hides_secrets() {
+        let env = [
+            ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+            ("PORTIQUE_MASTER_KEY", KEY),
+            ("PORTIQUE_ADMIN_PASSWORD", "admin-password-123"),
+            ("PORTIQUE_AUTH_MODE", "proxy"),
+            ("PORTIQUE_TRUSTED_PROXIES", "172.16.0.0/12, ::ffff:192.0.2.9/128, traefik"),
+        ];
+        let c = Config::from_env(&env).unwrap();
+        let mapped: std::net::IpAddr = "::ffff:172.18.0.2".parse().unwrap();
+        assert!(c.proxy.is_trusted(&mapped), "CIDR IPv4");
+        assert!(c.proxy.is_trusted(&"::ffff:192.0.2.9".parse().unwrap()), "CIDR IPv6 mappé");
+        assert!(!c.proxy.is_trusted(&"::ffff:192.0.2.10".parse().unwrap()));
+        *c.proxy.resolved.write().unwrap() =
+            Some((std::time::Instant::now(), vec!["192.0.2.7".parse().unwrap()]));
+        assert!(c.proxy.is_trusted(&"::ffff:192.0.2.7".parse().unwrap()), "nom résolu");
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("admin-password-123") && !dbg.contains("29, 30, 31"), "{dbg}");
     }
 
     #[test]

@@ -190,11 +190,14 @@ impl Gfx {
                 let monitors: Vec<Rect> = defs
                     .iter()
                     .filter_map(|&(l, t, rr, b)| {
+                        // En i64 : des bords extrêmes (i32::MIN et i32::MAX) débordent en i32.
+                        let sat = |v: i64| v.clamp(0, i64::from(u32::MAX)) as u32;
+                        let (l, t, rr, b) = (i64::from(l), i64::from(t), i64::from(rr), i64::from(b));
                         Rect {
-                            x: (l - min_x) as u32,
-                            y: (t - min_y) as u32,
-                            w: (rr - l + 1) as u32,
-                            h: (b - t + 1) as u32,
+                            x: sat(l - i64::from(min_x)),
+                            y: sat(t - i64::from(min_y)),
+                            w: sat(rr - l + 1),
+                            h: sat(b - t + 1),
                         }
                         .clip(w, h)
                     })
@@ -678,5 +681,55 @@ mod tests {
         assert!(g.process(&wrap(&[unknown])).is_err());
         let mut g = Gfx::new();
         assert!(g.process(&[0xE0, 0x04, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn rejected_pdu_not_counted_as_queued() {
+        let mut g = Gfx::new();
+        g.queued_bytes = crate::MAX_QUEUED_BYTES - 7;
+        assert!(g.process(&wrap(&[pdu(id::CAPS_CONFIRM, &[])])).is_err());
+        assert_eq!(g.queued_bytes, crate::MAX_QUEUED_BYTES - 7);
+    }
+
+    #[test]
+    fn avc444_planes_counted_even_if_the_frame_is_refused() {
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+        );
+        g.process(&wrap(&[create])).unwrap();
+        let full = Rect { x: 0, y: 0, w: 16, h: 16 };
+        g.pending_avc = Some(PendingAvc { surface: 0, rects: vec![full], aux: None });
+        // Plans trop courts : refusée après la création des plans 4:4:4.
+        let frame =
+            crate::Yuv420 { width: 16, height: 16, y: &[], u: &[], v: &[], y_stride: 16, uv_stride: 8 };
+        assert!(g.submit_avc444(Some(&frame), None).is_err());
+        let s = &g.surfaces[&0];
+        assert_eq!(g.surface_bytes, s.rgba.len() + s.p444.as_ref().unwrap().bytes());
+        g.process(&wrap(&[pdu(id::DELETE_SURFACE, &0u16.to_le_bytes())])).unwrap();
+        assert_eq!(g.surface_bytes, 0);
+    }
+
+    #[test]
+    fn extreme_monitor_edges() {
+        // Bords aux limites d'i32 : pas de débordement, rectangles saturés puis découpés.
+        let mon = |l: i32, t: i32, r: i32, b: i32| {
+            le(&[&l.to_le_bytes(), &t.to_le_bytes(), &r.to_le_bytes(), &b.to_le_bytes(), &[0; 4]])
+        };
+        let body = le(&[
+            &16u32.to_le_bytes(),
+            &16u32.to_le_bytes(),
+            &3u32.to_le_bytes(),
+            &mon(i32::MIN, 0, i32::MIN + 9, 9),
+            &mon(i32::MAX - 9, 0, i32::MAX, 9),
+            &mon(i32::MIN, 0, i32::MAX, 9),
+        ]);
+        let out = Gfx::new().process(&wrap(&[pdu(id::RESET_GRAPHICS, &body)])).unwrap();
+        let full = Rect { x: 0, y: 0, w: 16, h: 10 };
+        assert_eq!(
+            out[0],
+            Out::Reset { width: 16, height: 16, monitors: vec![Rect { w: 10, ..full }, full] }
+        );
     }
 }

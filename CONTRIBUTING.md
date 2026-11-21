@@ -7,7 +7,8 @@ Merci de ton intérêt ! Ce guide tient en une page.
 - Rust stable, avec `rustfmt` et `clippy`
 - cible wasm : `rustup target add wasm32-unknown-unknown`
 - [trunk](https://trunkrs.dev) pour le front : `cargo install --locked trunk`
-- `curl` et `openssl` : `scripts/vendor-xterm.sh` télécharge xterm.js et vérifie son empreinte
+- `curl`, `openssl` et `flock` (util-linux) : `scripts/vendor-xterm.sh` télécharge xterm.js, vérifie son
+  empreinte et attend la fin d'une autre exécution en cours
 
 ```sh
 cargo test --workspace --exclude portique-web
@@ -17,8 +18,8 @@ cargo fmt --all --check
 (cd crates/web && trunk build --release --dist ../../dist)
 ```
 
-Ou tout d'un coup : `./scripts/ci.sh`. Il n'y a pas de CI GitHub : ce script fait foi et se lance avant
-chaque push.
+Ou tout d'un coup : `./scripts/ci.sh`, à lancer avant chaque push. La CI GitHub (`.github/workflows/ci.yml`)
+rejoue ce même script sur chaque push et chaque pull request.
 
 Tout ce qui est généré reste dans le dépôt et est ignoré par Git (`target/`, `dist/`, `data/`).
 

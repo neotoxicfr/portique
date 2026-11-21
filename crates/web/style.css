@@ -1,203 +1,616 @@
+/*
+ * Portique : style du front (thèmes Apple : couleurs système, matières translucides, police système).
+ * Aucune police web (CSP stricte). Clair par défaut, sombre via prefers-color-scheme.
+ *
+ * CATALOGUE (nom -> usage). Les pages s'appuient dessus sans toucher au socle.
+ *  Mise en page
+ *   main               contenu de page (960 px), main.center : contenu centré (connexion, chargement)
+ *   .sr-only           visible seulement des lecteurs d'écran (les h1 de page)
+ *   .row, .row.wrap, .row.spread, .stack, .grid, .full   flex/grille utilitaires (.full = toute la ligne de .grid)
+ *   .muted, .mono, .error   texte secondaire, chasse fixe, texte rouge
+ *  Groupes façon Réglages
+ *   .group-title       titre de groupe (13 px, gris), au-dessus d'un .group
+ *   .group             bloc arrondi 16 px, fond carte ; chaque enfant direct est une ligne à filet interne
+ *   .line              ligne de .group : libellé à gauche (.line-label), champ ou contrôle à droite ;
+ *                      un input/select/textarea dans .line est sans bordure ; .line.col : empilée ;
+ *                      a.line / button.line : ligne cliquable (.line.danger : rouge)
+ *   .card              carte pleine (fond carte, rayon 20 px, ombre) pour un bloc isolé
+ *  Contrôles
+ *   button             pilule bleue pleine (44 px) ; .secondary gris ; .danger rouge ; .link sans fond ;
+ *                      a.button : même rendu pour un lien ; .block : pleine largeur
+ *   .iconbtn           bouton rond 44 px à icône (.big = 50 px) ; teintes .blue .red .ghost ; .empty = emplacement vide
+ *   .switch            <label class="switch"><input type="checkbox" role="switch"><span class="track"></span></label>
+ *   .seg               contrôle segmenté (a ou button, l'actif porte aria-current="page", aria-pressed="true" ou .on)
+ *   .tag               étiquette en pilule (combinaison, rôle) ; .tag button = croix de suppression
+ *   .badge             pastille de texte discrète ; .dot (+ .green .orange .red .gray) : point d'état
+ *   .pastille          icône d'app : carré arrondi dégradé + glyphe blanc ; .green .orange .indigo .red .gray .blue ;
+ *                      taille par --s (défaut 40px)
+ *   .ico               svg en ligne (trait 2, bouts ronds, couleur du texte), 20 px ; .ico.sm 16 px
+ *  Messages
+ *   .alert             erreur ou avertissement dans le flux (role="alert") ; .alert.ok : confirmation
+ *   .banner            bandeau discret en haut du contenu (role="status") ; .banner.error en rouge ; .banner button : action
+ *   .spinner           indicateur d'attente
+ *  Divers
+ *   .qr                code QR sur fond blanc
+ *   .table-wrap        tableau à défilement horizontal (en-têtes conservés)
+ *   .host              carte de machine de l'accueil (taille fixe)
+ */
+
 :root {
-  --bg: #f6f7f9;
-  --surface: #ffffff;
-  --text: #16181d;
-  --muted: #5f6672;
-  --border: #dfe2e7;
-  --accent: #2459d6;
-  --accent-text: #ffffff;
-  --danger: #c22a2a;
-  --ok-bg: #e7f3ec;
-  --ok-text: #1d5b36;
-  --radius: 10px;
+  --bg: #f2f2f7;
+  --card: #ffffff;
+  --bar: rgba(246, 246, 248, 0.78);
+  --sep: rgba(60, 60, 67, 0.2);
+  --fill: rgba(118, 118, 128, 0.12);
+  --thumb: #ffffff;
+  --thumb-shadow: 0 3px 8px rgba(0, 0, 0, 0.12), 0 3px 1px rgba(0, 0, 0, 0.04);
+  --gray-btn: rgba(120, 120, 128, 0.12);
+  --empty: rgba(116, 116, 128, 0.08);
+  --text: #1d1d1f;
+  /* Texte secondaire : 4,5:1 au moins aussi sur un fond --fill (recherche, étiquettes, ligne sélectionnée). */
+  --muted: #636366;
+  --link: #0066cc;
+  --accent: #0071e3;
+  --accent-icon: #0071e3;
+  --red: #cc0013; /* #d70015 n'atteint que 4,2:1 sur le fond + teinte rouge ou bouton gris */
+  --red-fill: #ff3b30;
+  --green: #34c759;
+  --orange: #ff9500;
+  --indigo: #5856d6;
+  --gray: #8e8e93;
+  --ok: #1f7a3a;
+  --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
+  --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  --focus: #0071e3; /* opaque : 4,6:1 sur blanc, au-delà du 3:1 exigé pour un indicateur de focus */
+  --alert: rgba(242, 242, 247, 0.88);
+  --code: rgba(118, 118, 128, 0.12);
+  --red-tint: rgba(255, 59, 48, 0.1);
+  --ok-tint: rgba(52, 199, 89, 0.14);
+  /* barre de touches (clavier iOS) */
+  --kb-bar: #d1d3d9;
+  --kb-key: #ffffff;
+  --kb-special: #adb1bb;
+  --kb-text: #000000;
+  --kb-shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+  /* Aussi en sombre : texte blanc 15 px, #0a84ff n'y donnerait que 3,6:1 (4,7:1 ici). */
+  --kb-on: #0071e3;
+  --sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 70%);
+  --font: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
   color-scheme: light dark;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #111317;
-    --surface: #1a1d23;
-    --text: #e7e9ed;
-    --muted: #9aa1ad;
-    --border: #2c3038;
-    --accent: #6d95f2;
-    --accent-text: #0d1220;
-    --danger: #ef7070;
-    --ok-bg: #173323;
-    --ok-text: #9fd8b5;
+    --bg: #000000;
+    --card: #1c1c1e;
+    --bar: rgba(22, 22, 23, 0.78);
+    --sep: rgba(84, 84, 88, 0.6);
+    --fill: rgba(118, 118, 128, 0.24);
+    --thumb: #636366;
+    --thumb-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
+    --gray-btn: rgba(120, 120, 128, 0.24);
+    --empty: rgba(118, 118, 128, 0.12);
+    --text: #f5f5f7;
+    --muted: #9a9a9f;
+    --link: #2997ff;
+    --accent-icon: #0a84ff;
+    --red: #ff6961;
+    --red-fill: #ff453a;
+    --green: #30d158;
+    --orange: #ff9f0a;
+    --indigo: #5e5ce6;
+    --gray: #636366;
+    --ok: #30d158;
+    --card-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
+    --btn-shadow: none;
+    --focus: #0a84ff;
+    --alert: rgba(44, 44, 46, 0.88);
+    --code: rgba(118, 118, 128, 0.24);
+    --red-tint: rgba(255, 69, 58, 0.16);
+    --ok-tint: rgba(48, 209, 88, 0.16);
+    --kb-bar: #2b2b2d;
+    --kb-key: #6b6b6e;
+    --kb-special: #47474a;
+    --kb-text: #ffffff;
+    --kb-shadow: 0 1px 0 rgba(0, 0, 0, 0.5);
   }
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
+html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 15px/1.45 var(--font);
+  letter-spacing: -0.1px;
   min-height: 100dvh;
   display: flex;
   flex-direction: column;
+  -webkit-tap-highlight-color: transparent;
 }
 
-main { width: 100%; max-width: 960px; margin: 0 auto; padding: 16px; flex: 1; }
-main.center { display: grid; place-items: center; }
-h1 { font-size: 1.5rem; margin: 8px 0 16px; }
-h2 { font-size: 1.1rem; margin: 0 0 12px; }
+main {
+  width: 100%; max-width: 960px; margin: 0 auto; flex: 1;
+  padding: 24px max(24px, env(safe-area-inset-right)) 40px max(24px, env(safe-area-inset-left));
+}
+main.center { display: grid; place-items: center; align-content: center; gap: 16px; text-align: center; }
+h1 { font-size: 28px; line-height: 1.15; letter-spacing: -0.5px; margin: 0 0 20px; }
+h2 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; margin: 0 0 10px; }
+p { margin: 0 0 10px; }
+a { color: var(--link); text-decoration: none; }
 
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+.error { color: var(--red); margin: 0; }
+
+/* Focus visible : anneau bleu translucide sur tout élément interactif. Un contour et non une ombre : les ombres
+   décoratives (bouton plein, segment actif, touche) ne peuvent pas l'effacer. */
+:is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+/* Ligne cliquable : le groupe rogne ce qui dépasse, l'anneau passe à l'intérieur. */
+:is(a, button).line:focus-visible { outline-offset: -3px; }
+/* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
+@media (forced-colors: active) {
+  :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+  .theme input:checked ~ .prev { outline: 2px solid CanvasText; outline-offset: 2px; }
+  .switch input:focus-visible + .track,
+  .theme input:focus-visible ~ .prev { outline: 3px solid Highlight; outline-offset: 2px; }
+  .switch .track { border: 1px solid CanvasText; }
+  .switch .track::after { forced-color-adjust: none; background: CanvasText; }
+}
+
+/* Icônes en ligne. */
+.ico { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ico.sm { width: 16px; height: 16px; }
+
+/* ---------- Coquille ---------- */
 .topbar {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
+  position: sticky; top: 0; z-index: 10;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px;
+  padding: max(10px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) 10px max(24px, env(safe-area-inset-left));
+  background: var(--bar);
+  -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 0.5px solid var(--sep);
 }
-.topbar nav { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-.topbar a { color: var(--muted); text-decoration: none; }
-.topbar a[aria-current="page"] { color: var(--text); font-weight: 600; }
-.topbar .brand { color: var(--text); font-weight: 700; }
+.brand { justify-self: start; display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 17px; color: var(--text); }
+.brand .pastille { --s: 30px; }
+.topbar .iconbtn { justify-self: end; }
 
-.footer { text-align: center; padding: 12px; font-size: 0.8rem; }
-.footer a { text-decoration: none; }
-
-.card {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 16px; margin-bottom: 16px;
+.pastille {
+  --s: 40px;
+  flex: none; display: inline-grid; place-items: center; width: var(--s); height: var(--s); border-radius: 23%;
+  background: var(--sheen), var(--accent); color: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), inset 0 0.5px 0 rgba(255, 255, 255, 0.3);
 }
-.login { width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px; }
-.login h1 { text-align: center; margin: 0 0 4px; }
+.pastille .ico { width: 52%; height: 52%; }
+.pastille.green { background: var(--sheen), var(--green); }
+.pastille.orange { background: var(--sheen), var(--orange); }
+.pastille.indigo { background: var(--sheen), var(--indigo); }
+.pastille.red { background: var(--sheen), var(--red-fill); }
+.pastille.gray { background: var(--sheen), var(--gray); }
+.pastille.blue { background: var(--sheen), linear-gradient(180deg, #3d9bff, #0066e0); }
 
-label { display: flex; flex-direction: column; gap: 4px; font-size: 0.9rem; color: var(--muted); }
-label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
-input, select {
-  font: inherit; color: var(--text); background: var(--bg);
-  border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; min-height: 40px;
+/* Contrôle segmenté (navigation au bureau, onglets en bas sur téléphone). */
+.seg { display: flex; gap: 2px; padding: 2px; border-radius: 10px; background: var(--fill); }
+.seg > :is(a, button) {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; padding: 0 18px;
+  border-radius: 8px; border: 0; background: transparent; color: var(--text); font: inherit; font-size: 14px; font-weight: 500;
+  cursor: pointer; white-space: nowrap;
 }
-input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
-input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-button {
-  font: inherit; font-weight: 600; cursor: pointer; border-radius: 8px; min-height: 40px;
-  padding: 8px 16px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text);
+.seg > :is([aria-current="page"], [aria-pressed="true"], .on) {
+  background: var(--thumb); box-shadow: var(--thumb-shadow); font-weight: 600;
 }
-button.secondary { background: transparent; color: var(--accent); }
-button.link { background: none; border: none; color: var(--accent); padding: 4px 6px; min-height: 0; font-weight: 500; }
-button.danger, button.link.danger { color: var(--danger); }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.seg .ico { display: none; }
+/* Mode de réveil : sur écran étroit, les deux boutons passent sous le libellé plutôt que d'être rognés. */
+.line.wake-mode { flex-wrap: wrap; }
+.line.wake-mode .grow { flex: 1 0 auto; }
+.wake-mode .seg { margin-left: auto; }
 
+.footer { text-align: center; padding: 18px 24px max(18px, env(safe-area-inset-bottom)); font-size: 13px; }
+
+/* ---------- Boutons ---------- */
+button, a.button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 22px;
+  border: 0; border-radius: 999px; background: var(--accent); color: #ffffff;
+  font: inherit; font-size: 15px; font-weight: 600; cursor: pointer; text-decoration: none; touch-action: manipulation;
+}
+button.secondary, a.button.secondary { background: var(--gray-btn); color: var(--text); }
+button.danger, a.button.danger { background: var(--gray-btn); color: var(--red); }
+button.block, a.button.block { display: flex; width: 100%; }
+button.link {
+  min-height: 44px; padding: 0 8px; background: none; color: var(--link); font-weight: 500; border-radius: 8px;
+}
+button.link.danger { color: var(--red); background: none; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.iconbtn, button.iconbtn {
+  display: inline-grid; place-items: center; width: 44px; height: 44px; min-height: 0; padding: 0; border: 0; border-radius: 999px;
+  background: var(--gray-btn); color: var(--text); cursor: pointer; flex: none;
+}
+.iconbtn.big { width: 50px; height: 50px; }
+.iconbtn.blue { background: var(--accent-icon); color: #ffffff; box-shadow: var(--btn-shadow); }
+.iconbtn.red { background: var(--red-fill); color: #ffffff; box-shadow: var(--btn-shadow); }
+.iconbtn.ghost { background: transparent; color: var(--link); }
+.iconbtn.empty { background: var(--empty); cursor: default; }
+
+/* Interrupteur 51x31, vrai <input type="checkbox" role="switch"> dessous. */
+.switch { position: relative; display: inline-block; flex: none; width: 51px; height: 31px; }
+.switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
+.switch .track { position: absolute; inset: 0; border-radius: 999px; background: var(--fill); transition: background 0.2s; }
+.switch .track::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #ffffff;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15), 0 1px 1px rgba(0, 0, 0, 0.16); transition: transform 0.2s;
+}
+.switch input:checked + .track { background: var(--green); }
+.switch input:checked + .track::after { transform: translateX(20px); }
+.switch input:focus-visible + .track { box-shadow: 0 0 0 3px var(--focus); }
+.switch input:disabled { cursor: not-allowed; }
+.switch input:disabled + .track { opacity: 0.5; }
+@media (prefers-reduced-motion: reduce) { .switch .track, .switch .track::after { transition: none; } }
+
+/* ---------- Champs, groupes ---------- */
+label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+label.check { flex-direction: row; align-items: center; gap: 10px; min-height: 44px; font-size: 15px; color: var(--text); }
+input, select, textarea {
+  font: inherit; font-size: 15px; color: var(--text); background: var(--fill);
+  border: 0; border-radius: 8px; padding: 0 12px; min-height: 44px; min-width: 0;
+}
+textarea { padding: 10px 12px; }
+input[type="checkbox"], input[type="radio"] { min-height: 0; width: 22px; height: 22px; padding: 0; accent-color: var(--accent); flex: none; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+input[type="search"] { -webkit-appearance: none; appearance: none; }
+fieldset { border: 0; border-radius: 12px; background: var(--fill); margin: 0; padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 0 16px; min-width: 0; }
+fieldset.column { flex-direction: column; align-items: stretch; }
+legend { color: var(--muted); font-size: 13px; padding: 0 4px; }
+
+.group-title { margin: 24px 16px 8px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.group { background: var(--card); border-radius: 16px; box-shadow: var(--card-shadow); overflow: hidden; margin-bottom: 8px; }
+.group > * { position: relative; }
+.group > * + *::before {
+  content: ""; position: absolute; top: 0; left: 16px; right: 0; border-top: 0.5px solid var(--sep);
+}
+.line {
+  display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 4px 16px;
+  font-size: 15px; color: var(--text);
+}
+.line-label { flex: none; min-width: 96px; font-size: 15px; color: var(--text); }
+.line input, .line select, .line textarea { flex: 1; background: transparent; border-radius: 0; padding: 0; min-height: 44px; text-align: right; }
+.line input[type="checkbox"] { flex: none; }
+.line.col { flex-direction: column; align-items: stretch; gap: 4px; padding-top: 10px; padding-bottom: 10px; }
+.line.col input, .line.col select, .line.col textarea { text-align: left; }
+a.line, button.line {
+  width: 100%; border-radius: 0; background: transparent; color: var(--link); font-weight: 400; justify-content: flex-start; text-align: left;
+}
+.line.danger { color: var(--red); }
+.line:focus-within:has(input:focus-visible, select:focus-visible, textarea:focus-visible) { background: var(--fill); }
+/* Le fond teinté seul ne se voit presque pas : l'anneau de focus, tracé dedans (le groupe rogne ce qui dépasse).
+   L'interrupteur a le sien. */
+.line:has(input:not([role="switch"]):focus-visible, select:focus-visible, textarea:focus-visible) { box-shadow: inset 0 0 0 3px var(--focus); }
+/* Contour transparent plutôt qu'absent : les couleurs forcées le rendent visible. */
+.line input:focus-visible, .line select:focus-visible, .line textarea:focus-visible { outline-color: transparent; }
+
+.card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 16px; box-shadow: var(--card-shadow); }
 .row { display: flex; gap: 8px; align-items: center; }
 .row.wrap { flex-wrap: wrap; }
 .row.spread { justify-content: space-between; }
-.row input { flex: 1; min-width: 0; }
+.row > input { flex: 1; }
 .stack { display: flex; flex-direction: column; gap: 12px; max-width: 420px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 16px; }
 .full { grid-column: 1 / -1; }
-fieldset { border: 1px solid var(--border); border-radius: 8px; display: flex; flex-wrap: wrap; gap: 8px 16px; }
-legend { color: var(--muted); font-size: 0.9rem; padding: 0 4px; }
 
-.tiles { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
-.tile { margin: 0; display: flex; flex-direction: column; gap: 12px; }
-.tile-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.tag {
+  display: inline-flex; align-items: center; gap: 4px; min-height: 32px; padding: 0 12px; border-radius: 999px;
+  background: var(--fill); color: var(--text); font-size: 13px; font-weight: 500; white-space: nowrap;
+}
+.tag button { min-height: 32px; width: 32px; margin-right: -10px; padding: 0; background: none; color: var(--muted); font-size: 16px; }
+.badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--fill); color: var(--muted); white-space: nowrap; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--gray); flex: none; }
+.dot.green { background: var(--green); }
+.dot.orange { background: var(--orange); }
+.dot.red { background: var(--red-fill); }
 
-.list { list-style: none; padding: 0; margin: 0 0 12px; }
-.list li { padding: 6px 0; border-bottom: 1px solid var(--border); }
+/* Messages. */
+.alert {
+  margin: 0 0 12px; padding: 10px 14px; border-radius: 12px; font-size: 14px;
+  background: var(--red-tint); color: var(--red);
+}
+.alert.ok { background: var(--ok-tint); color: var(--ok); }
+.banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px; padding: 10px 14px;
+  border-radius: 12px; background: var(--fill); color: var(--text); font-size: 14px;
+}
+.banner.error { background: var(--red-tint); color: var(--red); }
+.banner button { min-height: 36px; padding: 0 14px; font-size: 14px; flex: none; }
 
-.table-wrap { overflow-x: auto; margin-bottom: 12px; }
-table { width: 100%; border-collapse: collapse; }
-td.cell-actions { text-align: right; white-space: nowrap; }
-th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
-
-.badge { font-size: 0.75rem; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); margin-left: 6px; white-space: nowrap; }
-.muted { color: var(--muted); }
-.mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 0.85rem; word-break: break-all; }
-.error { color: var(--danger); margin: 0; }
-.notice { background: var(--ok-bg); color: var(--ok-text); padding: 8px 12px; border-radius: 8px; }
-.qr { background: #fff; display: inline-block; padding: 8px; border-radius: 8px; }
-.qr svg { display: block; width: 200px; height: 200px; }
-.table-wrap td, .table-wrap th { white-space: nowrap; }
-.row.wrap > input { min-width: 160px; }
-
-a.button {
-  display: inline-flex; align-items: center; justify-content: center; text-decoration: none;
-  font-weight: 600; border-radius: 8px; min-height: 40px; padding: 8px 16px;
-  border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text);
-}
-a.button.secondary { background: transparent; color: var(--accent); }
-
-/* Session : le bureau distant occupe toute la fenêtre. */
-.session { position: fixed; inset: 0; background: #000; overflow: hidden; }
-.session .screen {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: contain; touch-action: none; outline: none; image-rendering: auto;
-}
-.session-menu { position: absolute; top: 0; left: 50%; transform: translateX(-50%); z-index: 2; text-align: center; }
-.session-handle {
-  min-height: 0; padding: 0 18px; height: 18px; line-height: 14px; border-radius: 0 0 10px 10px;
-  background: rgba(30, 32, 38, 0.75); border: none; color: #fff; opacity: 0.45;
-}
-.session-handle:hover, .session-menu.open .session-handle { opacity: 1; }
-.session-actions {
-  display: flex; gap: 8px; padding: 8px; margin-top: 4px; border-radius: 10px;
-  background: rgba(30, 32, 38, 0.92);
-}
-.session-overlay {
-  position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px;
-  align-items: center; justify-content: center; padding: 16px; text-align: center;
-  background: rgba(10, 11, 14, 0.82); color: #e7e9ed; z-index: 3;
-}
-.session-overlay .mono { max-width: 40ch; color: #fff; }
-
-/* Terminal SSH : plein cadre ; la hauteur suit la partie visible (clavier virtuel exclu). */
-.ssh { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; display: flex; flex-direction: column; background: #111317; }
-/* Barre de titre fine : ne recouvre jamais le texte du terminal (téléphone compris). */
-.ssh-top {
-  display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 4px 6px;
-  background: #1c1f26; border-bottom: 1px solid #2c313c; color: #e7e9ed;
-}
-.ssh-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 0.95rem; }
-.ssh-top a, .ssh-top button {
-  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 36px;
-  padding: 0 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.14); text-decoration: none;
-  background: transparent; color: #e7e9ed; opacity: 0.85; font-size: 1.05rem;
-}
-.ssh-top a:hover, .ssh-top button:hover, .ssh-top a:focus-visible, .ssh-top button:focus-visible { opacity: 1; }
-.ssh-term { flex: 1; min-height: 0; padding: 4px 0 0 4px; }
-.keybar {
-  display: flex; gap: 6px; padding: 6px; overflow-x: auto; flex-shrink: 0;
-  background: #1c1f26; border-top: 1px solid #2c313c; scrollbar-width: none;
-  padding-bottom: max(6px, env(safe-area-inset-bottom));
-}
-.keybar .key {
-  flex-shrink: 0; min-width: 44px; min-height: 40px; padding: 0 10px; border-radius: 8px;
-  border: 1px solid #3a3f4b; background: #262a33; color: #e7e9ed; font-size: 0.9rem; touch-action: manipulation;
-}
-.keybar .key.on { background: #3d5afe; border-color: #3d5afe; color: #fff; }
-.keybar .key.combo { font-family: ui-monospace, monospace; font-size: 0.8rem; }
-
-/* Indicateur d'attente des sessions (RDP, SSH). */
 .spinner {
-  width: 28px; height: 28px; border-radius: 50%;
-  border: 3px solid rgba(231, 233, 237, 0.2); border-top-color: #e7e9ed;
+  width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--fill); border-top-color: var(--muted);
   animation: tourne 0.9s linear infinite;
 }
 @keyframes tourne { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 
-/* Clé du service : la ligne entière, lisible et sélectionnable. */
-.card textarea.key { width: 100%; resize: vertical; white-space: pre-wrap; word-break: break-all; }
+.qr { background: #ffffff; display: inline-block; padding: 8px; border-radius: 12px; }
+.qr svg { display: block; width: 200px; height: 200px; }
 
-/* Téléphone : les tableaux de l'admin deviennent des cartes, actions comprises. */
+/* Tableaux : défilement horizontal, en-têtes conservés. */
+.table-wrap { overflow-x: auto; margin-bottom: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 0.5px solid var(--sep); vertical-align: middle; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 13px; }
+td.cell-actions { text-align: right; }
+.list { list-style: none; padding: 0; margin: 0 0 12px; }
+.list li { padding: 8px 0; border-bottom: 0.5px solid var(--sep); }
+.card textarea.key { width: 100%; resize: vertical; white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 13px; }
+
+/* ---------- Connexion ---------- */
+.login { width: min(380px, 100%); display: flex; flex-direction: column; gap: 14px; text-align: left; }
+.login-icon { display: block; width: 72px; height: 72px; margin: 0 auto; border-radius: 23%; box-shadow: var(--card-shadow); }
+.login h1 { text-align: center; font-size: 24px; margin: 0; }
+.login .group { margin: 0; }
+.login .alert { margin: 0; }
+
+/* ---------- Accueil ---------- */
+.search {
+  display: flex; flex-direction: row; align-items: center; gap: 8px; max-width: 420px; height: 40px; margin-bottom: 24px;
+  padding: 0 12px; border-radius: 10px; background: var(--fill); color: var(--muted); font-size: 15px;
+}
+.search input { flex: 1; background: transparent; border-radius: 0; padding: 0; min-height: 0; height: 100%; font-size: 15px; }
+.search input:focus-visible { outline-color: transparent; }
+.search:focus-within { box-shadow: 0 0 0 3px var(--focus); }
+.hosts { list-style: none; margin: 0; padding: 0; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.host {
+  height: 152px; padding: 18px; border-radius: 20px; background: var(--card); box-shadow: var(--card-shadow);
+  display: flex; flex-direction: column; justify-content: space-between;
+}
+.host-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.host .pastille { --s: 42px; }
+.host-name { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.host-actions { display: grid; grid-template-columns: repeat(3, 50px); gap: 12px; }
+.host-actions .iconbtn { width: 50px; height: 50px; }
+.host-actions .iconbtn .ico { width: 21px; height: 21px; }
+.host.alert-host .host-name { color: var(--red); }
+.host.alert-host .iconbtn.blue { background: var(--red-fill); }
+
+/* ---------- Téléphone : onglets en bas ---------- */
 @media (max-width: 640px) {
-  .table-wrap table, .table-wrap tbody, .table-wrap tr, .table-wrap td { display: block; width: 100%; }
-  .table-wrap thead { display: none; }
-  .table-wrap tr { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; }
-  .table-wrap td { border: none; padding: 3px 0; white-space: normal; }
-  .table-wrap td:first-child { font-weight: 600; }
-  .table-wrap td:empty { display: none; }
-  td.cell-actions { text-align: left; display: flex; gap: 20px; padding-top: 8px; }
-  td.cell-actions button { min-height: 40px; }
+  main { padding: 8px max(16px, env(safe-area-inset-right)) 24px max(16px, env(safe-area-inset-left)); }
+  h1 { font-size: 24px; }
+  /* Sans flou ici : un parent à backdrop-filter devient le repère des position:fixed, et la barre d'onglets
+     se collerait sous l'en-tête au lieu du bas de l'écran. */
+  .topbar { display: flex; justify-content: space-between; padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left)); border-bottom: 0; background: var(--bg); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .topbar nav.seg {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; gap: 0; border-radius: 0; background: var(--bar);
+    -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+    border-top: 0.5px solid var(--sep);
+    padding: 6px max(8px, env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  }
+  .topbar nav.seg > a {
+    flex: 1; flex-direction: column; gap: 2px; min-height: 49px; padding: 4px 0; border-radius: 8px;
+    font-size: 11px; font-weight: 500; color: var(--muted); background: transparent; box-shadow: none;
+  }
+  .topbar nav.seg > a[aria-current="page"] { color: var(--accent-icon); background: transparent; box-shadow: none; font-weight: 600; }
+  .seg .ico { display: block; width: 24px; height: 24px; }
+  .footer { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
+  .hosts { grid-template-columns: 1fr; gap: 12px; }
+  .host { height: 136px; padding: 16px; }
+  .host .pastille { --s: 40px; }
+  .search { height: 44px; max-width: none; border-radius: 12px; }
+  .line-label { min-width: 84px; }
 }
 
-.login-icon { display: block; width: 56px; height: 56px; margin: 0 auto 8px; }
+/* ---------- Session RDP ---------- */
+.session { position: fixed; inset: 0; background: #000; overflow: hidden; }
+.session .screen {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain; touch-action: none; outline: none; image-rendering: auto;
+  /* Appui long iOS = clic droit : ni loupe, ni menu système, ni surbrillance. Le zoom écrit son transform en ligne. */
+  -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+}
+/* Champ du clavier virtuel : invisible mais focalisable (ni display:none ni visibility:hidden). 16 px : en dessous,
+   iOS zoome la page au focus ; en haut à gauche, iOS ne fait pas défiler la page. */
+.session-kbd {
+  position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; resize: none;
+  pointer-events: none; color: transparent; caret-color: transparent; background: transparent; font-size: 16px;
+}
+/* Bouton clavier : en haut à droite, le clavier iOS couvre le bas de la vue. Écrans tactiles seulement. */
+.session-keyboard {
+  position: absolute; top: calc(env(safe-area-inset-top) + 8px); right: calc(env(safe-area-inset-right) + 8px); z-index: 2;
+  display: none; place-items: center; width: 44px; height: 44px; min-height: 0; border-radius: 50%; padding: 0;
+  background: rgba(30, 30, 32, 0.6); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  color: #ffffff; opacity: 0.55;
+}
+.session-keyboard:hover, .session-keyboard:focus-visible { opacity: 1; }
+@media (any-pointer: coarse) { .session-keyboard { display: grid; } }
+/* Barre pleine largeur, contenu centré : le menu ne dépasse jamais la fenêtre et les commandes passent à la ligne. */
+.session-menu {
+  position: absolute; top: env(safe-area-inset-top); left: 0; right: 0; z-index: 2;
+  display: flex; flex-direction: column; align-items: center; pointer-events: none;
+}
+.session-menu > * { pointer-events: auto; }
+.session-handle {
+  position: relative; min-height: 0; height: 22px; width: 56px; padding: 0; border-radius: 0 0 12px 12px;
+  background: rgba(30, 30, 32, 0.6); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  color: #ffffff; opacity: 0.55; font-size: 15px; line-height: 14px;
+}
+.session-handle::after { content: ""; position: absolute; inset: 0 -12px -14px; } /* cible tactile élargie */
+.session-handle:hover, .session-menu.open .session-handle { opacity: 1; }
+.session-actions {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 10px; margin-top: 6px;
+  max-width: calc(100% - 16px); border-radius: 16px;
+  background: rgba(44, 44, 46, 0.78); -webkit-backdrop-filter: saturate(180%) blur(30px); backdrop-filter: saturate(180%) blur(30px);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+}
+.session-actions button { background: rgba(255, 255, 255, 0.16); color: #ffffff; min-height: 44px; padding: 0 16px; font-size: 14px; }
+.session-actions button.secondary { background: rgba(255, 69, 58, 0.9); }
 
-fieldset.column { flex-direction: column; align-items: stretch; }
+/* Fenêtre d'alerte façon iOS : la matière est l'overlay lui-même, l'ombre étalée assombrit le reste.
+   L'ombre ne reçoit pas les clics : un voile transparent plein cadre les arrête (poignée du menu, barre). */
+.session:has(> .session-overlay)::after, .ssh:has(> .session-overlay)::after {
+  content: ""; position: absolute; inset: 0; z-index: 3;
+}
+.session-overlay {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 4;
+  width: min(290px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow-y: auto;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  padding: 20px 16px 0; border-radius: 14px; color: var(--text);
+  background: var(--alert); -webkit-backdrop-filter: saturate(180%) blur(30px); backdrop-filter: saturate(180%) blur(30px);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3), 0 0 0 100vmax rgba(0, 0, 0, 0.4);
+}
+.session-overlay h2 { margin: 0 0 6px; font-size: 17px; }
+.session-overlay p { margin: 0 0 12px; font-size: 13px; line-height: 1.4; max-width: 100%; }
+.session-overlay .spinner { margin-bottom: 12px; }
+.session-overlay .mono { width: 100%; padding: 8px; border-radius: 8px; background: var(--code); font-size: 12px; color: var(--text); }
+.session-overlay .row { flex-direction: column; align-items: stretch; gap: 0; width: calc(100% + 32px); margin: 0 -16px; }
+.session-overlay :is(button, a.button) {
+  display: flex; width: calc(100% + 32px); margin: 0 -16px; min-height: 44px; padding: 0 12px; border-radius: 0;
+  background: transparent; color: var(--link); font-size: 17px; font-weight: 400; border-top: 0.5px solid var(--sep);
+  box-shadow: none; text-align: center;
+}
+.session-overlay .row :is(button, a.button) { width: 100%; margin: 0; }
+.session-overlay button { font-weight: 600; }
+.session-overlay :is(button, a.button):focus-visible { outline-offset: -3px; }
+
+/* ---------- Terminal SSH ---------- */
+/* Plein cadre ; la hauteur suit la partie visible (clavier virtuel exclu). */
+.ssh { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; display: flex; flex-direction: column; background: #111317; }
+.ssh-top {
+  display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: max(6px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left));
+  background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 0.5px solid var(--sep); color: var(--text);
+}
+.ssh-top :is(a, button) {
+  display: grid; place-items: center; width: 44px; height: 44px; min-height: 0; padding: 0; border: 0; border-radius: 999px;
+  background: transparent; color: var(--link); font-size: 22px; line-height: 1; text-decoration: none;
+}
+.ssh-top .ssh-toggle { background: var(--fill); font-size: 20px; }
+.ssh-name {
+  display: flex; align-items: center; justify-content: center; gap: 8px; min-width: 0; font-weight: 600; font-size: 16px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ssh-name::before {
+  content: ">_"; flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px;
+  background: var(--sheen), var(--green); color: #ffffff; font: 700 10px/1 var(--mono);
+}
+/* isolation : les z-index internes de xterm (ascenseur, règle) restent sous l'alerte et son voile. */
+.ssh-term { flex: 1; min-height: 0; padding: 10px 0 0 12px; isolation: isolate; }
+
+/* Barre de touches façon clavier iOS : 8 touches sur la 1re rangée, combinaisons en dessous. */
+.keybar {
+  display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; max-height: 104px; overflow-y: auto;
+  padding: 8px max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  background: var(--kb-bar); border-top: 0.5px solid var(--sep); scrollbar-width: none;
+}
+.keybar .key {
+  flex: 0 0 calc((100% - 42px) / 8); min-width: 0; height: 42px; min-height: 0; padding: 0; border-radius: 7px;
+  border: 0; background: var(--kb-key); color: var(--kb-text); box-shadow: var(--kb-shadow);
+  font-size: 14px; font-weight: 500; letter-spacing: -0.2px; touch-action: manipulation;
+}
+.keybar .key.on { background: var(--kb-on); color: #ffffff; }
+.keybar .key.combo {
+  flex: 0 0 auto; height: 36px; padding: 0 12px; background: var(--kb-special);
+  font-family: var(--mono); font-size: 13px; font-weight: 400;
+}
+
+/* === Compte et admin === */
+/* <label class="line"> : le socle laissait la colonne de `label`. */
+label.line { flex-direction: row; }
+.line.end { justify-content: flex-end; }
+.line .grow { flex: 1; min-width: 0; }
+.line .pastille { --s: 30px; }
+.line .sub { margin-left: 6px; font-size: 13px; color: var(--muted); }
+/* Formulaire dans un groupe : ses lignes gardent leurs filets. */
+.group form > * { position: relative; }
+.group form > * + *::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; border-top: 0.5px solid var(--sep); }
+.group-head { display: flex; align-items: center; justify-content: space-between; margin: 24px 4px 8px 16px; }
+.group-head .group-title { margin: 0; }
+.group-head .iconbtn { margin: -6px 0; color: var(--link); }
+.iconbtn.ghost.danger { color: var(--red); }
+.actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin: 12px 0 0; }
+.actions .spacer { flex: 1; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 0 24px; align-items: start; }
+.cols > * { min-width: 0; }
+.qr-line { align-items: center; }
+
+/* Terminal : aperçus de thèmes, combinaisons. */
+.group fieldset { display: block; border-radius: 0; background: transparent; padding: 14px 16px 16px; }
+.group fieldset legend { float: left; width: 100%; padding: 0; margin-bottom: 12px; font-size: 15px; color: var(--text); }
+.group fieldset legend + * { clear: both; }
+.themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 12px; }
+.theme { position: relative; flex-direction: column; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.theme input { position: absolute; opacity: 0; width: 1px; height: 1px; min-height: 0; }
+.theme .prev {
+  display: block; width: 100%; height: 66px; padding: 10px 12px; border-radius: 10px; overflow: hidden; text-align: left;
+  font: 12px/1.5 var(--mono); box-shadow: inset 0 0 0 0.5px var(--sep);
+}
+.theme .prev b { font-weight: 400; }
+.theme .nm { color: var(--muted); }
+.theme input:checked ~ .prev { box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--accent); }
+.theme input:checked ~ .nm { color: var(--text); font-weight: 600; }
+.theme input:focus-visible ~ .prev { box-shadow: 0 0 0 2px var(--card), 0 0 0 5px var(--focus); }
+.theme input:disabled ~ * { opacity: 0.5; }
+.prev.t-sombre { background: #111317; color: #e7e9ed; } .prev.t-sombre b { color: #4fc1ff; }
+.prev.t-clair { background: #fafafa; color: #1f2328; } .prev.t-clair b { color: #0550ae; }
+.prev.t-solarise { background: #002b36; color: #93a1a1; } .prev.t-solarise b { color: #b58900; }
+.prev.t-dracula { background: #282a36; color: #f8f8f2; } .prev.t-dracula b { color: #bd93f9; }
+.prev.t-nord { background: #2e3440; color: #d8dee9; } .prev.t-nord b { color: #88c0d0; }
+.prev.t-alerte { background: #2b0b0e; color: #f4e4e5; } .prev.t-alerte b { color: #ff6b6b; }
+.tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.tags .tag { min-height: 36px; padding: 0 4px 0 12px; border-radius: 8px; font: 13px var(--mono); }
+.tags .tag button { width: 32px; min-height: 32px; margin: 0; border-radius: 999px; }
+.tags input { width: 130px; min-height: 36px; border-radius: 8px; padding: 0 12px; font: 13px var(--mono); }
+
+/* Admin : liste à gauche, éditeur à droite. */
+.admin { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 0 24px; align-items: start; }
+.admin > * { min-width: 0; }
+/* `fieldset` (figé pendant l'enregistrement) : sans l'habillage des fieldsets ci-dessus. */
+.editor { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 16px; margin-top: 24px; padding: 0; border-radius: 0; background: none; }
+.editor .group { margin: 0; }
+@media (max-width: 900px) { .admin { grid-template-columns: 1fr; } }
+.mlist { list-style: none; margin: 0; padding: 6px; display: flex; flex-direction: column; gap: 2px; background: var(--card); border-radius: 16px; box-shadow: var(--card-shadow); }
+.mrow {
+  display: flex; align-items: center; justify-content: flex-start; gap: 12px; width: 100%; min-height: 52px; padding: 0 10px;
+  border-radius: 10px; background: transparent; color: var(--text); font-weight: 400; text-align: left;
+}
+.mrow[aria-current="true"] { background: var(--fill); }
+.mrow .who { flex: 1; min-width: 0; }
+.mrow .who b, .mrow .who span { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mrow .who b { font-weight: 600; }
+.mrow .who span { font: 13px var(--mono); color: var(--muted); }
+.caps { display: flex; gap: 8px; }
+.caps .ico { width: 18px; height: 18px; }
+.caps .off { opacity: 0.25; }
+.mrow > .ico { width: 14px; height: 14px; color: var(--muted); }
+.avatar {
+  flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%;
+  background: linear-gradient(180deg, #a1a1a6, #7c7c80); color: #ffffff; font-size: 14px; font-weight: 600;
+}
+.urow { flex-wrap: wrap; row-gap: 0; padding-right: 8px; }
+.urow .name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.urow .role { font-size: 13px; color: var(--muted); }
+.urow .iconbtn { color: var(--link); background: transparent; }
+.mfa { display: grid; place-items: center; width: 28px; color: var(--orange); }
+.mfa.on { color: var(--green); }
+.sect .line-label { font-weight: 600; }
+.line .val { flex: 1; min-width: 0; text-align: right; font: 13px var(--mono); color: var(--muted); word-break: break-all; }
+.line.col .val { text-align: left; }
+.keyline code { flex: 1; min-width: 0; font: 13px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: all; }
+.keyline .iconbtn { color: var(--link); background: transparent; }
+.pick { cursor: pointer; }
+.pick .ico { color: var(--link); }
+.group fieldset .alert { margin: 12px 0 0; }
+.mrow .pastille { --s: 30px; }
+
+/* Écran tactile ou étroit : 16 px au moins dans les champs, sinon iOS zoome la page au focus (le zoom manuel reste
+   permis). En fin de fichier pour passer devant les tailles propres (.tags input). */
+@media (max-width: 640px), (pointer: coarse) {
+  input, select, textarea, .tags input { font-size: 16px; }
+  .search input { font-size: 17px; }
+}

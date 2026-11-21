@@ -63,7 +63,9 @@ pub fn total_len(buf: &[u8]) -> Option<usize> {
         return Some(usize::MAX);
     }
     let len = buf.get(2..2 + n)?.iter().fold(0usize, |acc, b| (acc << 8) | *b as usize);
-    Some(2 + n + len)
+    // Sur 32 bits, l'en-tête ajouté à une longueur de 4 octets peut déborder : on sature à
+    // `usize::MAX`, la valeur « invalide » déjà refusée par `read` et `read_frame`.
+    Some((2 + n).saturating_add(len))
 }
 
 /// Lit un TLV : (balise, contenu, reste).

@@ -8,7 +8,9 @@
 
 # Données locales et secrets (jamais dans Git)
 /data/
-/secrets/
+/deploy/data/
+# Tout dossier `secrets/`, où que soit lancé Compose (ex. deploy/secrets/master_key).
+secrets/
 *.db
 *.db-*
 .env
@@ -18,6 +20,7 @@
 # Sorties de la sonde : captures et enregistrements EGFX de l'écran distant
 *.png
 !crates/web/pwa/*.png
+!docs/images/*.png
 *.egfx
 *.dump
 

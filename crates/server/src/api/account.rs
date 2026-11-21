@@ -303,8 +303,9 @@ pub async fn terminal_set(
     if let Some(c) = combos.iter().find(|c| Combo::parse(c).is_none()) {
         return Err(bad(format!("combinaison invalide : « {c} » (ex. Ctrl+C, Alt+B, Ctrl+Alt+D)")));
     }
+    // Doublon = même séquence envoyée (Ctrl+C et ctrl+c), pas même texte : Alt+B et Alt+b diffèrent.
     let mut seen = std::collections::HashSet::new();
-    if let Some(c) = combos.iter().find(|c| !seen.insert(c.to_lowercase())) {
+    if let Some(c) = combos.iter().find(|c| !seen.insert(Combo::parse(c).map(|k| k.bytes()))) {
         return Err(bad(format!("combinaison en double : « {c} »")));
     }
     sqlx::query("UPDATE users SET terminal_theme = ?, key_combos = ? WHERE id = ?")

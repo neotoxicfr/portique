@@ -88,10 +88,12 @@ navigateur côté client, ordinateur ou téléphone.
 
 ```sh
 mkdir -p portique && cd portique
-(umask 077; mkdir -p secrets data                   # dossiers en 700 : rien de lisible par un autre compte
+(umask 077; mkdir -p secrets data                   # rien de lisible par un autre compte
  openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
- printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password)
-chmod 400 secrets/* && sudo chown 10001:10001 data secrets/*   # le conteneur tourne sous l'UID 10001
+ openssl rand -base64 18 > secrets/admin_password)  # mot de passe du premier compte admin
+chmod 700 secrets data                              # aussi si les dossiers existaient déjà
+chmod 400 secrets/* && cat secrets/admin_password        # à noter : il sert à la première connexion
+sudo chown 10001:10001 data secrets/*               # le conteneur tourne sous l'UID 10001
 ```
 
 L'UID 10001 ne doit être celui d'aucun compte de l'hôte : ce compte lirait la clé et la base. S'il est pris,
@@ -129,7 +131,7 @@ Un exemple complet (Traefik, Authelia, conteneur dans le réseau d'un tunnel Wir
 
 ### 2. Ajouter des machines
 
-Connecte-toi en `admin`, active un TOTP ou une passkey dans **Compte** (le SSH l'exige), puis ajoute tes
+Connecte-toi en `admin` avec le mot de passe affiché à l'étape 1, change-le dans **Compte**, active un TOTP ou une passkey dans **Compte** (le SSH l'exige), puis ajoute tes
 machines dans **Admin** : RDP, SSH ou les deux. Pour le SSH, la page Admin donne la ligne `authorized_keys` de
 la clé du service, à ajouter sur chaque hôte.
 

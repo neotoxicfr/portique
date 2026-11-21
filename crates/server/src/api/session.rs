@@ -56,7 +56,18 @@ pub async fn open(
     Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| async move {
         match prepared {
             Ok((row, trust)) => run(state, user, ip, row, trust, token, socket).await,
-            Err(e) => fail(socket, crate::state::user_message(e), true).await,
+            Err(e) => {
+                // Refus (accès, hôte sans RDP, empreinte invalide) : durable. Erreur interne (base
+                // momentanément indisponible) ou trop de tentatives : la reconnexion peut réussir.
+                let lasting = matches!(
+                    e,
+                    AppError::Unauthorized
+                        | AppError::Forbidden
+                        | AppError::NotFound
+                        | AppError::BadRequest(_)
+                );
+                fail(socket, crate::state::user_message(e), lasting).await
+            }
         }
     }))
 }

@@ -826,13 +826,15 @@ impl Engine {
         };
         let events =
             button_input(&mut self.inner.borrow_mut().buttons, e.pointer_id(), idx, kind, e.buttons(), point);
-        if events.is_empty() {
-            return;
-        }
+        // Capture même sans entrée RDP (bouton déjà tenu par un autre pointeur) : sinon le relâchement
+        // hors du canevas n'arriverait pas, et le bouton resterait enfoncé côté PC.
         if kind == "pointerdown"
             && let Some(v) = self.inner.borrow().views.get(idx)
         {
             let _ = v.canvas.set_pointer_capture(e.pointer_id());
+        }
+        if events.is_empty() {
+            return;
         }
         self.input(&events);
     }

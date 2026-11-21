@@ -13,9 +13,11 @@ git fetch -q origin dev
 
 ./scripts/ci.sh
 sha=$(git rev-parse --short HEAD)
-ssh "$DOCKER_SSH" "cd '$REMOTE_DIR' && ARM_HOST='$ARM_HOST' scripts/build-image.sh dev-$sha dev"
+# Valeur citée pour le shell distant (quel qu'il soit) : apostrophes comprises.
+quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+ssh "$DOCKER_SSH" "cd $(quote "$REMOTE_DIR") && ARM_HOST=$(quote "$ARM_HOST") scripts/build-image.sh dev-$sha dev"
 
 # Déploiement qui suit :dev (facultatif) : mis à jour dès la publication, sans attendre une mise à jour planifiée.
 if [[ -n ${DEPLOY_DIR:-} ]]; then
-  ssh "$DOCKER_SSH" "cd '$DEPLOY_DIR' && docker compose pull -q && docker compose up -d"
+  ssh "$DOCKER_SSH" "cd $(quote "$DEPLOY_DIR") && docker compose pull -q && docker compose up -d"
 fi

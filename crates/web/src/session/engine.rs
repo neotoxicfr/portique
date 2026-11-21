@@ -1428,7 +1428,14 @@ async fn paste_attempts<F: std::future::Future<Output = Option<bool>>>(
 
 /// Pointeurs suivis depuis leur `pointerdown` (souris, stylet, doigt d'une fenêtre secondaire) :
 /// vue d'origine, boutons transmis au PC (masque `PointerEvent.buttons`), dernière position envoyée.
-type Held = HashMap<i32, (usize, u16, (u16, u16))>;
+/// Boutons tenus par pointeur, clé (vue, pointerId) : un `pointerId` n'est unique que dans sa fenêtre.
+/// Valeur : (masque des boutons, dernière position envoyée).
+type Held = HashMap<(usize, i32), (u16, (u16, u16))>;
+
+/// RDP n'a qu'une souris : le PC voit l'union des boutons tenus par tous les pointeurs.
+fn held_mask(held: &Held) -> u16 {
+    held.values().fold(0, |m, h| m | h.0)
+}
 
 /// Bits de `PointerEvent.buttons` transmis, et bouton RDP de chacun (étendu : X1/X2).
 const BUTTONS: [(u16, u16, bool); 5] = {
@@ -1471,24 +1478,28 @@ fn button_input(
     at: (u16, u16),
 ) -> Vec<Input> {
     let buttons = buttons & BUTTONS.iter().map(|b| b.0).sum::<u16>();
+    let key = (view, id);
     let target = match kind {
         "pointerdown" => {
-            held.entry(id).or_insert((view, 0, at)).0 = view;
+            held.entry(key).or_insert((0, at));
             buttons
         }
-        "pointermove" if held.contains_key(&id) => buttons,
+        "pointermove" if held.contains_key(&key) => buttons,
         "pointermove" => return vec![Input::Mouse { flags: rdp_pdu::fastpath::ptr::MOVE, x: at.0, y: at.1 }],
         _ => 0,
     };
-    let Some(h) = held.get_mut(&id) else { return Vec::new() };
+    let before = held_mask(held);
+    let Some(h) = held.get_mut(&key) else { return Vec::new() };
     if kind != "pointercancel" {
-        h.2 = at;
+        h.1 = at;
     }
-    let out = button_changes(h.1, target, h.2);
-    h.1 = target;
+    h.0 = target;
+    let pos = h.1;
     if kind == "pointerup" || kind == "pointercancel" {
-        held.remove(&id);
+        held.remove(&key);
     }
+    // Transitions du masque global : un bouton encore tenu par un autre pointeur reste enfoncé.
+    let out = button_changes(before, held_mask(held), pos);
     if out.is_empty() && kind == "pointermove" {
         return vec![Input::Mouse { flags: rdp_pdu::fastpath::ptr::MOVE, x: at.0, y: at.1 }];
     }
@@ -1498,14 +1509,16 @@ fn button_input(
 /// Relâche les boutons des pointeurs partis d'une fenêtre secondaire, avant sa fermeture : son
 /// `pointerup` n'arrivera plus au moteur. Ceux de la fenêtre principale restent.
 fn release_secondary(held: &mut Held) -> Vec<Input> {
-    let mut out = Vec::new();
-    held.retain(|_, &mut (view, mask, at)| {
+    let before = held_mask(held);
+    let mut pos = None;
+    held.retain(|&(view, _), &mut (_, at)| {
         if view != 0 {
-            out.extend(button_changes(mask, 0, at));
+            pos.get_or_insert(at);
         }
         view == 0
     });
-    out
+    // Seuls les boutons que plus personne ne tient sont relâchés.
+    pos.map_or_else(Vec::new, |at| button_changes(before, held_mask(held), at))
 }
 
 /// Écran seul à envoyer pour `size` (déjà bornée), `None` s'il n'y a rien à envoyer. `desired`
@@ -1683,14 +1696,20 @@ mod tests {
         button_input(&mut held, 1, 1, "pointerdown", 1, (2000, 10));
         button_input(&mut held, 1, 1, "pointermove", 3, (2010, 20));
         button_input(&mut held, 9, 0, "pointerdown", 1, (10, 10));
+        // Le gauche est aussi tenu dans la vue principale : seul le droit est relâché.
+        assert_eq!(release_secondary(&mut held), vec![Input::Mouse { flags: ptr::BUTTON2, x: 2010, y: 20 }]);
+        assert_eq!(held.keys().collect::<Vec<_>>(), [&(0, 9)], "la vue principale garde son bouton");
         assert_eq!(
-            release_secondary(&mut held),
-            vec![
-                Input::Mouse { flags: ptr::BUTTON1, x: 2010, y: 20 },
-                Input::Mouse { flags: ptr::BUTTON2, x: 2010, y: 20 }
-            ]
+            button_input(&mut held, 9, 0, "pointerup", 0, (12, 12)),
+            vec![Input::Mouse { flags: ptr::BUTTON1, x: 12, y: 12 }]
         );
-        assert_eq!(held.keys().collect::<Vec<_>>(), [&9], "la vue principale garde son bouton");
+        // Même pointerId dans deux vues : suivis séparément.
+        button_input(&mut held, 7, 0, "pointerdown", 1, (1, 1));
+        assert_eq!(
+            button_input(&mut held, 7, 1, "pointermove", 0, (2000, 5)),
+            vec![Input::Mouse { flags: ptr::MOVE, x: 2000, y: 5 }]
+        );
+        assert_eq!(held.len(), 1, "le déplacement sans bouton d'une autre vue ne relâche rien");
         assert_eq!(release_secondary(&mut held), vec![]);
     }
 

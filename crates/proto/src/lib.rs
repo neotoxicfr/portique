@@ -277,19 +277,15 @@ pub struct UserInput {
 pub enum SessionMessage {
     /// Premier contact : l'empreinte du certificat du PC doit être approuvée par un admin
     /// (à comparer avec celle qu'affiche le script de préparation sur le PC).
-    UntrustedCertificate {
-        fingerprint: String,
-        can_approve: bool,
-    },
+    UntrustedCertificate { fingerprint: String, can_approve: bool },
     /// Le serveur a fait TLS + NLA : le navigateur reprend à MCS Connect Initial.
-    Ready {
-        selected_protocol: u32,
-        negotiation_flags: u8,
-        username: String,
-        domain: String,
-    },
+    Ready { selected_protocol: u32, negotiation_flags: u8, username: String, domain: String },
     Error {
         message: String,
+        /// Refus durable (accès, configuration, identifiants, certificat changé) : ne pas reconnecter.
+        /// Faux pour un échec passager (PC qui redémarre, réseau) : la reconnexion automatique reprend.
+        #[serde(default)]
+        lasting: bool,
     },
 }
 

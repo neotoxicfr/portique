@@ -113,7 +113,7 @@ pub async fn passkey_start(
     let creds: Vec<Passkey> = keys.into_iter().map(|(_, k)| k).collect();
     let (options, st) =
         state.webauthn.start_passkey_authentication(&creds).map_err(|e| anyhow::anyhow!("webauthn : {e}"))?;
-    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st, ticket, ip })?;
+    let ceremony = state.ceremonies.insert(Ceremony::Login { user_id: user.id, state: st, ticket, ip });
     Ok(Json(CeremonyChallenge { ceremony, options }))
 }
 
@@ -139,21 +139,42 @@ pub async fn passkey_finish(
         }
     };
 
-    // La passkey doit toujours être enregistrée : le défi a pu être émis avant sa suppression.
-    let Some((id, mut key)) =
-        load_passkeys(&state, user_id).await?.into_iter().find(|(_, k)| k.cred_id() == result.cred_id())
-    else {
-        tracing::info!(%ip, user = user.username, "passkey retirée pendant la connexion");
-        return Err(AppError::Unauthorized);
-    };
-    // Met à jour son compteur de signature.
-    if key.update_credential(&result) == Some(true) {
-        sqlx::query("UPDATE passkeys SET credential = ? WHERE id = ?")
+    // La passkey doit toujours être enregistrée : le défi a pu être émis avant sa suppression. Son compteur
+    // de signature ne s'écrit que sur la version lue : deux connexions simultanées ne le font pas reculer,
+    // la perdante repart de ce que l'autre a écrit.
+    let id = loop {
+        // Texte stocké gardé tel quel pour l'écriture conditionnelle : une resérialisation ne lui serait pas
+        // forcément identique (passkey écrite par une autre version de webauthn-rs).
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, credential FROM passkeys WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&state.db)
+                .await?;
+        let mut found = None;
+        for (id, read) in rows {
+            let key: Passkey = serde_json::from_str(&read).map_err(anyhow::Error::from)?;
+            if key.cred_id() == result.cred_id() {
+                found = Some((id, read, key));
+                break;
+            }
+        }
+        let Some((id, read, mut key)) = found else {
+            tracing::info!(%ip, user = user.username, "passkey retirée pendant la connexion");
+            return Err(AppError::Unauthorized);
+        };
+        if key.update_credential(&result) != Some(true) {
+            break id;
+        }
+        let r = sqlx::query("UPDATE passkeys SET credential = ? WHERE id = ? AND credential = ?")
             .bind(serde_json::to_string(&key).map_err(anyhow::Error::from)?)
             .bind(id)
+            .bind(&read)
             .execute(&state.db)
             .await?;
-    }
+        if r.rows_affected() == 1 {
+            break id;
+        }
+    };
 
     let jar = auth::open_session(&state, jar, user.id, auth::Proof::Passkey(id)).await?;
     // Rendue sous l'adresse du démarrage : celle de la fin peut différer (réseau mobile, double pile).

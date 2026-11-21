@@ -3,6 +3,11 @@
 # (SHA-512 publiée par npm, figée ici) et les place dans crates/web/vendor/xterm/ (ignoré par Git).
 # Appelé par scripts/ci.sh et le Dockerfile avant `trunk build`. Mise à jour : changer versions et empreintes.
 set -euo pipefail
+# Deux exécutions sur le même dossier (CI locale lancée deux fois, agents en parallèle) : la seconde attend la
+# première, sinon elle validerait le cache pendant que l'autre réécrit les fichiers. Verrou sur le script
+# lui-même : aucun fichier de plus dans le dossier copié par trunk.
+exec 9<"$0"
+flock 9
 cd "$(dirname "$0")/.."
 dest=crates/web/vendor/xterm
 pkgs=(

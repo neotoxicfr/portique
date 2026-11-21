@@ -513,6 +513,9 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let dup = json!({"theme": "nord", "combos": ["Ctrl+C", "ctrl+c"]});
+    let r = call(&app, "PUT", "/api/account/terminal", Some(&admin), Some(dup), &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "combinaison en double");
     let p = call(&app, "GET", "/api/account/terminal", Some(&admin), None, &[]).await.body;
     assert_eq!(p, json!({"theme": "nord", "combos": ["Ctrl+C", "Alt+B"]}));
 }

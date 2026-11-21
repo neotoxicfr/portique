@@ -56,7 +56,7 @@ pub async fn open(
     Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| async move {
         match prepared {
             Ok((row, trust)) => run(state, user, ip, row, trust, token, socket).await,
-            Err(e) => fail(socket, crate::state::user_message(e)).await,
+            Err(e) => fail(socket, crate::state::user_message(e), true).await,
         }
     }))
 }
@@ -89,8 +89,9 @@ async fn send_text(socket: &mut WebSocket, msg: &SessionMessage) {
     }
 }
 
-async fn fail(mut socket: WebSocket, message: String) {
-    send_text(&mut socket, &SessionMessage::Error { message }).await;
+/// `lasting` : refus durable, le navigateur ne relance pas la connexion.
+async fn fail(mut socket: WebSocket, message: String, lasting: bool) {
+    send_text(&mut socket, &SessionMessage::Error { message, lasting }).await;
     let _ = socket.close().await;
 }
 
@@ -137,10 +138,11 @@ async fn run(
     let password = match &row.password {
         Some(sealed) => match state.vault.open(&format!("connection:{}", row.id), sealed) {
             Ok(p) => String::from_utf8_lossy(&p).into_owned(),
-            Err(e) => return fail(socket, format!("mot de passe illisible : {e}")).await,
+            Err(e) => return fail(socket, format!("mot de passe illisible : {e}"), true).await,
         },
         None => {
-            return fail(socket, "aucun mot de passe Windows enregistré pour cette connexion".into()).await;
+            return fail(socket, "aucun mot de passe Windows enregistré pour cette connexion".into(), true)
+                .await;
         }
     };
     let target = rdp_connect::Target {
@@ -165,7 +167,13 @@ async fn run(
         }
         Err(e) => {
             tracing::warn!(user = user.username, connection = row.name, "échec de connexion : {e}");
-            return fail(socket, e.to_string()).await;
+            // Identifiants refusés ou certificat changé : réessayer ne changera rien. Le reste (PC
+            // injoignable, délai, TLS, négociation) peut venir d'un PC qui redémarre.
+            let lasting = matches!(
+                e,
+                rdp_connect::ConnectError::Auth(_) | rdp_connect::ConnectError::CertificateMismatch { .. }
+            );
+            return fail(socket, e.to_string(), lasting).await;
         }
     };
     let tm = connected.timings;

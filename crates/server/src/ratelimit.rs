@@ -62,9 +62,11 @@ fn ip_key(ip: IpAddr) -> String {
 }
 
 impl LoginLimiter {
+    /// Identifiant replié comme `COLLATE NOCASE` (ASCII seulement) : « Élodie » et « élodie » sont deux
+    /// comptes en base, ils ne partagent pas leur plafond.
     fn keys(ip: IpAddr, username: &str) -> [(String, usize); 2] {
         let ip = ip_key(ip);
-        [(format!("{ip}|{}", username.to_lowercase()), MAX_PER_ACCOUNT), (ip, MAX_PER_IP)]
+        [(format!("{ip}|{}", username.to_ascii_lowercase()), MAX_PER_ACCOUNT), (ip, MAX_PER_IP)]
     }
 
     /// Réserve une tentative : plafonds vérifiés et tentative comptée sous le même verrou, avant tout travail
@@ -137,6 +139,9 @@ mod tests {
         let mut tickets: Vec<_> = (0..MAX_PER_ACCOUNT).map(|_| l.reserve(ip, "alice").unwrap()).collect();
         assert!(l.reserve(ip, "Alice").is_none());
         assert!(l.reserve(ip, "autre").is_some());
+        // Repli ASCII seulement, comme la base : « Élodie » n'épuise pas le plafond d'« élodie ».
+        let _elodie: Vec<_> = (0..MAX_PER_ACCOUNT).map(|_| l.reserve(ip, "Élodie").unwrap()).collect();
+        assert!(l.reserve(ip, "élodie").is_some());
         l.succeeded(ip, "alice", tickets.remove(0));
         // Le succès ne rend que sa place : les quatre autres tentatives sont toujours en vol.
         let fifth = l.reserve(ip, "alice").expect("place du succès rendue");

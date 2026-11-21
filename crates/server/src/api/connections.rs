@@ -398,6 +398,10 @@ fn validate(i: &ConnectionInput) -> ApiResult<Valid> {
         Some(m) => Some(wol::format_mac(wol::parse_mac(m).ok_or_else(|| bad("adresse MAC invalide"))?)),
         None => None,
     };
+    // Le réveil par commande remplace {mac} : sans adresse, la commande partirait vide.
+    if i.wol_command.is_some() && wol_mac.is_none() {
+        return Err(bad("adresse MAC requise pour le réveil par commande"));
+    }
     let wol_target = match i.wol_target.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(t) => {
             Some(wol::parse_target(t).ok_or_else(|| bad("cible WoL invalide (ip ou ip:port)"))?.to_string())

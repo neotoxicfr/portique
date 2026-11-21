@@ -57,7 +57,7 @@ const MAX_LOGINS: usize = 1000;
 const MAX_REGISTRATIONS: usize = 100;
 
 impl Ceremonies {
-    pub fn insert(&self, c: Ceremony) -> Result<Uuid, AppError> {
+    pub fn insert(&self, c: Ceremony) -> Uuid {
         let id = Uuid::new_v4();
         let mut map = self.pending.lock().unwrap();
         map.retain(|_, (t, _)| t.elapsed() < CEREMONY_TTL);
@@ -73,7 +73,7 @@ impl Ceremonies {
             map.remove(&oldest);
         }
         map.insert(id, (Instant::now(), c));
-        Ok(id)
+        id
     }
 
     /// Retire la cérémonie : un défi ne sert qu'une fois, même en cas d'échec.
@@ -175,10 +175,10 @@ mod tests {
             Ceremony::Login { user_id: 1, state, ticket, ip: "192.0.2.1".parse().unwrap() }
         };
         let c = Ceremonies::default();
-        let reg = c.insert(register()).unwrap();
-        let first_login = c.insert(login()).unwrap();
+        let reg = c.insert(register());
+        let first_login = c.insert(login());
         for _ in 1..MAX_LOGINS + 10 {
-            c.insert(login()).unwrap();
+            c.insert(login());
         }
         assert_eq!(c.pending.lock().unwrap().len(), MAX_LOGINS + 1);
         assert!(c.take(first_login).is_none(), "plus ancienne connexion évincée");

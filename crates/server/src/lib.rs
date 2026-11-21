@@ -225,6 +225,53 @@ pub fn app(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    /// 0008 : comptes et hôtes reconstruits sans perdre ce qui les référence (sessions, passkeys, droits,
+    /// rebonds), clés étrangères rétablies ; un identifiant supprimé n'est plus redonné.
+    #[tokio::test]
+    async fn rebuild_keeps_children_and_ids_are_never_reused() {
+        use super::*;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:").unwrap().foreign_keys(true);
+        let db = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(7, &db).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users (username, webauthn_id) VALUES ('alice', 'a'), ('bob', 'b');
+             INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (x'01', 1, 0, 1), (x'02', 2, 0, 0);
+             INSERT INTO passkeys (user_id, name, credential) VALUES (2, 'clé', '{}');
+             INSERT INTO connections (name, host, port) VALUES ('pc', '192.0.2.1', 3389), ('rebond', '192.0.2.2', 22);
+             UPDATE connections SET ssh_jump_id = 2, wol_via_id = 2 WHERE id = 1;
+             INSERT INTO connection_access (connection_id, user_id) VALUES (1, 1), (2, 2);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        migrator.run(&db).await.unwrap();
+        let n = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(&db);
+        assert_eq!(n("PRAGMA foreign_keys").await.unwrap(), 1, "clés étrangères rétablies");
+        let kept = "SELECT (SELECT count(*) FROM users) * 1000 + (SELECT count(*) FROM sessions) * 100
+                    + (SELECT count(*) FROM passkeys) * 10 + (SELECT count(*) FROM connection_access)";
+        assert_eq!(n(kept).await.unwrap(), 2212, "comptes, sessions, passkeys, droits");
+        assert_eq!(n("SELECT ssh_jump_id + wol_via_id FROM connections WHERE id = 1").await.unwrap(), 4);
+
+        // bob porte le plus grand identifiant : supprimé, il emporte ses lignes, et carol ne prend pas sa place.
+        sqlx::raw_sql(
+            "DELETE FROM users WHERE id = 2; INSERT INTO users (username, webauthn_id) VALUES ('carol', 'c');
+             DELETE FROM connections WHERE id = 2; INSERT INTO connections (name, host, port) VALUES ('nas', '192.0.2.3', 22);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(n("SELECT id FROM users WHERE username = 'carol'").await.unwrap(), 3);
+        assert_eq!(n("SELECT id FROM connections WHERE name = 'nas'").await.unwrap(), 3);
+        assert_eq!(n(kept).await.unwrap(), 2101, "lignes de bob et du rebond supprimées en cascade");
+        assert_eq!(
+            n("SELECT count(*) FROM connections WHERE ssh_jump_id IS NULL AND wol_via_id IS NULL")
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
     #[test]
     fn static_cache_control_by_name() {
         use super::static_cache_control as c;

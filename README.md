@@ -87,11 +87,15 @@ navigateur côté client, ordinateur ou téléphone.
 ### 1. Lancer le conteneur
 
 ```sh
-mkdir -p portique/secrets portique/data && cd portique
-openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
-printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password
+mkdir -p portique && cd portique
+(umask 077; mkdir -p secrets data                   # dossiers en 700 : rien de lisible par un autre compte
+ openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
+ printf '%s' 'un-mot-de-passe-solide' > secrets/admin_password)
 chmod 400 secrets/* && sudo chown 10001:10001 data secrets/*   # le conteneur tourne sous l'UID 10001
 ```
+
+L'UID 10001 ne doit être celui d'aucun compte de l'hôte : ce compte lirait la clé et la base. S'il est pris,
+isole le conteneur avec `userns-remap`.
 
 Avec Docker rootless ou `userns-remap`, l'UID 10001 du conteneur correspond à un autre UID de l'hôte : donne
 `data` et les secrets au début de ta plage `/etc/subuid` + 10000 en rootless, + 10001 avec `userns-remap`

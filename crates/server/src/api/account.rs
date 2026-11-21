@@ -7,7 +7,7 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use portique_proto::{
-    CeremonyChallenge, CeremonyFinish, ChangePassword, Combo, DEFAULT_COMBOS, PasskeyInfo, ReAuth,
+    AuthMode, CeremonyChallenge, CeremonyFinish, ChangePassword, Combo, DEFAULT_COMBOS, PasskeyInfo, ReAuth,
     TERMINAL_THEMES, TerminalPrefs, TotpConfirm, TotpSetup,
 };
 use uuid::Uuid;
@@ -136,12 +136,21 @@ pub async fn totp_confirm(
     let secret = state.vault.open(&format!("totp-pending:{}", u.id), &pending)?;
     let step = totp::verify(&secret, &u.username, &req.code, 0)?
         .ok_or_else(|| bad("code invalide, vérifie l'heure du téléphone"))?;
-    sqlx::query("UPDATE users SET totp_secret = ?, totp_pending = NULL, totp_last = ? WHERE id = ?")
-        .bind(state.vault.seal(&format!("totp:{}", u.id), &secret))
-        .bind(step)
-        .bind(u.id)
-        .execute(&state.db)
-        .await?;
+    // N'active que la graine vérifiée : effacée entre-temps (remise à zéro de la 2FA par un admin) ou
+    // remplacée par une autre configuration, elle ne doit pas revenir.
+    let r = sqlx::query(
+        "UPDATE users SET totp_secret = ?, totp_pending = NULL, totp_last = ?
+         WHERE id = ? AND totp_secret IS NULL AND totp_pending = ?",
+    )
+    .bind(state.vault.seal(&format!("totp:{}", u.id), &secret))
+    .bind(step)
+    .bind(u.id)
+    .bind(&pending)
+    .execute(&state.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(bad("aucune configuration TOTP en cours"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -193,7 +202,7 @@ pub async fn passkey_register_start(
         .webauthn
         .start_passkey_registration(user_uuid, &u.username, &u.username, Some(exclude))
         .map_err(|e| anyhow::anyhow!("webauthn : {e}"))?;
-    let ceremony = state.ceremonies.insert(Ceremony::Register { user_id: u.id, state: st })?;
+    let ceremony = state.ceremonies.insert(Ceremony::Register { user_id: u.id, state: st });
     Ok(Json(CeremonyChallenge { ceremony, options }))
 }
 
@@ -220,12 +229,23 @@ pub async fn passkey_register_finish(
         .map(|n| n.trim().chars().take(64).collect::<String>())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Passkey".into());
-    sqlx::query("INSERT INTO passkeys (user_id, name, credential) VALUES (?, ?, ?)")
-        .bind(u.id)
-        .bind(name)
-        .bind(serde_json::to_string(&key).map_err(anyhow::Error::from)?)
-        .execute(&state.db)
-        .await?;
+    // La session qui a passé les contrôles doit exister encore : une remise à zéro de la 2FA ou un mot de
+    // passe changé par un admin entre-temps l'a supprimée, la passkey ne doit pas survivre à ce ménage.
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
+    let r = sqlx::query(
+        "INSERT INTO passkeys (user_id, name, credential) SELECT ?1, ?2, ?3
+         WHERE ?4 OR EXISTS (SELECT 1 FROM sessions WHERE token_hash = ?5 AND user_id = ?1)",
+    )
+    .bind(u.id)
+    .bind(name)
+    .bind(serde_json::to_string(&key).map_err(anyhow::Error::from)?)
+    .bind(state.cfg.auth_mode == AuthMode::Proxy)
+    .bind(token)
+    .execute(&state.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::Unauthorized);
+    }
     Ok(StatusCode::CREATED)
 }
 
@@ -283,6 +303,10 @@ pub async fn terminal_set(
     if let Some(c) = combos.iter().find(|c| Combo::parse(c).is_none()) {
         return Err(bad(format!("combinaison invalide : « {c} » (ex. Ctrl+C, Alt+B, Ctrl+Alt+D)")));
     }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(c) = combos.iter().find(|c| !seen.insert(c.to_lowercase())) {
+        return Err(bad(format!("combinaison en double : « {c} »")));
+    }
     sqlx::query("UPDATE users SET terminal_theme = ?, key_combos = ? WHERE id = ?")
         .bind(&p.theme)
         .bind(serde_json::to_string(&combos).map_err(anyhow::Error::from)?)
@@ -295,7 +319,8 @@ pub async fn terminal_set(
 #[cfg(test)]
 mod tests {
     use axum::{Json, extract::State};
-    use portique_proto::{ChangePassword, ReAuth};
+    use axum_extra::extract::CookieJar;
+    use portique_proto::{ChangePassword, ReAuth, TotpConfirm};
 
     use crate::{
         auth::{self, ClientIp, CurrentUser, user_by_name},
@@ -357,5 +382,48 @@ mod tests {
         assert!(matches!(r, Err(AppError::Unauthorized)));
         let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
         assert_eq!(now.password_hash, stale.password_hash);
+    }
+
+    /// Un admin remet la 2FA à zéro pendant qu'une confirmation TOTP est en vol (graine lue, code vérifié) :
+    /// la graine effacée n'est pas réactivée. Base sur disque : la remise à zéro tient le verrou d'écriture
+    /// pendant que la confirmation lit la graine, puis attend ce verrou pour écrire.
+    #[tokio::test]
+    async fn totp_confirm_does_not_revive_a_reset_seed() {
+        let path = std::env::temp_dir().join(format!("portique-totp-{}.db", std::process::id()));
+        let db = crate::open_db(&format!("sqlite://{}", path.display())).await.unwrap();
+        let s = crate::state::AppState { db, ..crate::api::ssh::tests::state("builtin").await };
+        crate::bootstrap_admin(&s).await.unwrap();
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        sqlx::query("UPDATE users SET totp_pending = ? WHERE id = ?")
+            .bind(s.vault.seal(&format!("totp-pending:{}", u.id), &secret))
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+
+        let mut reset = s.db.begin().await.unwrap();
+        sqlx::query("UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0 WHERE id = ?")
+            .bind(u.id)
+            .execute(&mut *reset)
+            .await
+            .unwrap();
+        let confirm = tokio::spawn(super::totp_confirm(
+            State(s.clone()),
+            CurrentUser(u.clone()),
+            CookieJar::new(),
+            Json(TotpConfirm { code }),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        reset.commit().await.unwrap();
+        assert!(confirm.await.unwrap().is_err());
+        let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        assert!(now.totp_secret.is_none(), "graine réactivée après la remise à zéro");
+
+        s.db.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 }

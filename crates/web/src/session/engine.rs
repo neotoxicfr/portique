@@ -1475,6 +1475,15 @@ impl Engine {
         self.input(&events);
     }
 
+    /// Touche de la barre de touches (scancodes), avec ses modificateurs collants.
+    pub fn bar_chord(&self, mods: super::keys::Mods, code: Option<&str>) {
+        if !self.is_connected() {
+            return;
+        }
+        self.user_gesture();
+        self.input(&super::keys::chord(mods, code));
+    }
+
     pub fn ctrl_alt_del(&self) {
         use rdp_pdu::fastpath::kbd::{EXTENDED, RELEASE};
         self.input(&[

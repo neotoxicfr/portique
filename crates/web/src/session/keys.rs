@@ -172,6 +172,43 @@ pub fn tap(code: u8, extended: bool) -> [Input; 2] {
     [Input::Scancode { code, flags: ext }, Input::Scancode { code, flags: ext | RELEASE }]
 }
 
+/// Modificateurs collants de la barre de touches : appliqués à la prochaine touche de la barre.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub win: bool,
+}
+
+/// Touche de la barre avec ses modificateurs : modificateurs enfoncés (Ctrl, Alt, Win), touche
+/// appuyée puis relâchée, modificateurs relâchés en ordre inverse. Sans touche (`None`), les
+/// modificateurs seuls sont tapés (Win seul = menu Démarrer). Code inconnu : rien.
+pub fn chord(mods: Mods, code: Option<&str>) -> Vec<Input> {
+    let key = match code {
+        Some(c) => match scancode(c) {
+            Some(k) => Some(k),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let held: Vec<(u8, bool)> =
+        [(mods.ctrl, (0x1D, false)), (mods.alt, (0x38, false)), (mods.win, (0x5B, true))]
+            .into_iter()
+            .filter_map(|(on, k)| on.then_some(k))
+            .collect();
+    let mut out = Vec::new();
+    for (code, ext) in &held {
+        out.push(Input::Scancode { code: *code, flags: if *ext { EXTENDED } else { 0 } });
+    }
+    if let Some((code, ext)) = key {
+        out.extend(tap(code, ext));
+    }
+    for (code, ext) in held.iter().rev() {
+        out.push(Input::Scancode { code: *code, flags: RELEASE | if *ext { EXTENDED } else { 0 } });
+    }
+    out
+}
+
 /// Texte tapé au clavier virtuel : caractères en Unicode (une paire de substitution est appuyée
 /// puis relâchée d'un bloc), fins de ligne (CRLF, CR ou LF) en une touche Entrée.
 pub fn text_events(text: &str) -> Vec<Input> {
@@ -216,6 +253,36 @@ mod tests {
         assert_eq!(scancode_of("Enter", "Enter"), Some((0x1C, false)), "clavier physique inchangé");
         assert_eq!(scancode_of("Unidentified", "a"), None, "caractère : par Unicode");
         assert_eq!(scancode_of("KeyQ", "a"), scancode("KeyQ"), "la position prime (AZERTY)");
+    }
+
+    #[test]
+    fn bar_chords_with_sticky_modifiers() {
+        let sc = |code, flags| Input::Scancode { code, flags };
+        let alt = Mods { alt: true, ..Mods::default() };
+        assert_eq!(
+            chord(alt, Some("Tab")),
+            [sc(0x38, 0), sc(0x0F, 0), sc(0x0F, RELEASE), sc(0x38, RELEASE)],
+            "Alt puis Tab = Alt+Tab"
+        );
+        let win = Mods { win: true, ..Mods::default() };
+        assert_eq!(chord(win, None), [sc(0x5B, EXTENDED), sc(0x5B, EXTENDED | RELEASE)], "Win seul");
+        let all = Mods { ctrl: true, alt: true, win: true };
+        assert_eq!(
+            chord(all, Some("ArrowLeft")),
+            [
+                sc(0x1D, 0),
+                sc(0x38, 0),
+                sc(0x5B, EXTENDED),
+                sc(0x4B, EXTENDED),
+                sc(0x4B, EXTENDED | RELEASE),
+                sc(0x5B, EXTENDED | RELEASE),
+                sc(0x38, RELEASE),
+                sc(0x1D, RELEASE)
+            ]
+        );
+        assert_eq!(chord(Mods::default(), Some("F5")), tap(0x3F, false), "sans modificateur : un appui");
+        assert_eq!(chord(all, Some("Nope")), Vec::new(), "code inconnu : rien, modificateurs coincés exclus");
+        assert!(chord(Mods::default(), None).is_empty());
     }
 
     #[test]

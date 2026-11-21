@@ -423,15 +423,39 @@ td.cell-actions { text-align: right; }
   position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; resize: none;
   pointer-events: none; color: transparent; caret-color: transparent; background: transparent; font-size: 16px;
 }
-/* Bouton clavier : en haut à droite, le clavier iOS couvre le bas de la vue. Écrans tactiles seulement. */
-.session-keyboard {
-  position: absolute; top: calc(env(safe-area-inset-top) + 8px); right: calc(env(safe-area-inset-right) + 8px); z-index: 2;
-  display: none; place-items: center; width: 44px; height: 44px; min-height: 0; border-radius: 50%; padding: 0;
-  background: rgba(30, 30, 32, 0.6); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
-  color: #ffffff; opacity: 0.55;
+/* Groupe clavier + déconnexion : déplaçable (position en ligne, bornée côté Rust), écrans tactiles seulement. Les zones
+   sûres sont lues dans le padding de .session. */
+.session { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.session-dock {
+  position: absolute; z-index: 2; display: none; flex-direction: column; gap: 8px; width: 44px;
+  touch-action: none; -webkit-user-select: none; user-select: none; opacity: 0.55;
 }
-.session-keyboard:hover, .session-keyboard:focus-visible { opacity: 1; }
-@media (any-pointer: coarse) { .session-keyboard { display: grid; } }
+.session-dock:hover, .session-dock:focus-within { opacity: 1; }
+.session-dock button {
+  display: grid; place-items: center; width: 44px; height: 44px; min-height: 0; border-radius: 50%; padding: 0;
+  background: rgba(30, 30, 32, 0.6); -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  color: #ffffff;
+}
+.session-dock button.danger { background: rgba(255, 69, 58, 0.9); }
+@media (any-pointer: coarse) { .session-dock { display: flex; } }
+/* Barre de touches du clavier système (téléphone, tablette), posée au-dessus de lui : `bottom` suit visualViewport. */
+.session-keys {
+  position: absolute; left: 0; right: 0; z-index: 2; display: none; flex-direction: column; gap: 6px; box-sizing: border-box; height: 106px;
+  padding: 6px max(6px, env(safe-area-inset-right)) 6px max(6px, env(safe-area-inset-left));
+  background: var(--kb-bar); border-top: 0.5px solid var(--sep);
+}
+@media (any-pointer: coarse) { .session-keys { display: flex; } }
+.sk-row { display: flex; gap: 6px; height: 44px; flex: none; }
+.sk-row.scroll { overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.sk-row.scroll::-webkit-scrollbar { display: none; }
+.sk-key {
+  flex: 1 1 0; min-width: 0; height: 44px; min-height: 0; padding: 0; border-radius: 7px; border: 0;
+  background: var(--kb-key); color: var(--kb-text); box-shadow: var(--kb-shadow);
+  font-size: 14px; font-weight: 500; letter-spacing: -0.2px; touch-action: manipulation;
+}
+.sk-row.scroll .sk-key { flex: 0 0 auto; min-width: 48px; padding: 0 12px; }
+.sk-key.special { background: var(--kb-special); font-family: var(--mono); font-size: 13px; font-weight: 400; }
+.sk-key.on { background: var(--kb-on); color: #ffffff; }
 /* Barre pleine largeur, contenu centré : le menu ne dépasse jamais la fenêtre et les commandes passent à la ligne. */
 .session-menu {
   position: absolute; top: env(safe-area-inset-top); left: 0; right: 0; z-index: 2;
@@ -580,6 +604,9 @@ label.line { flex-direction: row; }
 .editor { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 16px; margin-top: 24px; padding: 0; border-radius: 0; background: none; }
 .editor .group { margin: 0; }
 @media (max-width: 900px) { .admin { grid-template-columns: 1fr; } }
+/* Écran étroit : l'éditeur s'ouvre dans la liste des machines, sous la ligne touchée. */
+section > .editor { margin-top: 12px; }
+.editor + .mlist { margin-top: 16px; }
 .mlist { list-style: none; margin: 0; padding: 6px; display: flex; flex-direction: column; gap: 2px; background: var(--card); border-radius: 16px; box-shadow: var(--card-shadow); }
 .mrow {
   display: flex; align-items: center; justify-content: flex-start; gap: 12px; width: 100%; min-height: 52px; padding: 0 10px;
@@ -604,9 +631,6 @@ label.line { flex-direction: row; }
 .urow .iconbtn { color: var(--link); background: transparent; }
 .mfa { display: grid; place-items: center; width: 28px; color: var(--orange); }
 .mfa.on { color: var(--green); }
-/* Écran étroit : l'éditeur s'ouvre dans la liste des machines, sous la ligne touchée. */
-section > .editor { margin-top: 12px; }
-.editor + .mlist { margin-top: 16px; }
 .mfa.info { color: var(--link); }
 .sect .line-label { font-weight: 600; }
 .line .val { flex: 1; min-width: 0; text-align: right; font: 13px var(--mono); color: var(--muted); word-break: break-all; }

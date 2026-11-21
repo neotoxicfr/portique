@@ -2,6 +2,7 @@
 //! virtuel), menu, reconnexion automatique.
 
 mod clip;
+mod dock;
 mod engine;
 mod h264;
 mod keys;
@@ -13,7 +14,7 @@ use std::rc::Rc;
 use engine::{Engine, Extend, Open, Retry, Status};
 use leptos::{
     ev,
-    html::{Button, Canvas, Textarea},
+    html::{Button, Canvas, Div, Textarea},
     prelude::*,
     task::spawn_local,
 };
@@ -27,6 +28,30 @@ const RETRY_DELAYS: [u32; 8] = [1, 2, 3, 5, 8, 13, 21, 30];
 
 /// Icône du bouton de clavier virtuel.
 const KEYBOARD: &str = r#"<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/>"#;
+
+/// Hauteur de la barre de touches (CSS `.session-keys`) : deux rangées de 44 px et leurs marges.
+const KEYS_HEIGHT: f64 = 106.0;
+
+/// Rangée 2 de la barre de touches (défilante) : (libellé, nom accessible, `KeyboardEvent.code`).
+const KEYS_MORE: [(&str, &str, &str); 17] = [
+    ("Suppr", "Supprimer", "Delete"),
+    ("Début", "Début", "Home"),
+    ("Fin", "Fin", "End"),
+    ("Pg ↑", "Page précédente", "PageUp"),
+    ("Pg ↓", "Page suivante", "PageDown"),
+    ("F1", "F1", "F1"),
+    ("F2", "F2", "F2"),
+    ("F3", "F3", "F3"),
+    ("F4", "F4", "F4"),
+    ("F5", "F5", "F5"),
+    ("F6", "F6", "F6"),
+    ("F7", "F7", "F7"),
+    ("F8", "F8", "F8"),
+    ("F9", "F9", "F9"),
+    ("F10", "F10", "F10"),
+    ("F11", "F11", "F11"),
+    ("F12", "F12", "F12"),
+];
 
 /// Texte collé dans le champ du clavier virtuel quand le navigateur le met dans `dataTransfer`
 /// plutôt que dans `data` (lu par réflexion : pas de feature web-sys `DataTransfer`).
@@ -67,6 +92,40 @@ fn viewport() -> (u32, u32) {
     (px(w.inner_width()), px(w.inner_height()))
 }
 
+/// Vue visible `(x, y, largeur, hauteur)` : celle du clavier ouvert sur iOS (`visualViewport`).
+fn visible_area() -> (f64, f64, f64, f64) {
+    let w = window();
+    if let Some(v) = w.visual_viewport() {
+        return (v.offset_left(), v.offset_top(), v.width(), v.height());
+    }
+    let (iw, ih) = viewport();
+    (0.0, 0.0, iw as f64, ih as f64)
+}
+
+/// Zones sûres `(haut, droite, bas, gauche)` : le `padding` de `.session` les reprend (env()).
+fn safe_insets(el: Option<web_sys::HtmlElement>) -> (f64, f64, f64, f64) {
+    let Some(style) = el.and_then(|e| window().get_computed_style(&e).ok().flatten()) else {
+        return (0.0, 0.0, 0.0, 0.0);
+    };
+    let px = |p: &str| {
+        style
+            .get_property_value(p)
+            .ok()
+            .and_then(|v| v.trim_end_matches("px").parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    (px("padding-top"), px("padding-right"), px("padding-bottom"), px("padding-left"))
+}
+
+/// Glissé du groupe clavier / déconnexion en cours.
+#[derive(Clone, Copy)]
+struct Drag {
+    id: i32,
+    start: (f64, f64),
+    origin: (f64, f64),
+    moving: bool,
+}
+
 fn sleep(seconds: u32) -> impl std::future::Future<Output = ()> {
     let p = js_sys::Promise::new(&mut |resolve, _| {
         let _ =
@@ -84,6 +143,16 @@ pub fn SessionPage() -> impl IntoView {
     let canvas_ref = NodeRef::<Canvas>::new();
     let kbd_ref = NodeRef::<Textarea>::new();
     let handle_ref = NodeRef::<Button>::new();
+    let session_ref = NodeRef::<Div>::new();
+    let dock_ref = NodeRef::<Div>::new();
+    // Clavier système affiché (champ caché focalisé), vue visible, position retenue du groupe
+    // clavier / déconnexion, modificateurs collants de la barre de touches.
+    let kbd_open = RwSignal::new(false);
+    let visible = RwSignal::new(visible_area());
+    let dock_pos = RwSignal::new(dock::load());
+    let mods = RwSignal::new(keys::Mods::default());
+    let drag = StoredValue::new(None::<Drag>);
+    let swallow_click = StoredValue::new(false);
     let status = RwSignal::new(Status::Connecting("Préparation…".into()));
     let attempt = RwSignal::new(0usize);
     let menu_open = RwSignal::new(false);
@@ -274,11 +343,31 @@ pub fn SessionPage() -> impl IntoView {
         }
     });
 
-    let listeners = StoredValue::new_local(Some((kd, ku, blur, resize, focus)));
+    let vp_window = window_event_listener(ev::resize, move |_| visible.set(visible_area()));
+    // Clavier iOS : la vue visible change de hauteur et de décalage sans que la fenêtre bouge.
+    let vp_cb = Closure::<dyn FnMut()>::new(move || visible.set(visible_area()));
+    if let Some(v) = window().visual_viewport() {
+        let f = vp_cb.as_ref().unchecked_ref();
+        let _ = v.add_event_listener_with_callback("resize", f);
+        let _ = v.add_event_listener_with_callback("scroll", f);
+    }
+    let vp_cb = StoredValue::new_local(Some(vp_cb));
+
+    let listeners = StoredValue::new_local(Some((kd, ku, blur, resize, focus, vp_window)));
     on_cleanup(move || {
         open_gen.try_update_value(|g| *g += 1);
         cancel_resize();
-        if let Some((kd, ku, blur, resize, focus)) = listeners.try_update_value(Option::take).flatten() {
+        if let Some(cb) = vp_cb.try_update_value(Option::take).flatten()
+            && let Some(v) = window().visual_viewport()
+        {
+            let f = cb.as_ref().unchecked_ref();
+            let _ = v.remove_event_listener_with_callback("resize", f);
+            let _ = v.remove_event_listener_with_callback("scroll", f);
+        }
+        if let Some((kd, ku, blur, resize, focus, vp_window)) =
+            listeners.try_update_value(Option::take).flatten()
+        {
+            vp_window.remove();
             kd.remove();
             ku.remove();
             blur.remove();
@@ -298,11 +387,21 @@ pub fn SessionPage() -> impl IntoView {
     // Clavier virtuel (téléphone, tablette) : un champ caché reçoit le focus dans le geste, ses
     // saisies partent au PC et il reste vide.
     let toggle_keyboard = move |_| {
+        if swallow_click.get_value() {
+            return;
+        }
         let Some(t) = kbd_ref.get_untracked() else { return };
         let el: &web_sys::Element = t.as_ref();
         if document().active_element().is_some_and(|a| &a == el) {
             let _ = t.blur();
         } else {
+            let opts = web_sys::FocusOptions::new();
+            opts.set_prevent_scroll(true);
+            let _ = t.focus_with_options(&opts);
+        }
+    };
+    let focus_keyboard = move || {
+        if let Some(t) = kbd_ref.get_untracked() {
             let opts = web_sys::FocusOptions::new();
             opts.set_prevent_scroll(true);
             let _ = t.focus_with_options(&opts);
@@ -419,8 +518,99 @@ pub fn SessionPage() -> impl IntoView {
         }
     });
 
+    // Zone du groupe clavier / déconnexion : vue visible, zones sûres, barre de touches si affichée.
+    let area = move || {
+        let reserved = if kbd_open.get() { KEYS_HEIGHT } else { 0.0 };
+        let insets = safe_insets(session_ref.get_untracked().map(Into::into));
+        dock::Area::new(visible.get(), insets, reserved)
+    };
+    let dock_style = move || {
+        let (x, y) = dock::place(dock_pos.get(), area());
+        format!("left:{x}px;top:{y}px")
+    };
+    let dock_down = move |e: PointerEvent| {
+        // Sans défaut : le focus reste sur le champ du clavier (qui ne se ferme pas).
+        e.prevent_default();
+        if !e.is_primary() || (e.pointer_type() == "mouse" && e.button() != 0) {
+            return;
+        }
+        swallow_click.set_value(false);
+        let origin = dock::place(dock_pos.get_untracked(), area());
+        let start = (e.client_x(), e.client_y());
+        drag.set_value(Some(Drag { id: e.pointer_id(), start, origin, moving: false }));
+    };
+    let dock_move = move |e: PointerEvent| {
+        let Some(mut d) = drag.get_value().filter(|d| d.id == e.pointer_id()) else { return };
+        let (dx, dy) = (e.client_x() - d.start.0, e.client_y() - d.start.1);
+        if !d.moving && dx.hypot(dy) >= dock::DRAG_START {
+            d.moving = true;
+            drag.set_value(Some(d));
+            if let Some(el) = dock_ref.get_untracked() {
+                let _ = el.set_pointer_capture(d.id);
+            }
+        }
+        if d.moving {
+            dock_pos.set(Some(dock::clamp((d.origin.0 + dx, d.origin.1 + dy), area())));
+        }
+    };
+    let dock_up = move |e: PointerEvent| {
+        let Some(d) = drag.get_value().filter(|d| d.id == e.pointer_id()) else { return };
+        drag.set_value(None);
+        if d.moving {
+            // Le clic qui suit un glissé ne déclenche ni clavier ni déconnexion.
+            swallow_click.set_value(true);
+            if let Some(p) = dock_pos.get_untracked() {
+                dock::save(p);
+            }
+        }
+    };
+    let quit_dock = {
+        let quit = quit.clone();
+        move |e: web_sys::MouseEvent| {
+            if !swallow_click.get_value() {
+                quit(e);
+            }
+        }
+    };
+
+    // Barre de touches : envoi en scancodes ; les modificateurs collants valent pour la prochaine
+    // touche de la barre (jamais pour les lettres du clavier système, envoyées en Unicode).
+    let bar_style = move || {
+        let (_, oy, _, vh) = visible.get();
+        let below = (window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) - oy - vh).max(0.0);
+        format!("bottom:max({below}px, env(safe-area-inset-bottom))")
+    };
+    let bar_key = move |label: &'static str, name: &'static str, code: &'static str| {
+        view! {
+            <button class="sk-key" type="button" aria-label=name title=name
+                on:pointerdown=|e| e.prevent_default()
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| {
+                    let m = mods.get_untracked();
+                    mods.set(keys::Mods::default());
+                    with_engine(&|eng| eng.bar_chord(m, Some(code)));
+                    focus_keyboard();
+                }>{label}</button>
+        }
+    };
+    let sticky = move |label: &'static str,
+                       name: &'static str,
+                       get: fn(&keys::Mods) -> bool,
+                       flip: fn(&mut keys::Mods)| {
+        view! {
+            <button class="sk-key" class:on=move || get(&mods.get()) type="button" aria-label=name title=name
+                aria-pressed=move || get(&mods.get()).to_string()
+                on:pointerdown=|e| e.prevent_default()
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| {
+                    mods.update(flip);
+                    focus_keyboard();
+                }>{label}</button>
+        }
+    };
+
     view! {
-        <div class="session">
+        <div class="session" node_ref=session_ref>
             <canvas
                 node_ref=canvas_ref
                 class="screen"
@@ -452,6 +642,8 @@ pub fn SessionPage() -> impl IntoView {
                         with_engine(&|eng| eng.text_input(&e.input_type(), data.clone()));
                     }
                 }
+                on:focus=move |_| kbd_open.set(true)
+                on:blur=move |_| kbd_open.set(false)
                 on:compositionstart=move |_| composing.set_value(true)
                 on:compositionend=move |e: web_sys::CompositionEvent| {
                     composing.set_value(false);
@@ -465,16 +657,78 @@ pub fn SessionPage() -> impl IntoView {
                     }
                 }
             ></textarea>
-            <button
-                class="session-keyboard"
+            <div
+                node_ref=dock_ref
+                class="session-dock"
+                style=dock_style
                 inert=blocked
-                aria-label="Clavier"
-                title="Clavier"
-                on:mousedown=|e| e.prevent_default()
-                on:click=toggle_keyboard
+                on:pointerdown=dock_down
+                on:pointermove=dock_move
+                on:pointerup=dock_up
+                on:pointercancel=dock_up
             >
-                {crate::icon(KEYBOARD)}
-            </button>
+                <button
+                    type="button"
+                    aria-label="Clavier"
+                    title="Clavier"
+                    on:mousedown=|e| e.prevent_default()
+                    on:click=toggle_keyboard
+                >
+                    {crate::icon(KEYBOARD)}
+                </button>
+                <button
+                    type="button"
+                    class="danger"
+                    aria-label="Déconnexion"
+                    title="Déconnexion"
+                    on:mousedown=|e| e.prevent_default()
+                    on:click=quit_dock
+                >
+                    {crate::icon(crate::glyph::LOGOUT)}
+                </button>
+            </div>
+            <Show when=move || kbd_open.get()>
+                <div class="session-keys" style=bar_style inert=blocked>
+                    <div class="sk-row">
+                        {bar_key("Esc", "Échap", "Escape")}
+                        {bar_key("Tab", "Tabulation", "Tab")}
+                        {sticky("Ctrl", "Ctrl", |m| m.ctrl, |m| m.ctrl = !m.ctrl)}
+                        {sticky("Alt", "Alt", |m| m.alt, |m| m.alt = !m.alt)}
+                        <button class="sk-key" class:on=move || mods.get().win type="button"
+                            aria-label="Windows : une 2e pression ouvre le menu Démarrer" title="Windows"
+                            aria-pressed=move || mods.get().win.to_string()
+                            on:pointerdown=|e| e.prevent_default()
+                            on:mousedown=|e| e.prevent_default()
+                            on:click=move |_| {
+                                let m = mods.get_untracked();
+                                if m.win {
+                                    // Win déjà armée : seule, elle ouvre le menu Démarrer.
+                                    mods.set(keys::Mods::default());
+                                    with_engine(&|eng| eng.bar_chord(m, None));
+                                } else {
+                                    mods.update(|m| m.win = true);
+                                }
+                                focus_keyboard();
+                            }>"Win"</button>
+                        {bar_key("←", "Flèche gauche", "ArrowLeft")}
+                        {bar_key("↑", "Flèche haut", "ArrowUp")}
+                        {bar_key("↓", "Flèche bas", "ArrowDown")}
+                        {bar_key("→", "Flèche droite", "ArrowRight")}
+                    </div>
+                    <div class="sk-row scroll">
+                        {KEYS_MORE.iter().map(|(l, n, c)| bar_key(l, n, c)).collect_view()}
+                        {bar_key("Impr", "Impression d'écran", "PrintScreen")}
+                        <button class="sk-key special" type="button" aria-label="Ctrl+Alt+Suppr" title="Ctrl+Alt+Suppr"
+                            on:pointerdown=|e| e.prevent_default()
+                            on:mousedown=|e| e.prevent_default()
+                            on:click=move |_| {
+                                mods.set(keys::Mods::default());
+                                with_engine(&|eng| eng.ctrl_alt_del());
+                                focus_keyboard();
+                            }>"Ctrl+Alt+Suppr"</button>
+                    </div>
+                </div>
+            </Show>
             <div class="session-menu" class:open=move || menu_open.get() inert=blocked>
                 <button
                     node_ref=handle_ref

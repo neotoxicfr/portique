@@ -45,12 +45,14 @@ pub fn Home() -> impl IntoView {
         failed.set(None);
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::get("/api/connections").await {
-                Ok(l) => list.set(Some(l)),
-                Err(e) => {
+            // Même délai qu'au démarrage : une requête qui ne revient pas rend « Réessayer ».
+            match crate::within(15_000, api::get("/api/connections")).await {
+                Some(Ok(l)) => list.set(Some(l)),
+                Some(Err(e)) => {
                     session.handle(epoch, &e);
                     failed.set(Some(e.to_string()));
                 }
+                None => failed.set(Some("le serveur ne répond pas".into())),
             }
         });
     };

@@ -336,6 +336,7 @@ impl Form {
     fn input(&self) -> ConnectionInput {
         let opt = |s: RwSignal<String>| Some(s.get_untracked()).filter(|v| !v.trim().is_empty());
         let wol = self.wol.get_untracked();
+        let by_command = wol && self.wol_by_command.get_untracked();
         ConnectionInput {
             name: self.name.get_untracked(),
             rdp: self.rdp.get_untracked(),
@@ -346,22 +347,21 @@ impl Form {
             // Champ vide en modification = garder l'ancien mot de passe.
             password: opt(self.password),
             wol_mac: opt(self.wol_mac).filter(|_| wol),
-            wol_target: opt(self.wol_target).filter(|_| wol),
+            // Champ masqué en mode commande : sa valeur ne doit pas faire refuser le formulaire.
+            wol_target: opt(self.wol_target).filter(|_| wol && !by_command),
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
-            wol_command: (wol && self.wol_by_command.get_untracked()).then(|| {
-                portique_proto::WolCommandInput {
-                    via_id: self.cmd_via.get_untracked().parse().ok(),
-                    host: self.cmd_host.get_untracked(),
-                    user: self.cmd_user.get_untracked(),
-                    command: self.cmd_command.get_untracked(),
-                    password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
-                    approve_hostkey: self
-                        .cmd_approve
-                        .get_untracked()
-                        .then(|| self.cmd_pending.get_untracked())
-                        .flatten(),
-                }
+            wol_command: by_command.then(|| portique_proto::WolCommandInput {
+                via_id: self.cmd_via.get_untracked().parse().ok(),
+                host: self.cmd_host.get_untracked(),
+                user: self.cmd_user.get_untracked(),
+                command: self.cmd_command.get_untracked(),
+                password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
+                approve_hostkey: self
+                    .cmd_approve
+                    .get_untracked()
+                    .then(|| self.cmd_pending.get_untracked())
+                    .flatten(),
             }),
             ssh: self.ssh.get_untracked().then(|| SshInput {
                 port: self.ssh_port.get_untracked().trim().parse().ok(),
@@ -432,24 +432,47 @@ fn Editor(
     open: RwSignal<bool>,
     reload: impl Fn() + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
+    // Machines dont une écriture est en vol, suivies hors du brouillon : `fill` remet `busy` à faux, et une
+    // machine rouverte pendant l'écriture pourrait sinon repartir, sur l'ancien instantané, dans un second
+    // envoi que le serveur appliquerait peut-être avant le premier.
+    let writes = RwSignal::new(Vec::<i64>::new());
+    let locked = move || f.busy.get() || f.editing.get().is_some_and(|id| writes.with(|w| w.contains(&id)));
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();
-        if f.busy.get_untracked() {
+        if locked() {
             return;
         }
         let body = f.input();
-        let (method, url) = match f.editing.get_untracked() {
+        let target = f.editing.get_untracked();
+        let (method, url) = match target {
             Some(id) => ("PUT", format!("/api/admin/connections/{id}")),
             None => ("POST", "/api/admin/connections".to_string()),
         };
         let mine = f.serial.get_untracked();
         f.busy.set(true);
+        if let Some(id) = target {
+            writes.update(|w| w.push(id));
+        }
         spawn_local(async move {
             let r = api::send::<_, ConnectionAdmin>(method, &url, &body).await;
             // Le formulaire n'est touché que s'il est encore celui qui a lancé la requête (page quittée comprise).
             let same = f.serial.try_get_untracked() == Some(mine);
             if same {
                 f.busy.set(false);
+            }
+            if let Ok(c) = &r {
+                // Instantané à jour dès la réponse, sans attendre le rechargement.
+                conns.update(|l| match l.iter_mut().find(|x| x.id == c.id) {
+                    Some(x) => *x = c.clone(),
+                    None => l.push(c.clone()),
+                });
+                // Rouverte pendant l'écriture, la machine était figée, donc sans saisie : on la recharge.
+                if !same && f.editing.try_get_untracked() == Some(Some(c.id)) {
+                    f.fill(Some(c));
+                }
+            }
+            if let Some(id) = target {
+                writes.update(|w| w.retain(|x| *x != id));
             }
             match r {
                 Ok(_) if same => {
@@ -464,7 +487,7 @@ fn Editor(
         });
     };
     let remove = move |_| {
-        if f.busy.get_untracked() {
+        if locked() {
             return;
         }
         let Some(id) = f.editing.get_untracked() else { return };
@@ -476,14 +499,22 @@ fn Editor(
         }
         let mine = f.serial.get_untracked();
         f.busy.set(true);
+        writes.update(|w| w.push(id));
         spawn_local(async move {
             let r = api::send_empty::<()>("DELETE", &format!("/api/admin/connections/{id}"), None).await;
             let same = f.serial.try_get_untracked() == Some(mine);
             if same {
                 f.busy.set(false);
             }
+            writes.update(|w| w.retain(|x| *x != id));
             match r {
-                Ok(()) if same => open.set(false),
+                Ok(()) => {
+                    conns.update(|l| l.retain(|c| c.id != id));
+                    // Fermé aussi s'il a été rouvert sur cette machine pendant la suppression.
+                    if same || f.editing.try_get_untracked() == Some(Some(id)) {
+                        open.set(false);
+                    }
+                }
                 Err(e) if same => f.err.set(Some(e.to_string())),
                 _ => {}
             }
@@ -500,11 +531,21 @@ fn Editor(
             .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
             .collect::<Vec<_>>()
     };
+    // Rebond ou relais qui n'est plus proposé (supprimé, SSH retiré) : vidé, pour que la valeur envoyée
+    // reste celle qu'affiche le sélecteur.
+    Effect::new(move || {
+        let ids: Vec<String> = ssh_hosts().iter().map(|c| c.id.to_string()).collect();
+        for sel in [f.ssh_jump, f.cmd_via] {
+            if sel.with(|v| !v.is_empty() && !ids.contains(v)) {
+                sel.set(String::new());
+            }
+        }
+    });
 
     view! {
         <Show when=move || open.get()>
             <form on:submit=save>
-                <fieldset class="editor" disabled=move || f.busy.get()>
+                <fieldset class="editor" disabled=locked>
                     <div class="group">
                         <label class="line"><span class="line-label">"Nom"</span>
                             <input type="text" required prop:value=move || f.name.get() on:input=input(f.name)/></label>
@@ -529,8 +570,13 @@ fn Editor(
                             <label class="line"><span class="line-label">"Rebond"</span>
                                 <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
                                     <option value="">"direct"</option>
+                                    // Options recréées à chaque rechargement : chacune reprend sa sélection, sinon le
+                                    // navigateur retombe sur « direct » sans que la valeur change.
                                     {move || ssh_hosts().into_iter()
-                                        .map(|c| view! { <option value=c.id.to_string()>{format!("par {}", c.name)}</option> })
+                                        .map(|c| {
+                                            let v = c.id.to_string();
+                                            view! { <option value=v.clone() prop:selected=move || f.ssh_jump.with(|j| *j == v)>{format!("par {}", c.name)}</option> }
+                                        })
                                         .collect_view()}
                                 </select></label>
                             <label class="line"><span class="line-label">"Thème"</span>
@@ -571,7 +617,7 @@ fn Editor(
                         </label>
                         <Show when=move || f.wol.get()>
                             <label class="line"><span class="line-label">"Adresse MAC"</span>
-                                <input type="text" class="mono" placeholder="00:11:22:33:44:55" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
+                                <input type="text" class="mono" required placeholder="00:11:22:33:44:55" prop:value=move || f.wol_mac.get() on:input=input(f.wol_mac)/></label>
                             <div class="line wake-mode"><span class="line-label grow">"Mode"</span>
                                 <div class="seg" role="group" aria-label="Mode de réveil">
                                     <button type="button" aria-pressed=move || (!f.wol_by_command.get()).to_string()
@@ -592,7 +638,10 @@ fn Editor(
                                     <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
                                         <option value="">"une adresse saisie ci-dessous"</option>
                                         {move || ssh_hosts().into_iter()
-                                            .map(|c| view! { <option value=c.id.to_string()>{format!("l'hôte SSH « {} »", c.name)}</option> })
+                                            .map(|c| {
+                                                let v = c.id.to_string();
+                                                view! { <option value=v.clone() prop:selected=move || f.cmd_via.with(|j| *j == v)>{format!("l'hôte SSH « {} »", c.name)}</option> }
+                                            })
                                             .collect_view()}
                                     </select></label>
                                 <Show when=move || f.cmd_via.get().is_empty()>
@@ -754,7 +803,26 @@ fn ServiceKeyPanel() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::restriction;
+    use leptos::prelude::Set;
+
+    use super::{Form, restriction};
+
+    #[test]
+    fn hidden_udp_target_is_not_sent_in_command_mode() {
+        let f = Form::default();
+        f.fill(None);
+        f.wol.set(true);
+        f.wol_mac.set("00:11:22:33:44:55".into());
+        f.wol_target.set("pas une cible".into());
+        f.wol_by_command.set(true);
+        let i = f.input();
+        assert_eq!(i.wol_target, None);
+        assert!(i.wol_command.is_some());
+        f.wol_by_command.set(false);
+        let i = f.input();
+        assert_eq!(i.wol_target.as_deref(), Some("pas une cible"));
+        assert!(i.wol_command.is_none());
+    }
 
     #[test]
     fn restriction_without_any_address_is_refused() {

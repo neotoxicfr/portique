@@ -23,6 +23,9 @@ pub struct Session {
     /// Génération de session, avancée à chaque fin de session : une réponse de déconnexion d'une session
     /// précédente ne doit rien afficher dans la suivante.
     pub epoch: RwSignal<u32>,
+    /// Déconnexion en vol : une seule à la fois. Gardé ici pour survivre aux changements de page : une
+    /// seconde réponse arrivée après une reconnexion effacerait le cookie de la nouvelle session.
+    pub logging_out: RwSignal<bool>,
 }
 
 impl Session {
@@ -35,6 +38,18 @@ impl Session {
     pub fn handle(&self, epoch: u32, e: &api::Error) {
         if *e == api::Error::Unauthorized && self.epoch.get_untracked() == epoch {
             self.me.set(None);
+        }
+    }
+
+    /// Reporte sur `me` l'état TOTP confirmé par une requête de la génération `epoch`, sauf si la session est
+    /// terminée depuis : la réponse modifierait l'affichage du compte suivant.
+    pub fn set_totp(&self, epoch: u32, on: bool) {
+        if self.epoch.get_untracked() == epoch {
+            self.me.update(|m| {
+                if let Some(m) = m {
+                    m.totp_enabled = on;
+                }
+            });
         }
     }
 
@@ -112,6 +127,7 @@ fn App() -> impl IntoView {
         checked: RwSignal::new(false),
         logout_error: RwSignal::new(None),
         epoch: RwSignal::new(0),
+        logging_out: RwSignal::new(false),
     };
     provide_context(session);
     // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion).
@@ -198,11 +214,17 @@ fn Shell(children: Children) -> impl IntoView {
     // Échec de déconnexion : la session reste ouverte côté serveur, on le dit et on laisse réessayer.
     let logout_error = session.logout_error;
     let logout = move || {
+        if session.logging_out.get_untracked() {
+            return;
+        }
+        session.logging_out.set(true);
         logout_error.set(None);
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
             let result = api::send_empty::<()>("POST", "/api/auth/logout", None).await;
-            // Session déjà terminée (double clic, reconnexion entre-temps) : réponse périmée, ignorée.
+            // Libéré quelle que soit l'issue : un échec doit pouvoir être retenté.
+            session.logging_out.set(false);
+            // Session déjà terminée (reconnexion entre-temps) : réponse périmée, ignorée.
             if session.epoch.get_untracked() != epoch {
                 return;
             }
@@ -258,6 +280,7 @@ mod tests {
             checked: RwSignal::new(true),
             logout_error: RwSignal::new(None),
             epoch: RwSignal::new(1),
+            logging_out: RwSignal::new(false),
         };
         let me = |name: &str| Me {
             id: 1,
@@ -279,5 +302,34 @@ mod tests {
         assert!(session.me.with_untracked(Option::is_some));
         session.handle(sent_by_bob, &api::Error::Unauthorized);
         assert_eq!(session.me.get_untracked(), None);
+    }
+
+    #[test]
+    fn late_totp_success_from_an_ended_session_keeps_the_next_account() {
+        let session = Session {
+            info: RwSignal::new(None),
+            me: RwSignal::new(None),
+            checked: RwSignal::new(true),
+            logout_error: RwSignal::new(None),
+            epoch: RwSignal::new(1),
+            logging_out: RwSignal::new(false),
+        };
+        let me = |name: &str, totp: bool| Me {
+            id: 1,
+            username: name.into(),
+            is_admin: false,
+            totp_enabled: totp,
+            external: false,
+        };
+        session.me.set(Some(me("alice", false)));
+        let sent_by_alice = session.epoch.get_untracked();
+        session.epoch.update(|e| *e += 1);
+        session.me.set(Some(me("bob", false)));
+        // L'activation d'alice revient pendant la session de bob : le compte affiché ne change pas.
+        session.set_totp(sent_by_alice, true);
+        assert_eq!(session.me.get_untracked(), Some(me("bob", false)));
+        let sent_by_bob = session.epoch.get_untracked();
+        session.set_totp(sent_by_bob, true);
+        assert_eq!(session.me.get_untracked(), Some(me("bob", true)));
     }
 }

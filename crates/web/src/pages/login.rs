@@ -20,7 +20,8 @@ pub fn Login() -> impl IntoView {
         totp.set(String::new());
     };
 
-    let done = move |r: api::Result<LoginResponse>| {
+    // `by_password` : un 401 ne parle du mot de passe que s'il l'a vérifié, pas après une passkey refusée.
+    let done = move |by_password: bool, r: api::Result<LoginResponse>| {
         busy.set(false);
         match r {
             Ok(LoginResponse::Ok { me }) => session.me.set(Some(me)),
@@ -30,10 +31,11 @@ pub fn Login() -> impl IntoView {
             }
             // Mot de passe refusé, y compris pendant le défi TOTP (changé entre les deux envois) : il faut le
             // ressaisir. Un code TOTP faux arrive autrement (400, message du serveur).
-            Err(api::Error::Unauthorized) => {
+            Err(api::Error::Unauthorized) if by_password => {
                 reset();
                 error.set(Some("identifiant ou mot de passe incorrect".into()));
             }
+            Err(api::Error::Unauthorized) => error.set(Some("passkey refusée".into())),
             Err(e) => error.set(Some(e.to_string())),
         }
     };
@@ -46,7 +48,7 @@ pub fn Login() -> impl IntoView {
             password: password.get_untracked(),
             totp: need_totp.get_untracked().then(|| totp.get_untracked()),
         };
-        spawn_local(async move { done(api::send("POST", "/api/auth/login", &req).await) });
+        spawn_local(async move { done(true, api::send("POST", "/api/auth/login", &req).await) });
     };
 
     let passkey = move |_| {
@@ -56,7 +58,7 @@ pub fn Login() -> impl IntoView {
             return;
         }
         busy.set(true);
-        spawn_local(async move { done(api::passkey_login(&name).await) });
+        spawn_local(async move { done(false, api::passkey_login(&name).await) });
     };
 
     let change_account = move |_| {

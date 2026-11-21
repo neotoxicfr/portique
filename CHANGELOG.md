@@ -37,7 +37,10 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   création de la session ; un changement de mot de passe ne peut plus écraser une remise à zéro simultanée ;
   un admin rétrogradé ne peut plus finir de créer ou promouvoir un compte.
 - Limitation des tentatives réservée avant tout travail coûteux, IPv6 comptée par /64, défis passkey plafonnés
-  sans bloquer tout le monde, identifiants de passkeys jamais réattribués (migration 0007).
+  sans bloquer tout le monde, identifiants de passkeys, de comptes et de machines jamais réattribués
+  (migrations 0007 et 0008 : sauvegarder `/data` avant la mise à jour).
+- Une confirmation TOTP ou une passkey inscrite pendant une remise à zéro de la 2FA ne la réactive plus ; le
+  compteur de signature d'une passkey ne recule plus ; les identifiants comptent sans casse pour la limitation.
 - NTLM exige 128 bits, signature et chiffrement ; Argon2 hors des workers de requêtes ; attentes SSH et WoL
   bornées.
 
@@ -47,8 +50,10 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   capacités, canaux virtuels, tuiles progressives), presse-papier fiabilisé dans les deux sens (accusé par
   annonce, réponses tardives jetées, repli DIB), redirection de ferme et identifiants trop longs signalés
   clairement, relais RDP vidé après chaque écriture.
-- Session : refus définitif sans reconnexion en boucle, boutons relâchés à l'annulation d'un geste, dispositions
-  multi-écran validées avant d'ouvrir les fenêtres.
+- Session : refus durable (accès, identifiants, certificat changé) sans reconnexion en boucle, échec passager
+  toujours reconnecté ; boutons relâchés à l'annulation d'un geste et suivis par fenêtre ; dispositions
+  multi-écran validées avant d'ouvrir les fenêtres, extension annulée si Windows ne la confirme pas ; bureau,
+  clavier et menu inactifs derrière une alerte.
 
 ## [v0.3.0] - 2026-11-20
 

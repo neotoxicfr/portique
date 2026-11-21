@@ -288,6 +288,14 @@ impl Announces {
     }
 }
 
+/// Empreinte à tenir pour commune aux deux côtés après une lecture locale d'empreinte `fp`. Tant
+/// qu'une copie du PC attend son écriture locale (`unwritten` : en cours, ou refusée faute de
+/// focus), relire le contenu local d'avant (`local`, vu en dernier) n'est pas une nouvelle copie :
+/// le republier écraserait la copie du PC. Un contenu local différent, lui, prend la main.
+pub fn common_for_read(common: Option<u64>, unwritten: bool, local: Option<u64>, fp: u64) -> Option<u64> {
+    if unwritten && local == Some(fp) { Some(fp) } else { common }
+}
+
 fn blob(bytes: &[u8], mime: &str) -> Result<Blob, String> {
     let parts = Array::of1(&Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
@@ -573,6 +581,29 @@ mod tests {
         a.sent(Some(5), 50.0, Some(te));
         a.clear();
         assert!(re.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_local_reread_keeps_an_unwritten_remote_copy() {
+        let (fa, fb, fc) = (1, 2, 3);
+        let mut a = Announces::default();
+        // A vu localement et commun ; Windows copie B, reçu (commun = B) mais pas écrit localement.
+        a.remote_changed();
+        let common = Some(fb);
+        // Retour du focus : le presse-papier local contient toujours A, ce n'est pas une copie.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fa, common_for_read(common, true, Some(fa), fa), 0.0), AfterRead::Done);
+        // Vraie copie locale C : elle prend la main sur B.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fc, common_for_read(common, true, Some(fa), fc), 0.0), AfterRead::Publish);
+        // B écrit localement (vu en dernier) : relire A est une nouvelle copie.
+        let m = a.mark();
+        assert_eq!(
+            a.after_read(m, fa, common_for_read(common, false, Some(fb), fa), 0.0),
+            AfterRead::Publish
+        );
+        // Contenu local jamais vu : rien ne le distingue d'une copie, comme avant.
+        assert_eq!(common_for_read(common, true, None, fa), common);
     }
 
     #[test]

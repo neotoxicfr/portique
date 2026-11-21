@@ -87,10 +87,17 @@ struct Inner {
     staged: Vec<View>,
     /// Écrans (et écran courant) sur lesquels porte l'extension en cours.
     staged_screens: Option<(Vec<ScreenGeom>, usize)>,
+    /// Extensions envoyées, et celle qui attend encore le Reset Graphics qui l'adopte (délai de
+    /// garde : un PC qui ne peut l'appliquer garde son affichage sans rien renvoyer).
+    extend_seq: u32,
+    extend_wait: Option<u32>,
     touch: Touch,
     /// Taille voulue (fenêtre) et retour forcé à un écran pas encore envoyé : appliqués dès que
     /// le contrôle d'affichage devient prêt (voir `single_layout`).
     desired: Option<((u32, u32), bool)>,
+    /// Dernière taille à un écran envoyée et pas encore confirmée par un Reset Graphics : c'est
+    /// elle que le bureau prendra, une nouvelle demande s'y compare (voir `single_layout`).
+    size_sent: Option<(u32, u32)>,
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
@@ -107,6 +114,10 @@ struct Inner {
     clip_write_gen: u32,
     /// Écriture locale refusée (page sans focus) : retentée au prochain geste.
     clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>)>,
+    /// Génération du contenu du PC pas encore écrit localement (écriture en cours ou refusée).
+    clip_unwritten: Option<u32>,
+    /// Empreinte du presse-papier local tel qu'on l'a vu en dernier (lu, ou écrit par nous).
+    clip_local: Option<u64>,
     /// Empreinte du dernier contenu commun aux deux côtés (évite l'écho PC → navigateur → PC) :
     /// reçu du PC, ou annoncé par nous ET accepté par Windows ; effacée quand Windows accepte une
     /// autre de nos listes (remplacée ensuite, ou au contenu inconnu). Gardée quand Windows copie un
@@ -136,8 +147,8 @@ impl Inner {
 pub struct Engine {
     inner: Rc<RefCell<Inner>>,
     status: Rc<dyn Fn(Status)>,
-    /// Le moteur est revenu de lui-même à un seul écran (disposition non adoptée par le PC).
-    on_single: Rc<dyn Fn()>,
+    /// Le moteur est revenu de lui-même à un seul écran (disposition non adoptée par le PC), motif.
+    on_single: Rc<dyn Fn(&str)>,
 }
 
 /// Étape d'une extension multi-écran.
@@ -147,6 +158,9 @@ pub enum Extend {
     /// Une fenêtre de plus est ouverte ; la suivante attend un nouveau geste.
     Next { opened: usize, total: usize },
 }
+
+/// Délai (s) laissé au PC pour adopter une disposition à plusieurs écrans (Reset Graphics).
+const EXTEND_CONFIRM_S: u32 = 10;
 
 /// Classe du champ caché qui reçoit le clavier virtuel (voir `SessionPage`).
 pub const KEYBOARD_CLASS: &str = "session-kbd";
@@ -183,7 +197,7 @@ impl Engine {
         canvas: HtmlCanvasElement,
         opts: Open,
         status: Rc<dyn Fn(Status)>,
-        on_single: Rc<dyn Fn()>,
+        on_single: Rc<dyn Fn(&str)>,
     ) -> Result<Self, String> {
         let ws = WebSocket::new(&ws_url(opts.connection_id, opts.trust.as_deref()))
             .map_err(|e| format!("{e:?}"))?;
@@ -205,8 +219,11 @@ impl Engine {
             display_caps: None,
             staged: Vec::new(),
             staged_screens: None,
+            extend_seq: 0,
+            extend_wait: None,
             touch: Touch::default(),
             desired: None,
+            size_sent: None,
             desktop: (w, h),
             cursors: vec![None; 32],
             pressed: HashSet::new(),
@@ -219,6 +236,8 @@ impl Engine {
             clip_fetch: clip::Fetch::default(),
             clip_write_gen: 0,
             clip_pending_write: None,
+            clip_unwritten: None,
+            clip_local: None,
             clip_last: None,
             clip_announces: clip::Announces::default(),
             holding: false,
@@ -329,10 +348,12 @@ impl Engine {
                 drop(i);
                 (self.status)(Status::Connecting("Ouverture de la session Windows…".into()));
             }
-            SessionMessage::Error { message } => {
-                // Refus du serveur ou PC injoignable (redémarrage) : rien ne les distingue ici.
+            SessionMessage::Error { message, lasting } => {
+                // Refus durable (accès, identifiants, certificat changé) : pas de reconnexion ;
+                // échec passager (PC qui redémarre) : la reconnexion automatique reprend.
                 self.inner.borrow_mut().closing = true;
-                (self.status)(Status::Closed { reason: message, retry: Retry::Transient });
+                let retry = if lasting { Retry::No } else { Retry::Transient };
+                (self.status)(Status::Closed { reason: message, retry });
             }
             SessionMessage::UntrustedCertificate { fingerprint, can_approve } => {
                 self.inner.borrow_mut().closing = true;
@@ -401,9 +422,11 @@ impl Engine {
                 } else if name == rdp_session::DVC_DISPLAY_CONTROL {
                     // Les limites sont celles du canal qui les annonce : un nouveau canal ouvert avant
                     // la fermeture de l'ancien n'est prêt qu'à sa propre CAPS PDU.
+                    // Une taille demandée sur l'ancien canal ne sera peut-être jamais confirmée.
                     let mut i = self.inner.borrow_mut();
                     i.display_channel = Some(channel_id);
                     i.display_caps = None;
+                    i.size_sent = None;
                 }
             }
             Event::DvcData { channel_id, data } => {
@@ -437,6 +460,7 @@ impl Engine {
                 if i.display_channel == Some(channel_id) {
                     i.display_channel = None;
                     i.display_caps = None;
+                    i.size_sent = None;
                 }
             }
             Event::Pointer(p) => self.pointer(p),
@@ -619,6 +643,9 @@ impl Engine {
     fn reset_views(&self, width: u32, height: u32, monitors: &[Rect]) {
         let mut i = self.inner.borrow_mut();
         i.desktop = (width, height);
+        if i.size_sent == Some((width, height)) {
+            i.size_sent = None;
+        }
         let expected = i.multi.clone();
         let adopted = expected.as_ref().is_some_and(|rects| {
             let bw = rects.iter().map(|r| r.x + r.w).max().unwrap_or(0);
@@ -628,6 +655,7 @@ impl Engine {
                 && (monitors.is_empty() || rects.iter().all(|r| monitors.contains(r)))
         });
         if adopted {
+            i.extend_wait = None;
             for (v, r) in i.views.iter_mut().zip(expected.unwrap()) {
                 v.set_rect(r);
             }
@@ -644,13 +672,14 @@ impl Engine {
                 v.close();
             }
             i.views.truncate(1);
+            i.extend_wait = None;
             fell_back = i.multi.take().is_some();
         }
         i.views[0].set_rect(Rect { x: 0, y: 0, w: width, h: height });
         drop(i);
         self.input(&released);
         if fell_back {
-            (self.on_single)();
+            (self.on_single)("Disposition refusée par le PC");
         }
     }
 
@@ -722,9 +751,34 @@ impl Engine {
         }
         i.views.extend(staged);
         i.multi = Some(std::iter::once(current).chain(secondary).map(|idx| rects[idx]).collect());
+        // La disposition remplace toute taille à un écran encore en vol.
+        i.size_sent = None;
+        i.extend_seq = i.extend_seq.wrapping_add(1);
+        let seq = i.extend_seq;
+        i.extend_wait = Some(seq);
         drop(i);
         self.dvc_send(channel, &views::layout_pdu(&monitors, current));
+        self.watch_extension(seq);
         Ok(Extend::Done(screens.len()))
+    }
+
+    /// Délai de garde d'une extension : un PC qui ne peut pas appliquer la disposition garde son
+    /// affichage sans Reset Graphics (MS-RDPEDISP 3.1.5.2), les fenêtres secondaires resteraient
+    /// noires. Sans adoption dans le délai, retour à un écran.
+    fn watch_extension(&self, seq: u32) {
+        let e = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            super::sleep(EXTEND_CONFIRM_S).await;
+            let waiting = {
+                let i = e.inner.borrow();
+                !i.closing && i.extend_wait == Some(seq)
+            };
+            if waiting {
+                web_sys::console::warn_1(&"multi-écran : disposition non confirmée par le PC".into());
+                e.disable_multi_views();
+                (e.on_single)("Extension non confirmée par le PC");
+            }
+        });
     }
 
     fn close_staged(&self) {
@@ -747,6 +801,7 @@ impl Engine {
         }
         i.views.truncate(1);
         i.multi = None;
+        i.extend_wait = None;
         drop(i);
         self.input(&released);
     }
@@ -935,12 +990,12 @@ impl Engine {
                     }
                 }
                 touch::Action::Button { button, down, x, y } => {
-                    if let Some((x, y)) = self.desktop_point(0, x, y) {
-                        let flag = match button {
-                            touch::Button::Left => ptr::BUTTON1,
-                            touch::Button::Right => ptr::BUTTON2,
+                    if let Some(at) = self.desktop_point(0, x, y) {
+                        let bit = match button {
+                            touch::Button::Left => 1,
+                            touch::Button::Right => 2,
                         };
-                        events.push(Input::Mouse { flags: flag | if down { ptr::DOWN } else { 0 }, x, y });
+                        events.extend(touch_button(&mut self.inner.borrow_mut().buttons, bit, down, at));
                     }
                 }
                 touch::Action::Wheel { delta, horizontal, x, y } => {
@@ -1184,6 +1239,7 @@ impl Engine {
             i.clip_last = Some(clip::fingerprint(&items));
             i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
             i.clip_pending_write = None;
+            i.clip_unwritten = Some(i.clip_write_gen);
             (i.clip_write_gen, i.clip_fetch.generation())
         };
         let e = self.clone();
@@ -1213,13 +1269,21 @@ impl Engine {
         wasm_bindgen_futures::spawn_local(async move {
             let current = || e.inner.borrow().clip_write_gen == generation;
             let result = clip::write_local(&items, &current).await;
-            if let Err(err) = result
-                && current()
-            {
-                web_sys::console::debug_1(
-                    &format!("presse-papier local : {err} (nouvel essai au prochain geste)").into(),
-                );
-                e.inner.borrow_mut().clip_pending_write = Some((generation, items));
+            if !current() {
+                return;
+            }
+            let mut i = e.inner.borrow_mut();
+            match result {
+                Ok(()) => {
+                    i.clip_unwritten = None;
+                    i.clip_local = Some(clip::fingerprint(&items));
+                }
+                Err(err) => {
+                    web_sys::console::debug_1(
+                        &format!("presse-papier local : {err} (nouvel essai au prochain geste)").into(),
+                    );
+                    i.clip_pending_write = Some((generation, items));
+                }
             }
         });
     }
@@ -1249,7 +1313,9 @@ impl Engine {
                 return Some(true);
             }
             let now = js_sys::Date::now();
-            let common = i.clip_last;
+            let unwritten = i.clip_unwritten == Some(i.clip_write_gen);
+            let common = clip::common_for_read(i.clip_last, unwritten, i.clip_local, fp);
+            i.clip_local = Some(fp);
             match i.clip_announces.after_read(mark, fp, common, now) {
                 clip::AfterRead::Done => return Some(true),
                 clip::AfterRead::Retry => return Some(false),
@@ -1395,13 +1461,14 @@ impl Engine {
     fn send_size(&self, width: u32, height: u32, force: bool) {
         let (channel, layout) = {
             let mut i = self.inner.borrow_mut();
-            let Inner { desired, display_channel, display_caps, desktop, multi, .. } = &mut *i;
+            let Inner { desired, size_sent, display_channel, display_caps, desktop, multi, .. } = &mut *i;
             // En multi-écran, la disposition vient des écrans, pas de la taille de la fenêtre.
             if multi.is_some() {
                 return;
             }
             let caps = display_caps.filter(|_| display_channel.is_some());
-            (*display_channel, single_layout(desired, caps, clamp_size(width, height), force, *desktop))
+            let size = clamp_size(width, height);
+            (*display_channel, single_layout(desired, size_sent, caps, size, force, *desktop))
         };
         match (channel, layout) {
             (Some(channel), Ok(Some(monitor))) => self.dvc_send(channel, &views::layout_pdu(&[monitor], 0)),
@@ -1508,6 +1575,22 @@ fn button_input(
     out
 }
 
+/// Clé réservée des gestes tactiles de la fenêtre principale dans `Held` (aucun `pointerId` réel).
+const TOUCH_KEY: (usize, i32) = (0, i32::MIN);
+
+/// Clic d'un geste tactile (`bit` : masque `PointerEvent.buttons`), dans le même masque que les
+/// autres pointeurs : un toucher pendant qu'une souris tient le bouton ne le relâche pas.
+fn touch_button(held: &mut Held, bit: u16, down: bool, at: (u16, u16)) -> Vec<Input> {
+    let before = held_mask(held);
+    let h = held.entry(TOUCH_KEY).or_insert((0, at));
+    h.0 = if down { h.0 | bit } else { h.0 & !bit };
+    h.1 = at;
+    if h.0 == 0 {
+        held.remove(&TOUCH_KEY);
+    }
+    button_changes(before, held_mask(held), at)
+}
+
 /// Relâche les boutons des pointeurs partis d'une fenêtre secondaire, avant sa fermeture : son
 /// `pointerup` n'arrivera plus au moteur. Ceux de la fenêtre principale restent.
 fn release_secondary(held: &mut Held) -> Vec<Input> {
@@ -1527,12 +1610,15 @@ fn release_secondary(held: &mut Held) -> Vec<Input> {
 /// retient la taille et un retour forcé à un écran tant qu'aucune disposition n'est partie :
 /// contrôle d'affichage pas prêt (`caps` absent) ou PC trop limité. Le PC peut garder sa
 /// disposition à plusieurs écrans pendant la fermeture du canal, même à taille de bureau égale.
+/// `sent` : taille envoyée pas encore confirmée ; c'est elle que le bureau va prendre, une taille
+/// égale au bureau actuel doit donc encore partir (fenêtre revenue à sa taille entre-temps).
 fn single_layout(
     desired: &mut Option<((u32, u32), bool)>,
+    sent: &mut Option<(u32, u32)>,
     caps: Option<DisplayCaps>,
     size: (u32, u32),
     force: bool,
-    current: (u32, u32),
+    desktop: (u32, u32),
 ) -> Result<Option<views::Monitor>, String> {
     let force = force || desired.is_some_and(|(_, f)| f);
     *desired = Some((size, force));
@@ -1541,10 +1627,11 @@ fn single_layout(
     let (w, h) = caps.fit(size.0, size.1);
     let monitor = (0, 0, w, h);
     caps.check(&[monitor])?;
-    if !force && (w, h) == current {
+    if !force && (w, h) == sent.unwrap_or(desktop) {
         return Ok(None);
     }
     *desired = Some((size, false));
+    *sent = Some((w, h));
     Ok(Some(monitor))
 }
 
@@ -1596,25 +1683,50 @@ mod tests {
     #[test]
     fn forced_single_layout_survives_a_closed_display_channel() {
         let caps = Some(DisplayCaps { max_monitors: 2, max_area: 4 * 1920 * 1080 });
-        let mut desired = None;
+        let (mut desired, mut sent) = (None, None);
         // Retour à un écran pendant que le canal est fermé : rien ne part, le forçage est retenu.
-        assert_eq!(single_layout(&mut desired, None, (1920, 1080), true, (1920, 1080)), Ok(None));
+        assert_eq!(single_layout(&mut desired, &mut sent, None, (1920, 1080), true, (1920, 1080)), Ok(None));
         // Redimensionnement ordinaire entre-temps, canal toujours fermé : toujours forcé.
-        assert_eq!(single_layout(&mut desired, None, (1920, 1080), false, (1920, 1080)), Ok(None));
+        assert_eq!(single_layout(&mut desired, &mut sent, None, (1920, 1080), false, (1920, 1080)), Ok(None));
         assert_eq!(desired, Some(((1920, 1080), true)));
         // Canal rouvert (rejeu sans forçage) : la disposition part malgré la taille égale.
         let monitor = Some((0, 0, 1920, 1080));
-        assert_eq!(single_layout(&mut desired, caps, (1920, 1080), false, (1920, 1080)), Ok(monitor));
-        // Envoyée : le forçage est consommé.
-        assert_eq!(single_layout(&mut desired, caps, (1920, 1080), false, (1920, 1080)), Ok(None));
         assert_eq!(
-            single_layout(&mut desired, caps, (1280, 720), false, (1920, 1080)),
+            single_layout(&mut desired, &mut sent, caps, (1920, 1080), false, (1920, 1080)),
+            Ok(monitor)
+        );
+        // Envoyée : le forçage est consommé.
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1920, 1080), false, (1920, 1080)), Ok(None));
+        assert_eq!(
+            single_layout(&mut desired, &mut sent, caps, (1280, 720), false, (1920, 1080)),
             Ok(Some((0, 0, 1280, 720)))
         );
         // PC trop limité : refus, le forçage attend une disposition acceptable.
         let tiny = Some(DisplayCaps { max_monitors: 1, max_area: 100 * 100 });
-        assert!(single_layout(&mut desired, tiny, (1920, 1080), true, (1920, 1080)).is_err());
+        assert!(single_layout(&mut desired, &mut sent, tiny, (1920, 1080), true, (1920, 1080)).is_err());
         assert_eq!(desired, Some(((1920, 1080), true)));
+    }
+
+    #[test]
+    fn size_in_flight_is_the_reference() {
+        let caps = Some(DisplayCaps { max_monitors: 1, max_area: 8192 * 8192 });
+        let (mut desired, mut sent) = (None, None);
+        let desktop = (1600, 900);
+        // 1280×720 part ; la fenêtre revient à la taille du bureau avant que le PC ne l'applique.
+        assert_eq!(
+            single_layout(&mut desired, &mut sent, caps, (1280, 720), false, desktop),
+            Ok(Some((0, 0, 1280, 720)))
+        );
+        assert_eq!(
+            single_layout(&mut desired, &mut sent, caps, (1600, 900), false, desktop),
+            Ok(Some((0, 0, 1600, 900))),
+            "le bureau va passer à 1280×720 : la taille actuelle doit repartir"
+        );
+        // Reset à 1280×720 (pas celui de la dernière demande) : 1600×900 est toujours en vol.
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1600, 900), false, (1280, 720)), Ok(None));
+        // Confirmée (`reset_views` efface `sent`) : une taille déjà appliquée reste ignorée.
+        sent = None;
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1600, 900), false, desktop), Ok(None));
     }
 
     #[test]
@@ -1712,6 +1824,31 @@ mod tests {
             vec![Input::Mouse { flags: ptr::MOVE, x: 2000, y: 5 }]
         );
         assert_eq!(held.len(), 1, "le déplacement sans bouton d'une autre vue ne relâche rien");
+        assert_eq!(release_secondary(&mut held), vec![]);
+    }
+
+    #[test]
+    fn touch_and_mouse_share_buttons() {
+        use rdp_pdu::fastpath::ptr;
+        let mut held = Held::new();
+        let mouse = |flags, (x, y)| vec![Input::Mouse { flags, x, y }];
+        // Toucher seul : clic complet.
+        assert_eq!(touch_button(&mut held, 1, true, (5, 5)), mouse(ptr::BUTTON1 | ptr::DOWN, (5, 5)));
+        assert_eq!(touch_button(&mut held, 1, false, (5, 5)), mouse(ptr::BUTTON1, (5, 5)));
+        assert!(held.is_empty());
+        // Souris qui glisse (gauche tenu) puis toucher : le glisser n'est pas interrompu.
+        button_input(&mut held, 1, 0, "pointerdown", 1, (10, 10));
+        assert_eq!(touch_button(&mut held, 1, true, (50, 50)), vec![]);
+        assert_eq!(touch_button(&mut held, 1, false, (50, 50)), vec![]);
+        assert_eq!(button_input(&mut held, 1, 0, "pointermove", 1, (20, 20)), mouse(ptr::MOVE, (20, 20)));
+        // Appui long (droit) pendant le glisser : seul le droit change.
+        assert_eq!(touch_button(&mut held, 2, true, (50, 50)), mouse(ptr::BUTTON2 | ptr::DOWN, (50, 50)));
+        // Souris relâchée pendant que le doigt tient : le gauche part, le droit reste.
+        assert_eq!(button_input(&mut held, 1, 0, "pointerup", 0, (30, 30)), mouse(ptr::BUTTON1, (30, 30)));
+        assert_eq!(touch_button(&mut held, 2, false, (50, 50)), mouse(ptr::BUTTON2, (50, 50)));
+        assert!(held.is_empty());
+        // Le geste tactile appartient à la fenêtre principale : fermer les secondaires le garde.
+        touch_button(&mut held, 1, true, (5, 5));
         assert_eq!(release_secondary(&mut held), vec![]);
     }
 

@@ -189,13 +189,6 @@ fn Totp(st: Status) -> impl IntoView {
     let proof = Proof::new();
     let code = RwSignal::new(String::new());
 
-    let set_enabled = move |on: bool| {
-        session.me.update(|m| {
-            if let Some(m) = m {
-                m.totp_enabled = on;
-            }
-        })
-    };
     let reset = move || {
         let _ = proof.take();
         code.set(String::new());
@@ -206,7 +199,8 @@ fn Totp(st: Status) -> impl IntoView {
         let on = event_target_checked(&ev);
         let now = session.me.with_untracked(|m| m.as_ref().is_some_and(|m| m.totp_enabled));
         st.set(None);
-        setup.set(None);
+        // Toute bascule repart de zéro : une preuve saisie pour l'intention abandonnée ne doit pas revenir.
+        reset();
         intent.set((on != now).then_some(on));
     };
 
@@ -247,7 +241,7 @@ fn Totp(st: Status) -> impl IntoView {
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/confirm", Some(&body)).await {
                 Ok(()) => {
-                    set_enabled(true);
+                    session.set_totp(epoch, true);
                     reset();
                     st.set(Some(Ok("TOTP activé.".into())));
                 }
@@ -270,7 +264,7 @@ fn Totp(st: Status) -> impl IntoView {
         spawn_local(async move {
             match api::send_empty("POST", "/api/account/totp/disable", Some(&body)).await {
                 Ok(()) => {
-                    set_enabled(false);
+                    session.set_totp(epoch, false);
                     reset();
                     st.set(Some(Ok("TOTP désactivé.".into())));
                 }
@@ -413,7 +407,7 @@ fn Passkeys(st: Status) -> impl IntoView {
             }
         </For>
         <button type="button" class="line" aria-expanded=move || adding.get().to_string() disabled=move || busy.get()
-            on:click=move |_| { adding.update(|a| *a = !*a); st.set(None); }>
+            on:click=move |_| { let _ = proof.take(); adding.update(|a| *a = !*a); st.set(None); }>
             <span class="pick">{icon(glyph::PLUS)}</span>
             "Ajouter une passkey"
         </button>
@@ -455,6 +449,18 @@ fn theme_label(t: &str) -> &str {
     }
 }
 
+/// Combinaisons sans doublon, dans l'ordre : chacune sert de clé à sa vignette (le serveur accepte les
+/// doublons, l'interface n'en crée pas).
+fn unique(combos: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(combos.len());
+    for c in combos {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Thème par défaut du terminal SSH (un hôte peut avoir le sien) et combinaisons de la barre de touches.
 #[component]
 fn Terminal() -> impl IntoView {
@@ -473,16 +479,18 @@ fn Terminal() -> impl IntoView {
         load.set(Load::Pending);
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::get::<TerminalPrefs>("/api/account/terminal").await {
-                Ok(p) => {
+            // Une lecture qui ne revient pas ne doit pas laisser le formulaire fermé sans « Réessayer ».
+            match crate::within(15_000, api::get::<TerminalPrefs>("/api/account/terminal")).await {
+                Some(Ok(p)) => {
                     theme.set(p.theme);
-                    combos.set(p.combos);
+                    combos.set(unique(p.combos));
                     load.set(Load::Ready);
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     session.handle(epoch, &e);
                     load.set(Load::Failed(e.to_string()));
                 }
+                None => load.set(Load::Failed("le serveur ne répond pas".into())),
             }
         });
     };
@@ -592,5 +600,17 @@ fn Terminal() -> impl IntoView {
                 <div class="actions"><button type="submit" disabled=locked>"Enregistrer"</button></div>
             </form>
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique;
+
+    #[test]
+    fn loaded_duplicate_combos_are_shown_once() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(unique(v(&["Ctrl+C", "Ctrl+C", "Alt+B"])), v(&["Ctrl+C", "Alt+B"]));
+        assert_eq!(unique(v(&["Alt+B", "Ctrl+C", "Alt+B"])), v(&["Alt+B", "Ctrl+C"]));
     }
 }

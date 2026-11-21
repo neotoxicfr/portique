@@ -128,10 +128,10 @@ pub fn SessionPage() -> impl IntoView {
                     status.set(s)
                 }
             });
-            let on_single: Rc<dyn Fn()> = Rc::new(move || {
+            let on_single: Rc<dyn Fn(&str)> = Rc::new(move |why: &str| {
                 if current() {
                     multi_active.set(false);
-                    multi_label.set(Some("Disposition refusée par le PC".into()));
+                    multi_label.set(Some(why.into()));
                 }
             });
             match Engine::open(
@@ -341,6 +341,10 @@ pub fn SessionPage() -> impl IntoView {
     let detect = move |_| {
         spawn_local(async move {
             let found = views::screen_details().await.and_then(|d| Ok((views::screens(&d)?.0, d)));
+            // Page quittée pendant la demande de permission : ses valeurs sont détruites.
+            if screens.is_disposed() {
+                return;
+            }
             match found {
                 Ok((list, details)) if list.len() > 1 => {
                     screens.set_value(Some((list, details)));
@@ -397,6 +401,23 @@ pub fn SessionPage() -> impl IntoView {
         attempt.set(0);
         open(Some(fp));
     };
+    // Alerte affichée : le bureau, le clavier et le menu passent en `inert` (ni clic, ni Tab, ni
+    // touches vers le PC) et le focus va sur la première action de l'alerte.
+    let blocked = move || !matches!(status.get(), Status::Connected);
+    Effect::new(move |_| {
+        if blocked() {
+            request_animation_frame(|| {
+                if let Some(el) = document()
+                    .query_selector(".session-overlay :is(button, a)")
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = el.focus();
+                }
+            });
+        }
+    });
 
     view! {
         <div class="session">
@@ -404,6 +425,7 @@ pub fn SessionPage() -> impl IntoView {
                 node_ref=canvas_ref
                 class="screen"
                 tabindex="0"
+                inert=blocked
                 on:pointermove=move |e| pointer(e, "pointermove")
                 on:pointerdown=move |e| pointer(e, "pointerdown")
                 on:pointerup=move |e| pointer(e, "pointerup")
@@ -445,6 +467,7 @@ pub fn SessionPage() -> impl IntoView {
             ></textarea>
             <button
                 class="session-keyboard"
+                inert=blocked
                 aria-label="Clavier"
                 title="Clavier"
                 on:mousedown=|e| e.prevent_default()
@@ -452,7 +475,7 @@ pub fn SessionPage() -> impl IntoView {
             >
                 {crate::icon(KEYBOARD)}
             </button>
-            <div class="session-menu" class:open=move || menu_open.get()>
+            <div class="session-menu" class:open=move || menu_open.get() inert=blocked>
                 <button
                     node_ref=handle_ref
                     class="session-handle"

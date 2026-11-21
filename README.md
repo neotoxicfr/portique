@@ -10,7 +10,7 @@
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Images](https://img.shields.io/badge/images-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.4.0-green)
+![Version](https://img.shields.io/badge/version-v0.5.0-green)
 
 </div>
 
@@ -46,16 +46,19 @@ navigateur côté client, ordinateur ou téléphone.
 **Bureau à distance (RDP)**
 
 - Affichage EGFX : ClearCodec, Planar, RemoteFX Progressive, **H.264 AVC420 et AVC444** (4:4:4) décodés par
-  WebCodecs, conversion des couleurs BT.709 pleine plage faite dans le wasm. Les navigateurs qui ne rendent que
-  du RGB (Firefox) affichent le H.264 en 4:2:0, sans repasser par un autre codec.
+  WebCodecs, conversion des couleurs BT.709 pleine plage faite dans le wasm. Quand le navigateur ne rend que du
+  RGB (Firefox), l'image 4:4:4 est recomposée si sa conversion s'inverse ; sinon la vue 4:2:0 reste. Le menu de
+  session dit le chemin d'image réellement utilisé et propose « Netteté maximale » (sans H.264 sur l'appareil).
 - Presse-papier texte, HTML et images dans les deux sens ; résolution qui suit la fenêtre ; multi-écran (une
   fenêtre par écran) ; plein écran avec capture du clavier (Alt+Tab, touche Windows) ; Ctrl+Alt+Suppr.
 - Reconnexion automatique ; ouverture rapide même sur un lien lointain (jointure des canaux évitée quand
   Windows le permet).
-- **Sur iPhone et iPad** : bouton clavier (texte, saisie IME, coller), toucher pour cliquer, appui long pour le
-  clic droit, deux doigts pour défiler, pincer pour zoomer la vue.
-- **Wake-on-LAN** : paquet magique direct, ou commande lancée par un hôte SSH du réseau du PC (un routeur, par
-  exemple), indispensable à travers un VPN.
+- **Sur iPhone et iPad** : bouton clavier déplaçable avec un bouton de déconnexion, et barre de touches au-dessus
+  du clavier (Échap, Tab, Ctrl/Alt/Win collants, flèches, Suppr, F1-F12, Ctrl+Alt+Suppr) ; toucher pour cliquer,
+  appui long pour le clic droit, deux doigts pour défiler, pincer pour zoomer la vue.
+- **Wake-on-LAN** : « Direct » (paquet magique) ou « Rebond » : une commande lancée par un hôte SSH du réseau
+  du PC, hôte connu de la liste ou hôte saisi pour cette machine. Utile quand le paquet magique ne peut pas
+  atteindre le PC tout seul : à travers un VPN routé, par exemple, sans diffusion dirigée vers son sous-réseau.
 - Préparation du PC **sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
   tout-en-un) qui activent RDP, NLA, le pare-feu, le H.264 4:4:4 et l'encodage matériel, et qui s'annulent.
 
@@ -64,14 +67,16 @@ navigateur côté client, ordinateur ou téléphone.
 - xterm.js servi par Portique (aucun CDN), redimensionnement, thèmes de couleur par compte et par hôte.
 - Une **clé ed25519 du service** à poser dans `authorized_keys` (restriction `from=` facultative), puis le
   mot de passe de l'hôte s'il y en a un.
-- **Rebonds** : un hôte peut passer par un autre, en chaîne, comme `ProxyJump`.
+- **Rebonds** : un hôte connu de la liste, en chaîne, comme `ProxyJump`, ou un hôte saisi pour cette machine
+  seule. Supprimer un hôte connu garde le chemin des machines qui passaient par lui.
 - **Barre de touches** sur téléphone et tablette, au-dessus du clavier virtuel : Échap, Tab, Ctrl et Alt
   collants, flèches, combinaisons enregistrées (Ctrl+C, Ctrl+R…).
 
 **Accès**
 
 - Comptes intégrés : mot de passe Argon2id, TOTP, passkeys ; rôles admin et utilisateur ; accès par machine.
-- Ou **mode proxy** : Authelia, Authentik… devant, connexion intégrée désactivée, comptes créés à la volée.
+- Ou **mode proxy** : Authelia, Authentik… devant, connexion intégrée désactivée, comptes créés à la volée ; la
+  double authentification se règle alors dans le proxy.
 - Appli installable (PWA), interface pensée pour le téléphone autant que pour l'ordinateur, en clair et en
   sombre selon l'appareil : une carte par machine, trois boutons toujours à la même place (Terminal, Bureau,
   Réveil).
@@ -276,7 +281,7 @@ bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md), [code de conduite](CODE_OF_COND
 
 - transcodage HEVC/AV1 côté serveur, au choix comme un réglage de qualité ;
 - son, micro, transfert et copier-coller de fichiers ;
-- confort mobile en RDP (trackpad, barre de touches, multi-touch), HiDPI et zoom ;
+- confort mobile en RDP (trackpad, multi-touch), HiDPI et zoom ;
 - partage et enregistrement de session.
 
 ## Remerciements

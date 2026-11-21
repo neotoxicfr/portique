@@ -66,12 +66,102 @@ pub fn disable(reason: &str) {
     }
 }
 
+/// Choix volontaire « Netteté maximale » (par user-agent) : clé distincte de `OFF_KEY`, qui reste la
+/// notation automatique d'un décodeur en échec.
+const CHOICE_KEY: &str = "portique.h264-choice";
+static CHOSEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// La valeur stockée désigne-t-elle ce navigateur ?
+fn is_for(stored: Option<String>, ua: &str) -> bool {
+    stored.is_some_and(|v| v == ua)
+}
+
+fn stored_for_this_browser(key: &str) -> bool {
+    storage().is_some_and(|s| is_for(s.get_item(key).ok().flatten(), &user_agent()))
+}
+
+/// H.264 coupé par un échec du décodeur ?
+fn failed() -> bool {
+    OFF.load(std::sync::atomic::Ordering::Relaxed) || stored_for_this_browser(OFF_KEY)
+}
+
+/// H.264 coupé par choix (« Netteté maximale ») ?
+pub fn chosen() -> bool {
+    CHOSEN.load(std::sync::atomic::Ordering::Relaxed) || stored_for_this_browser(CHOICE_KEY)
+}
+
 fn disabled() -> bool {
-    if OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
+    failed() || chosen()
+}
+
+/// H.264 coupé, quelle qu'en soit la raison.
+pub fn is_off() -> bool {
+    disabled()
+}
+
+/// Pose ou retire le choix « Netteté maximale » ; retirer lève aussi la notation d'un échec passé.
+pub fn set_sharp(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CHOSEN.store(on, Relaxed);
+    let ua = user_agent();
+    if on {
+        if let Some(s) = storage() {
+            let _ = s.set_item(CHOICE_KEY, &ua);
+        }
+    } else {
+        OFF.store(false, Relaxed);
+        if let Some(s) = storage() {
+            let _ = s.remove_item(CHOICE_KEY);
+            let _ = s.remove_item(OFF_KEY);
+        }
     }
-    let Some(s) = storage() else { return false };
-    s.get_item(OFF_KEY).ok().flatten().is_some_and(|ua| ua == user_agent())
+}
+
+/// Chemin d'image d'une image H.264 reçue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Avc420,
+    Avc444,
+    /// AVC444 rendu en RGB par le navigateur, 4:4:4 retrouvé en inversant sa conversion.
+    Avc444Rgb,
+}
+
+/// Nom court d'un format d'image du décodeur.
+pub fn format_name(f: VideoPixelFormat) -> &'static str {
+    match f {
+        VideoPixelFormat::I420 => "I420",
+        VideoPixelFormat::I420a => "I420A",
+        VideoPixelFormat::Nv12 => "NV12",
+        VideoPixelFormat::Rgba => "RGBA",
+        VideoPixelFormat::Rgbx => "RGBX",
+        VideoPixelFormat::Bgra => "BGRA",
+        VideoPixelFormat::Bgrx => "BGRX",
+        _ => "autre",
+    }
+}
+
+/// Libellé du chemin d'image réellement utilisé. `h264` : annoncé au serveur ; `kind` : dernière
+/// image reçue (`None` : aucune encore) ; `format` : format d'image du décodeur.
+pub fn path_label(h264: bool, chosen: bool, kind: Option<Kind>, format: Option<&str>) -> String {
+    if !h264 {
+        let why = if chosen { ", choix manuel" } else { "" };
+        return format!("Sans H.264 (RemoteFX/ClearCodec){why}");
+    }
+    let rgb = matches!(format, Some("RGBA" | "RGBX" | "BGRA" | "BGRX"));
+    let mut s = match (kind, rgb) {
+        (None, _) => "H.264".to_owned(),
+        (Some(Kind::Avc444), false) => "H.264 4:4:4".to_owned(),
+        (Some(Kind::Avc444), true) => {
+            "H.264 4:2:0 (image principale seule : le navigateur donne du RGB)".to_owned()
+        }
+        (Some(Kind::Avc444Rgb), _) => "H.264 4:4:4 (recomposé depuis du RGB)".to_owned(),
+        (Some(Kind::Avc420), _) => "H.264 4:2:0".to_owned(),
+    };
+    if let Some(f) = format {
+        s.push_str(" · ");
+        s.push_str(f);
+    }
+    s
 }
 
 /// Image décodée : plans YUV (conversion faite par `rdp-gfx`) ou RGBA déjà converti.
@@ -111,6 +201,8 @@ pub struct H264 {
     decoder: VideoDecoder,
     slot: Slot,
     codec: Option<String>,
+    /// Format de la dernière image rendue par le décodeur.
+    format: Option<&'static str>,
     timestamp: i32,
     _output: Closure<dyn FnMut(VideoFrame)>,
     _error: Closure<dyn FnMut(JsValue)>,
@@ -193,7 +285,7 @@ impl H264 {
         });
         let init = VideoDecoderInit::new(error.as_ref().unchecked_ref(), output.as_ref().unchecked_ref());
         let decoder = VideoDecoder::new(&init).map_err(|e| format!("{e:?}"))?;
-        Ok(Self { decoder, slot, codec: None, timestamp: 0, _output: output, _error: error })
+        Ok(Self { decoder, slot, codec: None, format: None, timestamp: 0, _output: output, _error: error })
     }
 
     fn configure(&mut self, codec: &str) -> Result<(), String> {
@@ -215,6 +307,10 @@ impl H264 {
         self.decoder.configure(&config).map_err(|e| format!("configuration H.264 : {e:?}"))?;
         self.codec = Some(codec.to_owned());
         Ok(())
+    }
+
+    pub fn format(&self) -> Option<&'static str> {
+        self.format
     }
 
     /// Décode une image Annex B et renvoie ses plans.
@@ -255,6 +351,7 @@ impl H264 {
                 )));
             }
         };
+        self.format = frame.format().map(format_name);
         let planes = within(OUTPUT_TIMEOUT_MS, copy_planes(&frame)).await;
         frame.close();
         planes
@@ -355,5 +452,46 @@ async fn copy_planes(frame: &VideoFrame) -> Result<Decoded, String> {
             Ok(Decoded::Rgba { width, height, data: out })
         }
         other => Err(format!("format d'image non géré : {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_path_labels() {
+        assert_eq!(path_label(false, false, None, None), "Sans H.264 (RemoteFX/ClearCodec)");
+        assert_eq!(path_label(false, true, None, None), "Sans H.264 (RemoteFX/ClearCodec), choix manuel");
+        assert_eq!(path_label(true, false, None, None), "H.264");
+        assert_eq!(path_label(true, false, Some(Kind::Avc444), Some("NV12")), "H.264 4:4:4 · NV12");
+        assert_eq!(
+            path_label(true, false, Some(Kind::Avc444), Some("BGRA")),
+            "H.264 4:2:0 (image principale seule : le navigateur donne du RGB) · BGRA"
+        );
+        assert_eq!(
+            path_label(true, false, Some(Kind::Avc444Rgb), Some("BGRA")),
+            "H.264 4:4:4 (recomposé depuis du RGB) · BGRA"
+        );
+        assert_eq!(path_label(true, false, Some(Kind::Avc420), Some("I420")), "H.264 4:2:0 · I420");
+        assert_eq!(
+            path_label(true, false, Some(Kind::Avc420), Some("BGRA")),
+            "H.264 4:2:0 · BGRA",
+            "420 : RGB sans perte de détail"
+        );
+    }
+
+    #[test]
+    fn stored_choice_is_per_user_agent() {
+        assert!(is_for(Some("UA".into()), "UA"));
+        assert!(!is_for(Some("UA".into()), "autre"), "une mise à jour du navigateur retente");
+        assert!(!is_for(None, "UA"));
+        assert_ne!(OFF_KEY, CHOICE_KEY, "le choix ne se confond pas avec la notation automatique");
+    }
+
+    #[test]
+    fn format_names() {
+        assert_eq!(format_name(VideoPixelFormat::Nv12), "NV12");
+        assert_eq!(format_name(VideoPixelFormat::Bgra), "BGRA");
     }
 }

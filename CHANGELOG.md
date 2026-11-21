@@ -2,7 +2,7 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
-## [v0.5.0] - à venir
+## [v0.5.0] - 2026-11-21
 
 ### Ajouté
 
@@ -16,6 +16,13 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 - `publish-dev.sh` redéploie aussi les autres déploiements qui suivent `:dev` (`DEPLOY_OTHERS`).
 - Admin en mode proxy : la colonne de double authentification des comptes montre une information bleue (elle se
   règle dans le proxy, que Portique ne voit pas) au lieu d'une alerte orange.
+- RDP sur écran tactile : bouton clavier déplaçable (position retenue par appareil) avec un bouton de déconnexion,
+  et barre de touches au-dessus du clavier système (Échap, Tab, Ctrl/Alt/Win collants, flèches, Suppr, Début/Fin,
+  pages, F1-F12, Impr. écran, Ctrl+Alt+Suppr).
+- Menu de session : chemin d'image réellement utilisé (H.264 4:4:4, 4:2:0, sans H.264, format du décodeur) et
+  option « Netteté maximale » (sans H.264 sur cet appareil).
+- H.264 4:4:4 recomposé quand le navigateur ne livre que des images RGB et que sa conversion s'inverse (texte et
+  icônes sans franges de couleur) ; sinon la vue principale reste affichée.
 
 ### Modifié
 
@@ -23,6 +30,16 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   `{"kind":"host",…}`) remplacent `via_id`, `host`, `user`, `password`, `approve_hostkey` et `jump_id`.
 - Le réveil par adresse saisie des versions précédentes est repris au démarrage en hôte saisi (mot de passe et clé
   d'hôte gardés). Migration 0009 : sauvegarder `/data` avant la mise à jour.
+- Admin sur téléphone : l'éditeur d'une machine s'ouvre sous la ligne touchée.
+- Page « Préparer un PC » retouchée, avec un retour vers Portique.
+- Dépendances à jour (gloo-net 0.8, qrcode 0.15, sqlx 0.9.1…), crate `openssl` inutilisé retiré, Rust 1.100.
+
+### Corrigé
+
+- Saisie SSH : `TCP_NODELAY` sur la connexion SSH et sur le serveur web ; sur un lien lointain les frappes ne
+  partent plus par paquets (écho médian mesuré : 241-276 ms avant, 160 ms après, pour 160 ms de délai réseau).
+- Terminal SSH : la dernière ligne ne dépasse plus du bas de l'écran.
+- Anneaux de focus : plus rognés par les coins arrondis des groupes.
 
 ## [v0.4.0] - 2026-11-21
 

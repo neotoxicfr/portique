@@ -110,6 +110,10 @@ struct Inner {
     /// Fermeture volontaire suivie d'une réouverture (H.264 inexploitable par ce navigateur).
     restart: bool,
     avc: h264::Avc,
+    /// Dernier chemin d'image H.264 reçu et format d'image du décodeur (menu de session).
+    image: (Option<h264::Kind>, Option<&'static str>),
+    /// Signale au menu de session un changement de `image`.
+    image_changed: leptos::prelude::ArcTrigger,
     clip: rdp_clip::Clipboard,
     clip_fetch: clip::Fetch,
     /// Génération du contenu à écrire localement : une écriture ou un réessai d'une génération
@@ -233,6 +237,8 @@ impl Engine {
             closing: false,
             restart: false,
             avc: opts.avc,
+            image: (None, None),
+            image_changed: leptos::prelude::ArcTrigger::new(),
             clip: rdp_clip::Clipboard::new(),
             clip_fetch: clip::Fetch::default(),
             clip_write_gen: 0,
@@ -509,6 +515,9 @@ impl Engine {
                         Some(d) => d.decode(&data).await,
                         None => Err(DecodeError::Unusable("décodeur H.264 indisponible".into())),
                     };
+                    if decoded.is_ok() {
+                        self.set_image(h264::Kind::Avc420, h264.as_ref().and_then(H264::format));
+                    }
                     let more = match decoded {
                         Ok(Decoded::Yuv(p)) => self.inner.borrow_mut().gfx.submit_yuv420(&p.view()),
                         Ok(Decoded::Rgba { width, height, data }) => self
@@ -549,35 +558,81 @@ impl Engine {
                         };
                         decoded.push(frame);
                     }
+                    // Rendu effectif, pour le libellé : une image qui n'affiche rien le laisse tel quel.
+                    let mut kind = None;
                     let mut gfx = std::cell::RefMut::map(self.inner.borrow_mut(), |i| &mut i.gfx);
+                    fn rgba(f: &Option<Decoded>) -> Option<rdp_gfx::Rgba<'_>> {
+                        match f {
+                            Some(Decoded::Rgba { width, height, data }) => Some(rdp_gfx::Rgba {
+                                width: *width,
+                                height: *height,
+                                data,
+                                stride: width * 4,
+                            }),
+                            _ => None,
+                        }
+                    }
+                    fn yuv(f: &Option<Decoded>) -> Option<rdp_gfx::Yuv420<'_>> {
+                        match f {
+                            Some(Decoded::Yuv(p)) => Some(p.view()),
+                            _ => None,
+                        }
+                    }
+                    let (m_rgb, a_rgb) = (rgba(&decoded[0]), rgba(&decoded[1]));
+                    let mixed = "H.264 (4:4:4) : sous-images en YUV et en RGB, chroma de l'auxiliaire perdue";
                     let more = match (failed, &decoded[0], &decoded[1]) {
                         (Some(e), ..) => {
                             web_sys::console::warn_1(&format!("H.264 (4:4:4) : {e}").into());
                             gfx.skip_frame()
                         }
-                        // Navigateur qui ne rend que du RGB : la sous-image principale est une image
-                        // 4:2:0 complète ; l'auxiliaire (chroma) a seulement nourri le décodeur.
-                        (None, Some(Decoded::Rgba { width, height, data }), _) => {
-                            gfx.submit_rgba(&rdp_gfx::Rgba {
-                                width: *width,
-                                height: *height,
-                                data,
-                                stride: width * 4,
-                            })
+                        // Le décodeur a changé de format entre les deux sous-images : la principale
+                        // seule, perte signalée.
+                        (None, Some(Decoded::Yuv(_)), Some(Decoded::Rgba { .. })) => {
+                            web_sys::console::warn_1(&mixed.into());
+                            kind = Some(h264::Kind::Avc444);
+                            gfx.submit_avc444(yuv(&decoded[0]).as_ref(), None)
                         }
-                        (None, None, Some(Decoded::Rgba { .. })) => gfx.skip_frame(),
-                        (None, m, a) => {
-                            fn yuv(f: &Option<Decoded>) -> Option<rdp_gfx::Yuv420<'_>> {
-                                match f {
-                                    Some(Decoded::Yuv(p)) => Some(p.view()),
-                                    _ => None,
+                        (None, Some(Decoded::Rgba { .. }), Some(Decoded::Yuv(_))) => {
+                            web_sys::console::warn_1(&mixed.into());
+                            kind = Some(h264::Kind::Avc444);
+                            gfx.submit_rgba(m_rgb.as_ref().expect("principale RGB"))
+                        }
+                        // Navigateur qui ne rend que du RGB : plans YUV retrouvés en inversant sa
+                        // conversion, puis 4:4:4. Si elle ne s'inverse pas, la sous-image principale
+                        // seule (image 4:2:0 complète) ; l'auxiliaire n'a alors que nourri le décodeur.
+                        _ if m_rgb.is_some() || a_rgb.is_some() => {
+                            match gfx.submit_avc444_rgba(m_rgb.as_ref(), a_rgb.as_ref()) {
+                                Ok((out, shown)) => {
+                                    kind = match shown {
+                                        rdp_gfx::Shown::Rebuilt => Some(h264::Kind::Avc444Rgb),
+                                        rdp_gfx::Shown::Main => Some(h264::Kind::Avc444),
+                                        rdp_gfx::Shown::Nothing => None,
+                                    };
+                                    Ok(out)
                                 }
+                                // Refus qui laisse la commande en attente : repli.
+                                Err(_) if gfx.waiting_for_avc() => match &m_rgb {
+                                    Some(m) => {
+                                        kind = Some(h264::Kind::Avc444);
+                                        gfx.submit_rgba(m)
+                                    }
+                                    None => gfx.skip_frame(),
+                                },
+                                Err(e) => Err(e),
+                            }
+                        }
+                        (None, m, a) => {
+                            if m.is_some() || a.is_some() {
+                                kind = Some(h264::Kind::Avc444);
                             }
                             gfx.submit_avc444(yuv(m).as_ref(), yuv(a).as_ref())
                         }
                     }
                     .map_err(|e| e.to_string())?;
                     drop(gfx);
+                    if let Some(kind) = kind {
+                        self.set_image(kind, h264.as_ref().and_then(H264::format));
+                    }
                     self.count_h264(t0);
                     queue.extend(drop_stale_presents(more));
                 }
@@ -1473,6 +1528,50 @@ impl Engine {
             })
             .collect();
         self.input(&events);
+    }
+
+    /// Chemin d'image réellement utilisé (ligne d'information du menu de session). Lu dans un
+    /// contexte réactif, il s'y met à jour quand ce chemin change.
+    pub fn image_path(&self) -> String {
+        use leptos::prelude::Track;
+        let i = self.inner.borrow();
+        i.image_changed.track();
+        h264::path_label(i.avc != h264::Avc::Off, h264::chosen(), i.image.0, i.image.1)
+    }
+
+    /// Note le chemin de la dernière image H.264 et prévient le menu s'il a changé.
+    fn set_image(&self, kind: h264::Kind, format: Option<&'static str>) {
+        use leptos::prelude::Notify;
+        let trigger = {
+            let mut i = self.inner.borrow_mut();
+            let changed = i.image != (Some(kind), format);
+            i.image = (Some(kind), format);
+            changed.then(|| i.image_changed.clone())
+        };
+        // Hors de l'emprunt : la mise à jour du menu relit `image`.
+        if let Some(t) = trigger {
+            t.notify();
+        }
+    }
+
+    /// Touche de la barre de touches (scancodes), avec ses modificateurs collants.
+    pub fn bar_chord(&self, mods: super::keys::Mods, code: Option<&str>) {
+        if !self.is_connected() {
+            return;
+        }
+        self.user_gesture();
+        // Modificateurs déjà maintenus au clavier matériel : la barre n'y touche pas.
+        let held = {
+            let i = self.inner.borrow();
+            let any =
+                |a: u8, b: u8, ext: bool| i.pressed.contains(&(a, ext)) || i.pressed.contains(&(b, ext));
+            super::keys::Mods {
+                ctrl: i.pressed.contains(&(0x1D, false)) || i.pressed.contains(&(0x1D, true)),
+                alt: i.pressed.contains(&(0x38, false)) || i.pressed.contains(&(0x38, true)),
+                win: any(0x5B, 0x5C, true),
+            }
+        };
+        self.input(&super::keys::chord(mods, code, held));
     }
 
     pub fn ctrl_alt_del(&self) {

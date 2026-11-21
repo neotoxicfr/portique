@@ -3,6 +3,7 @@ name = "rdp-auth"
 description = "Authentification RDP sans I/O : NTLMv2 (MS-NLMP) et CredSSP (MS-CSSP)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

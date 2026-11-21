@@ -52,6 +52,8 @@ pub fn Admin() -> impl IntoView {
     let f = Form::default();
     f.fill(None);
     let open = RwSignal::new(false);
+    let st = EditorState::default();
+    let narrow = narrow_screen();
     view! {
         <h1 class="sr-only">"Administration"</h1>
         {move || load_err().map(|m| view! {
@@ -62,11 +64,14 @@ pub fn Admin() -> impl IntoView {
         })}
         <div class="admin">
             <div>
-                <Machines conns f open/>
+                <Machines conns users f open reload st narrow/>
                 <Users users reload/>
                 <ServiceKeyPanel/>
             </div>
-            <Editor conns users f open reload/>
+            // Écran large : l'éditeur dans sa colonne. Étroit : sous la machine touchée (voir `Machines`).
+            <Show when=move || !narrow.get()>
+                <Editor conns users f open reload st/>
+            </Show>
         </div>
     }
 }
@@ -611,8 +616,117 @@ fn HopFields(
     }
 }
 
+/// État de l'éditeur gardé par la page : l'éditeur change de place selon la largeur de l'écran, et une écriture en vol
+/// ne doit pas perdre son verrou si sa vue est recréée.
+#[derive(Clone, Copy)]
+struct EditorState {
+    /// Machines dont une écriture est en vol, suivies hors du brouillon : `fill` remet `busy` à faux, et une
+    /// machine rouverte pendant l'écriture pourrait sinon repartir, sur l'ancien instantané, dans un second
+    /// envoi que le serveur appliquerait peut-être avant le premier.
+    writes: RwSignal<Vec<i64>>,
+    /// Machines restées verrouillées faute de relecture, avec l'erreur de celle-ci : affichée seulement quand la
+    /// machine est sélectionnée, avec « Relire ».
+    stale: RwSignal<Vec<(i64, String)>>,
+    /// Relectures « Relire » en vol, une par machine : une seconde réponse, plus ancienne, écraserait sinon le
+    /// brouillon commencé ou l'enregistrement fait après la première.
+    rereading: RwSignal<Vec<i64>>,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            writes: RwSignal::new(Vec::new()),
+            stale: RwSignal::new(Vec::new()),
+            rereading: RwSignal::new(Vec::new()),
+        }
+    }
+}
+
+/// Écran étroit (une colonne, même seuil que le CSS), suivi tant que la page est ouverte.
+fn narrow_screen() -> RwSignal<bool> {
+    use wasm_bindgen::closure::Closure;
+    let narrow = RwSignal::new(false);
+    let Some(mq) = window().match_media("(max-width: 900px)").ok().flatten() else { return narrow };
+    narrow.set(mq.matches());
+    let on_change = Closure::<dyn Fn()>::new({
+        let mq = mq.clone();
+        move || {
+            narrow.try_set(mq.matches());
+        }
+    });
+    let _ = mq.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+    let listener = StoredValue::new_local(Some((mq, on_change)));
+    on_cleanup(move || {
+        if let Some((mq, on_change)) = listener.try_update_value(Option::take).flatten() {
+            let _ = mq.remove_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+        }
+    });
+    narrow
+}
+
+/// Ligne d'une machine dans la liste ; la toucher ouvre son éditeur.
+fn machine_row(c: ConnectionAdmin, f: Form, open: RwSignal<bool>) -> impl IntoView {
+    let id = c.id;
+    let caps = [("SSH", c.ssh.is_some()), ("bureau", c.rdp), ("réveil", c.wol_mac.is_some())]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let alert = c.ssh.as_ref().and_then(|s| s.theme.as_deref()) == Some("alerte");
+    let (tone, glyph_d) = super::home::pastille(alert, c.rdp, c.ssh.is_some());
+    let tint = format!("pastille {tone}");
+    let (ssh, rdp, wol) = (c.ssh.is_some(), c.rdp, c.wol_mac.is_some());
+    let c_edit = c.clone();
+    view! {
+        <li>
+            <button type="button" class="mrow"
+                aria-current=move || (open.get() && f.editing.get() == Some(id)).then_some("true")
+                on:click=move |_| {
+                    if !(open.get_untracked() && f.editing.get_untracked() == Some(id)) {
+                        f.fill(Some(&c_edit));
+                        open.set(true);
+                    }
+                }>
+                <span class=tint>{icon(glyph_d)}</span>
+                <span class="who"><b>{c.name.clone()}</b><span>{c.host.clone()}</span></span>
+                <span class="caps" role="img" aria-label=caps>
+                    <span class=if ssh { "" } else { "off" }>{icon(glyph::TERMINAL)}</span>
+                    <span class=if rdp { "" } else { "off" }>{icon(glyph::SCREEN)}</span>
+                    <span class=if wol { "" } else { "off" }>{icon(glyph::POWER)}</span>
+                </span>
+                {icon(glyph::CHEVRON)}
+            </button>
+        </li>
+    }
+}
+
+/// Liste des machines. Écran étroit : l'éditeur s'ouvre sous la machine touchée (la liste s'écarte autour de lui), ou
+/// sous l'en-tête pour une nouvelle machine, au lieu d'arriver après toutes les autres sections.
 #[component]
-fn Machines(conns: RwSignal<Vec<ConnectionAdmin>>, f: Form, open: RwSignal<bool>) -> impl IntoView {
+fn Machines(
+    conns: RwSignal<Vec<ConnectionAdmin>>,
+    users: RwSignal<Vec<UserAdmin>>,
+    f: Form,
+    open: RwSignal<bool>,
+    reload: impl Fn() + Copy + Send + Sync + 'static,
+    st: EditorState,
+    narrow: RwSignal<bool>,
+) -> impl IntoView {
+    // Rang de la machine éditée sur écran étroit ; `None` : liste d'un seul tenant.
+    let at = Memo::new(move |_| {
+        let id = f.editing.get()?;
+        (narrow.get() && open.get()).then(|| conns.with(|l| l.iter().position(|c| c.id == id))).flatten()
+    });
+    let creating = move || narrow.get() && open.get() && f.editing.get().is_none();
+    let key = |c: &ConnectionAdmin| format!("{c:?}");
+    let head = move || {
+        conns.with(|l| match at.get() {
+            Some(i) => l[..=i].to_vec(),
+            None => l.clone(),
+        })
+    };
+    let tail = move || conns.with(|l| at.get().map(|i| l[i + 1..].to_vec()).unwrap_or_default());
     view! {
         <section>
             <div class="group-head">
@@ -620,41 +734,24 @@ fn Machines(conns: RwSignal<Vec<ConnectionAdmin>>, f: Form, open: RwSignal<bool>
                 <button type="button" class="iconbtn" aria-label="Ajouter une machine" title="Ajouter une machine"
                     on:click=move |_| { f.fill(None); open.set(true); }>{icon(glyph::PLUS)}</button>
             </div>
+            <Show when=creating>
+                <Editor conns users f open reload st/>
+            </Show>
             <ul class="mlist">
-                <For each=move || conns.get() key=|c| format!("{c:?}") let(c)>
-                    {
-                        let id = c.id;
-                        let caps = [("SSH", c.ssh.is_some()), ("bureau", c.rdp), ("réveil", c.wol_mac.is_some())]
-                            .iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>().join(", ");
-                        let alert = c.ssh.as_ref().and_then(|s| s.theme.as_deref()) == Some("alerte");
-                        let (tone, glyph_d) = super::home::pastille(alert, c.rdp, c.ssh.is_some());
-                        let tint = format!("pastille {tone}");
-                        let (ssh, rdp, wol) = (c.ssh.is_some(), c.rdp, c.wol_mac.is_some());
-                        let c_edit = c.clone();
-                        view! {
-                            <li>
-                                <button type="button" class="mrow"
-                                    aria-current=move || (open.get() && f.editing.get() == Some(id)).then_some("true")
-                                    on:click=move |_| {
-                                        if !(open.get_untracked() && f.editing.get_untracked() == Some(id)) {
-                                            f.fill(Some(&c_edit));
-                                            open.set(true);
-                                        }
-                                    }>
-                                    <span class=tint>{icon(glyph_d)}</span>
-                                    <span class="who"><b>{c.name.clone()}</b><span>{c.host.clone()}</span></span>
-                                    <span class="caps" role="img" aria-label=caps>
-                                        <span class=if ssh { "" } else { "off" }>{icon(glyph::TERMINAL)}</span>
-                                        <span class=if rdp { "" } else { "off" }>{icon(glyph::SCREEN)}</span>
-                                        <span class=if wol { "" } else { "off" }>{icon(glyph::POWER)}</span>
-                                    </span>
-                                    {icon(glyph::CHEVRON)}
-                                </button>
-                            </li>
-                        }
-                    }
+                <For each=head key=key let(c)>
+                    {machine_row(c, f, open)}
                 </For>
             </ul>
+            <Show when=move || at.get().is_some()>
+                <Editor conns users f open reload st/>
+                <Show when=move || !tail().is_empty()>
+                    <ul class="mlist">
+                        <For each=tail key=key let(c)>
+                            {machine_row(c, f, open)}
+                        </For>
+                    </ul>
+                </Show>
+            </Show>
         </section>
     }
 }
@@ -667,17 +764,9 @@ fn Editor(
     f: Form,
     open: RwSignal<bool>,
     reload: impl Fn() + Copy + Send + Sync + 'static,
+    st: EditorState,
 ) -> impl IntoView {
-    // Machines dont une écriture est en vol, suivies hors du brouillon : `fill` remet `busy` à faux, et une
-    // machine rouverte pendant l'écriture pourrait sinon repartir, sur l'ancien instantané, dans un second
-    // envoi que le serveur appliquerait peut-être avant le premier.
-    let writes = RwSignal::new(Vec::<i64>::new());
-    // Machines restées verrouillées faute de relecture, avec l'erreur de celle-ci : affichée seulement quand la
-    // machine est sélectionnée, avec « Relire ».
-    let stale = RwSignal::new(Vec::<(i64, String)>::new());
-    // Relectures « Relire » en vol, une par machine : une seconde réponse, plus ancienne, écraserait sinon le
-    // brouillon commencé ou l'enregistrement fait après la première.
-    let rereading = RwSignal::new(Vec::<i64>::new());
+    let EditorState { writes, stale, rereading } = st;
     let locked = move || f.busy.get() || f.editing.get().is_some_and(|id| writes.with(|w| w.contains(&id)));
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();

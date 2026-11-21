@@ -3,6 +3,7 @@ name = "portique-web"
 description = "Front Portique (Leptos CSR, wasm)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -19,7 +20,7 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 leptos = { version = "0.8.23", features = ["csr"] }
 leptos_router = "0.8.17"
-gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
+gloo-net = { version = "0.8.0", default-features = false, features = ["http", "json"] }
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"

@@ -213,9 +213,12 @@ pub async fn connect(hops: &[Hop], key: &PrivateKey, trust: Option<(i64, &str)>)
     // Délai d'inactivité : russh ne voit pas l'abandon du `Handle` pendant un échange de clés, une tentative
     // échouée en plein échange laisserait la session et sa connexion TCP ouvertes. Plus long que l'intervalle
     // des keepalives, auxquels un hôte répond : une session ouverte et inactive n'est pas coupée.
+    // nodelay : sans lui (défaut de russh), Nagle retient chaque frappe tant que la précédente n'est pas acquittée ;
+    // sur un lien lointain la saisie arrive par paquets, un aller-retour plus tard.
     let config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         inactivity_timeout: Some(Duration::from_secs(90)),
+        nodelay: true,
         ..Default::default()
     });
     let mut sessions: Vec<client::Handle<Check>> = Vec::new();

@@ -305,6 +305,10 @@ impl Gfx {
                             p.copy_from_slice(&px);
                         }
                     }
+                    // Écrit hors H.264 : une vue auxiliaire seule ne doit pas y ramener l'ancienne luma.
+                    if let Some(planes) = s.p444.as_mut() {
+                        planes.invalidate(rect);
+                    }
                     touched.push(rect);
                 }
                 for t in touched {
@@ -382,6 +386,9 @@ impl Gfx {
                 let rects = self.progressive.decode(sid as u32, data, &mut s.rgba, w, h)?;
                 for (x, y, rw, rh) in rects {
                     if let Some(rect) = (Rect { x, y, w: rw, h: rh }).clip(w, h) {
+                        if let Some(planes) = self.surfaces.get_mut(&sid).and_then(|s| s.p444.as_mut()) {
+                            planes.invalidate(rect);
+                        }
                         self.touch(sid, rect, origin);
                     }
                 }
@@ -397,6 +404,10 @@ impl Gfx {
         let Some(dst) = (Rect { x, y, w, h }).clip(s.width, s.height) else { return Ok(()) };
         let sw = s.width;
         blit(pixels, w, 0, 0, &mut s.rgba, sw, dst.x, dst.y, dst.w, dst.h);
+        // Codecs hors H.264, copie de surface ou du cache : la luma 4:4:4 de la zone n'est plus la bonne.
+        if let Some(planes) = s.p444.as_mut() {
+            planes.invalidate(dst);
+        }
         let origin = s.origin;
         self.touch(sid, dst, origin);
         Ok(())
@@ -689,6 +700,121 @@ mod tests {
         g.queued_bytes = crate::MAX_QUEUED_BYTES - 7;
         assert!(g.process(&wrap(&[pdu(id::CAPS_CONFIRM, &[])])).is_err());
         assert_eq!(g.queued_bytes, crate::MAX_QUEUED_BYTES - 7);
+    }
+
+    #[test]
+    fn avc444_from_rgb_rebuilt_then_refused_for_good() {
+        let surface = || {
+            let mut g = Gfx::new();
+            let create = pdu(
+                id::CREATE_SURFACE,
+                &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+            );
+            g.process(&wrap(&[create])).unwrap();
+            g
+        };
+        let full = Rect { x: 0, y: 0, w: 16, h: 16 };
+        let pending = |g: &mut Gfx| {
+            g.pending_avc =
+                Some(PendingAvc { surface: 0, rects: vec![full], aux: Some((vec![full], false)) });
+        };
+        fn rgba(d: &[u8]) -> crate::Rgba<'_> {
+            crate::Rgba { width: 16, height: 16, data: d, stride: 64 }
+        }
+        let px = |g: &Gfx, x: usize, y: usize| g.surfaces[&0].rgba[(y * 16 + x) * 4..][..4].to_vec();
+        // 4:4:4 à lignes alternées : Y = V = 128, U = 128 sur les lignes paires, 160 sur les
+        // impaires. Principale : Ũ = 144 ; auxiliaire v1 : luma à 160 sur les lignes U, 128 sur les
+        // lignes V, chroma neutre.
+        let main = crate::yuv::to_rgb(128, 144, 128).repeat(256);
+        let aux: Vec<u8> = (0..256)
+            .flat_map(|i| if (i / 16) % 16 < 8 { [160, 160, 160, 255] } else { [128, 128, 128, 255] })
+            .collect();
+        // Conversion prouvée (posée ici : une surface de 16×16 n'en apporte pas la preuve).
+        let mut g = surface();
+        g.rgb = crate::Rgb444::Proven;
+        pending(&mut g);
+        let (_, shown) = g.submit_avc444_rgba(Some(&rgba(&main)), Some(&rgba(&aux))).unwrap();
+        assert_eq!(shown, crate::Shown::Rebuilt);
+        // Ligne impaire : la chroma de l'auxiliaire, pas celle de la principale.
+        assert_eq!(px(&g, 1, 1), crate::yuv::to_rgb(128, 160, 128));
+        assert_ne!(px(&g, 1, 1), crate::yuv::to_rgb(128, 144, 128));
+        assert_eq!(px(&g, 1, 0), crate::yuv::to_rgb(128, 128, 128));
+        // Chroma qui varie à l'intérieur des blocs 2×2 : interpolée par le navigateur. Refusée sans
+        // consommer la commande, pour le repli sur la principale seule.
+        let mut smooth = Vec::new();
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                smooth.extend([8 + 16 * x, 100, 248 - 16 * y, 255]);
+            }
+        }
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&smooth)), Some(&rgba(&aux))).is_err());
+        assert!(g.waiting_for_avc() && g.rgb == crate::Rgb444::Refused);
+        g.submit_rgba(&rgba(&smooth)).unwrap();
+        assert!(!g.waiting_for_avc());
+        assert_eq!(px(&g, 0, 0), [8, 100, 248, 255]);
+        // Plus de recomposition pour la session, même sur une image inversible.
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&main)), Some(&rgba(&aux))).is_err());
+        // Image tronquée : refusée avant tout.
+        let mut g = surface();
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&main[..100])), None).is_err());
+        assert!(g.waiting_for_avc() && g.rgb == crate::Rgb444::Unknown);
+        // Chroma seule sans luma connue : refusée.
+        assert!(g.submit_avc444_rgba(None, Some(&rgba(&aux))).is_err());
+        // Mémoire de surface épuisée : la commande reste au repli.
+        g.surface_bytes = crate::MAX_SURFACE_BYTES;
+        assert!(g.submit_avc444_rgba(Some(&rgba(&main)), Some(&rgba(&aux))).is_err());
+        assert!(g.waiting_for_avc());
+        g.submit_rgba(&rgba(&main)).unwrap();
+        assert_eq!(px(&g, 1, 1), crate::yuv::to_rgb(128, 144, 128));
+    }
+
+    #[test]
+    fn non_h264_writes_stale_the_444_luma() {
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+        );
+        g.process(&wrap(&[create])).unwrap();
+        let full = Rect { x: 0, y: 0, w: 16, h: 16 };
+        fn rgba(d: &[u8]) -> crate::Rgba<'_> {
+            crate::Rgba { width: 16, height: 16, data: d, stride: 64 }
+        }
+        let main = crate::yuv::to_rgb(128, 144, 128).repeat(256);
+        let aux: Vec<u8> = (0..256)
+            .flat_map(|i| if (i / 16) % 16 < 8 { [160, 160, 160, 255] } else { [128, 128, 128, 255] })
+            .collect();
+        g.rgb = crate::Rgb444::Proven;
+        g.pending_avc = Some(PendingAvc { surface: 0, rects: vec![full], aux: Some((vec![full], false)) });
+        g.submit_avc444_rgba(Some(&rgba(&main)), Some(&rgba(&aux))).unwrap();
+        // Remplissage uni rouge de toute la surface, hors H.264.
+        let fill = pdu(
+            id::SOLID_FILL,
+            &le(&[
+                &0u16.to_le_bytes(),
+                &[0, 0, 0xFF, 0xFF],
+                &1u16.to_le_bytes(),
+                &[0, 0, 0, 0, 16, 0, 16, 0],
+            ]),
+        );
+        g.process(&wrap(&[fill])).unwrap();
+        // Vue auxiliaire seule : la zone n'a plus de luma à jour, le rouge reste.
+        g.pending_avc = Some(PendingAvc { surface: 0, rects: vec![], aux: Some((vec![full], false)) });
+        let _ = g.submit_avc444_rgba(None, Some(&rgba(&aux)));
+        assert_eq!(g.surfaces[&0].rgba[(16 + 1) * 4..][..4], [0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn rgba_check_rejects_short_stride_without_overflow() {
+        let huge = crate::Rgba { width: u32::MAX, height: u32::MAX, data: &[], stride: u32::MAX };
+        assert!(huge.check().is_err());
+        let padded = crate::Rgba { width: 2, height: 2, data: &[0; 24], stride: 16 };
+        assert!(padded.check().is_ok(), "remplissage en fin de ligne");
+        let short = crate::Rgba { width: 2, height: 2, data: &[0; 24], stride: 4 };
+        assert!(short.check().is_err());
     }
 
     #[test]

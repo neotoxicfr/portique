@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use axum::serve::ListenerExt;
 use portique_server::{app, bootstrap_admin, build_state, config};
 use tracing_subscriber::EnvFilter;
 
@@ -33,8 +34,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let listener =
-        tokio::net::TcpListener::bind(listen).await.with_context(|| format!("écoute sur {listen}"))?;
+    // TCP_NODELAY sur chaque connexion acceptée : les frappes et les petites images relayées par WebSocket partent
+    // sans attendre l'acquittement des précédentes (Nagle).
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("écoute sur {listen}"))?
+        .tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::warn!("TCP_NODELAY : {e}");
+            }
+        });
     tracing::info!(%listen, ?mode, "portique démarré");
     axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())

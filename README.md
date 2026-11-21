@@ -57,8 +57,8 @@ navigateur côté client, ordinateur ou téléphone.
   du clavier (Échap, Tab, Ctrl/Alt/Win collants, flèches, Suppr, F1-F12, Ctrl+Alt+Suppr) ; toucher pour cliquer,
   appui long pour le clic droit, deux doigts pour défiler, pincer pour zoomer la vue.
 - **Wake-on-LAN** : « Direct » (paquet magique) ou « Rebond » : une commande lancée par un hôte SSH du réseau
-  du PC, hôte connu de la liste ou hôte saisi pour cette machine, indispensable à travers un VPN routé en IP (le
-  paquet magique, diffusé, ne le traverse pas ; un VPN de niveau 2 qui transmet la diffusion permet le mode Direct).
+  du PC, hôte connu de la liste ou hôte saisi pour cette machine. Utile quand le paquet magique ne peut pas
+  atteindre le PC tout seul : à travers un VPN routé, par exemple, sans diffusion dirigée vers son sous-réseau.
 - Préparation du PC **sans rien installer** : la page `/setup/` fournit des scripts (.reg + .cmd, ou .ps1
   tout-en-un) qui activent RDP, NLA, le pare-feu, le H.264 4:4:4 et l'encodage matériel, et qui s'annulent.
 

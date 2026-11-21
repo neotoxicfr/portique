@@ -480,10 +480,16 @@ fn Editor(
             {
                 match api::get::<Vec<ConnectionAdmin>>("/api/admin/connections").await {
                     Ok(list) => {
-                        if let Some(c) = list.iter().find(|c| c.id == id)
-                            && f.editing.try_get_untracked() == Some(Some(id))
-                        {
-                            f.fill(Some(c));
+                        // L'état relu devient l'instantané de la liste AVANT de lever le verrou : rouverte plus
+                        // tard, la machine repart de lui et non de l'ancien.
+                        if let Some(c) = list.iter().find(|c| c.id == id) {
+                            conns.update(|l| match l.iter_mut().find(|x| x.id == id) {
+                                Some(x) => *x = c.clone(),
+                                None => l.push(c.clone()),
+                            });
+                            if f.editing.try_get_untracked() == Some(Some(id)) {
+                                f.fill(Some(c));
+                            }
                         }
                     }
                     Err(e) => {

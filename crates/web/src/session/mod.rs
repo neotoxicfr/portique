@@ -144,11 +144,23 @@ pub fn SessionPage() -> impl IntoView {
     let kbd_ref = NodeRef::<Textarea>::new();
     let handle_ref = NodeRef::<Button>::new();
     let session_ref = NodeRef::<Div>::new();
-    let dock_ref = NodeRef::<Div>::new();
     // Clavier système affiché (champ caché focalisé), vue visible, position retenue du groupe
     // clavier / déconnexion, modificateurs collants de la barre de touches.
-    let kbd_open = RwSignal::new(false);
+    // Le champ a le focus ET la vue visible a rétréci : sur iPad, la touche native de fermeture du
+    // clavier laisse le focus, seule la vue visible le dit.
+    let kbd_focus = RwSignal::new(false);
+    let kbd_shown = RwSignal::new(false);
+    let kbd_open = Memo::new(move |_| kbd_focus.get() && kbd_shown.get());
+    let kbd_watch = StoredValue::new(dock::KeyboardWatch::default());
     let visible = RwSignal::new(visible_area());
+    let refresh_visible = move || {
+        let v = visible_area();
+        visible.set(v);
+        let inner = window().inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(v.3);
+        if let Some(shown) = kbd_watch.try_update_value(|w| w.update(v.2, inner, v.3)) {
+            kbd_shown.set(shown);
+        }
+    };
     let dock_pos = RwSignal::new(dock::load());
     let mods = RwSignal::new(keys::Mods::default());
     let drag = StoredValue::new(None::<Drag>);
@@ -343,9 +355,9 @@ pub fn SessionPage() -> impl IntoView {
         }
     });
 
-    let vp_window = window_event_listener(ev::resize, move |_| visible.set(visible_area()));
+    let vp_window = window_event_listener(ev::resize, move |_| refresh_visible());
     // Clavier iOS : la vue visible change de hauteur et de décalage sans que la fenêtre bouge.
-    let vp_cb = Closure::<dyn FnMut()>::new(move || visible.set(visible_area()));
+    let vp_cb = Closure::<dyn FnMut()>::new(refresh_visible);
     if let Some(v) = window().visual_viewport() {
         let f = vp_cb.as_ref().unchecked_ref();
         let _ = v.add_event_listener_with_callback("resize", f);
@@ -392,9 +404,15 @@ pub fn SessionPage() -> impl IntoView {
         }
         let Some(t) = kbd_ref.get_untracked() else { return };
         let el: &web_sys::Element = t.as_ref();
-        if document().active_element().is_some_and(|a| &a == el) {
+        let focused = document().active_element().is_some_and(|a| &a == el);
+        if focused && kbd_shown.get_untracked() {
             let _ = t.blur();
         } else {
+            // Focus gardé sans clavier (fermé par sa touche native) : il faut le perdre pour que
+            // le focus suivant rouvre le clavier.
+            if focused {
+                let _ = t.blur();
+            }
             let opts = web_sys::FocusOptions::new();
             opts.set_prevent_scroll(true);
             let _ = t.focus_with_options(&opts);
@@ -492,6 +510,14 @@ pub fn SessionPage() -> impl IntoView {
         }
         navigate("/", Default::default());
     };
+    // « Netteté maximale » : sans H.264 (RemoteFX/ClearCodec, sans sous-échantillonnage de chroma) ;
+    // le choix est retenu par navigateur et la session se rouvre pour qu'il prenne effet.
+    let sharp = move |_| {
+        h264::set_sharp(!h264::is_off());
+        menu_open.set(false);
+        attempt.set(0);
+        open(None);
+    };
     let retry = move |_| {
         attempt.set(0);
         open(None);
@@ -539,15 +565,13 @@ pub fn SessionPage() -> impl IntoView {
         let start = (e.client_x(), e.client_y());
         drag.set_value(Some(Drag { id: e.pointer_id(), start, origin, moving: false }));
     };
+    // Suivi sur `window` : le glissé continue et se termine même si le pointeur sort du groupe.
     let dock_move = move |e: PointerEvent| {
         let Some(mut d) = drag.get_value().filter(|d| d.id == e.pointer_id()) else { return };
         let (dx, dy) = (e.client_x() - d.start.0, e.client_y() - d.start.1);
         if !d.moving && dx.hypot(dy) >= dock::DRAG_START {
             d.moving = true;
             drag.set_value(Some(d));
-            if let Some(el) = dock_ref.get_untracked() {
-                let _ = el.set_pointer_capture(d.id);
-            }
         }
         if d.moving {
             dock_pos.set(Some(dock::clamp((d.origin.0 + dx, d.origin.1 + dy), area())));
@@ -564,6 +588,18 @@ pub fn SessionPage() -> impl IntoView {
             }
         }
     };
+    let dock_listeners = StoredValue::new_local(Some((
+        window_event_listener(ev::pointermove, dock_move),
+        window_event_listener(ev::pointerup, dock_up),
+        window_event_listener(ev::pointercancel, dock_up),
+    )));
+    on_cleanup(move || {
+        if let Some((m, u, c)) = dock_listeners.try_update_value(Option::take).flatten() {
+            m.remove();
+            u.remove();
+            c.remove();
+        }
+    });
     let quit_dock = {
         let quit = quit.clone();
         move |e: web_sys::MouseEvent| {
@@ -642,8 +678,8 @@ pub fn SessionPage() -> impl IntoView {
                         with_engine(&|eng| eng.text_input(&e.input_type(), data.clone()));
                     }
                 }
-                on:focus=move |_| kbd_open.set(true)
-                on:blur=move |_| kbd_open.set(false)
+                on:focus=move |_| kbd_focus.set(true)
+                on:blur=move |_| kbd_focus.set(false)
                 on:compositionstart=move |_| composing.set_value(true)
                 on:compositionend=move |e: web_sys::CompositionEvent| {
                     composing.set_value(false);
@@ -658,14 +694,10 @@ pub fn SessionPage() -> impl IntoView {
                 }
             ></textarea>
             <div
-                node_ref=dock_ref
                 class="session-dock"
                 style=dock_style
                 inert=blocked
                 on:pointerdown=dock_down
-                on:pointermove=dock_move
-                on:pointerup=dock_up
-                on:pointercancel=dock_up
             >
                 <button
                     type="button"
@@ -704,7 +736,7 @@ pub fn SessionPage() -> impl IntoView {
                                 if m.win {
                                     // Win déjà armée : seule, elle ouvre le menu Démarrer.
                                     mods.set(keys::Mods::default());
-                                    with_engine(&|eng| eng.bar_chord(m, None));
+                                    with_engine(&|eng| eng.bar_chord(keys::Mods { win: true, ..Default::default() }, None));
                                 } else {
                                     mods.update(|m| m.win = true);
                                 }
@@ -748,6 +780,9 @@ pub fn SessionPage() -> impl IntoView {
                 </button>
                 <Show when=move || menu_open.get()>
                     <div class="session-actions">
+                        <p class="session-info">
+                            {move || engine.with_value(|e| e.as_ref().map(Engine::image_path)).unwrap_or_default()}
+                        </p>
                         {can_fullscreen.then(|| view! { <button on:click=fullscreen>"Plein écran"</button> })}
                         {move || {
                             multi_label.track();
@@ -762,6 +797,9 @@ pub fn SessionPage() -> impl IntoView {
                             }
                         }}
                         <button on:click=cad>"Ctrl+Alt+Suppr"</button>
+                        <button on:click=sharp>
+                            {if h264::is_off() { "Revenir au H.264" } else { "Netteté maximale" }}
+                        </button>
                         <button class="secondary" on:click=quit.clone()>"Quitter"</button>
                     </div>
                 </Show>

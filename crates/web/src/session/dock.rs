@@ -41,6 +41,31 @@ fn parse(s: &str) -> Option<(f64, f64)> {
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
+/// Écart de hauteur (px) à partir duquel la vue visible dit « clavier affiché » (au-dessus du
+/// bandeau de raccourcis d'un clavier matériel d'iPad, environ 55 px).
+const KEYBOARD_MIN: f64 = 100.0;
+
+/// Détecte le clavier système par la hauteur de la vue visible, comparée à la plus grande hauteur
+/// vue pour cette largeur (couvre `innerHeight` fixe comme `innerHeight` qui rétrécit).
+#[derive(Default, Debug)]
+pub struct KeyboardWatch {
+    width: f64,
+    height: f64,
+}
+
+impl KeyboardWatch {
+    /// `width` et `visible` : vue visible ; `inner` : hauteur de la fenêtre. Vrai si le clavier est affiché.
+    pub fn update(&mut self, width: f64, inner: f64, visible: f64) -> bool {
+        if (width - self.width).abs() > 1.0 {
+            // Rotation ou redimensionnement : nouvelle référence.
+            self.width = width;
+            self.height = 0.0;
+        }
+        self.height = self.height.max(inner).max(visible);
+        self.height - visible > KEYBOARD_MIN
+    }
+}
+
 pub fn load() -> Option<(f64, f64)> {
     parse(&web_sys::window()?.local_storage().ok()??.get_item(KEY).ok()??)
 }
@@ -72,6 +97,21 @@ mod tests {
         assert_eq!(clamp((0.0, 9999.0), a).1, 500.0 - 8.0 - 106.0 - HEIGHT);
         let scrolled = Area::new((0.0, 120.0, 390.0, 500.0), (0.0, 0.0, 0.0, 0.0), 0.0);
         assert_eq!(clamp((0.0, 0.0), scrolled).1, 128.0);
+    }
+
+    #[test]
+    fn keyboard_detected_from_the_visible_height() {
+        let mut w = KeyboardWatch::default();
+        assert!(!w.update(390.0, 844.0, 844.0));
+        assert!(w.update(390.0, 844.0, 500.0), "clavier ouvert");
+        assert!(!w.update(390.0, 844.0, 844.0), "fermé par sa touche native : la barre doit partir");
+        assert!(!w.update(390.0, 844.0, 800.0), "barre d'adresse : pas un clavier");
+        // Android ancien : la fenêtre rétrécit avec le clavier.
+        let mut a = KeyboardWatch::default();
+        assert!(!a.update(400.0, 800.0, 800.0));
+        assert!(a.update(400.0, 450.0, 450.0));
+        // Rotation : nouvelle référence, pas de faux positif.
+        assert!(!a.update(800.0, 400.0, 400.0));
     }
 
     #[test]

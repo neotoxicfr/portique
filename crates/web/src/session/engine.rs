@@ -110,6 +110,8 @@ struct Inner {
     /// Fermeture volontaire suivie d'une réouverture (H.264 inexploitable par ce navigateur).
     restart: bool,
     avc: h264::Avc,
+    /// Dernier chemin d'image H.264 reçu et format d'image du décodeur (menu de session).
+    image: (Option<h264::Kind>, Option<&'static str>),
     clip: rdp_clip::Clipboard,
     clip_fetch: clip::Fetch,
     /// Génération du contenu à écrire localement : une écriture ou un réessai d'une génération
@@ -233,6 +235,7 @@ impl Engine {
             closing: false,
             restart: false,
             avc: opts.avc,
+            image: (None, None),
             clip: rdp_clip::Clipboard::new(),
             clip_fetch: clip::Fetch::default(),
             clip_write_gen: 0,
@@ -509,6 +512,8 @@ impl Engine {
                         Some(d) => d.decode(&data).await,
                         None => Err(DecodeError::Unusable("décodeur H.264 indisponible".into())),
                     };
+                    self.inner.borrow_mut().image =
+                        (Some(h264::Kind::Avc420), h264.as_ref().and_then(H264::format));
                     let more = match decoded {
                         Ok(Decoded::Yuv(p)) => self.inner.borrow_mut().gfx.submit_yuv420(&p.view()),
                         Ok(Decoded::Rgba { width, height, data }) => self
@@ -549,6 +554,8 @@ impl Engine {
                         };
                         decoded.push(frame);
                     }
+                    self.inner.borrow_mut().image =
+                        (Some(h264::Kind::Avc444), h264.as_ref().and_then(H264::format));
                     let mut gfx = std::cell::RefMut::map(self.inner.borrow_mut(), |i| &mut i.gfx);
                     let more = match (failed, &decoded[0], &decoded[1]) {
                         (Some(e), ..) => {
@@ -1475,13 +1482,30 @@ impl Engine {
         self.input(&events);
     }
 
+    /// Chemin d'image réellement utilisé (ligne d'information du menu de session).
+    pub fn image_path(&self) -> String {
+        let i = self.inner.borrow();
+        h264::path_label(i.avc != h264::Avc::Off, h264::chosen(), i.image.0, i.image.1)
+    }
+
     /// Touche de la barre de touches (scancodes), avec ses modificateurs collants.
     pub fn bar_chord(&self, mods: super::keys::Mods, code: Option<&str>) {
         if !self.is_connected() {
             return;
         }
         self.user_gesture();
-        self.input(&super::keys::chord(mods, code));
+        // Modificateurs déjà maintenus au clavier matériel : la barre n'y touche pas.
+        let held = {
+            let i = self.inner.borrow();
+            let any =
+                |a: u8, b: u8, ext: bool| i.pressed.contains(&(a, ext)) || i.pressed.contains(&(b, ext));
+            super::keys::Mods {
+                ctrl: i.pressed.contains(&(0x1D, false)) || i.pressed.contains(&(0x1D, true)),
+                alt: i.pressed.contains(&(0x38, false)) || i.pressed.contains(&(0x38, true)),
+                win: any(0x5B, 0x5C, true),
+            }
+        };
+        self.input(&super::keys::chord(mods, code, held));
     }
 
     pub fn ctrl_alt_del(&self) {

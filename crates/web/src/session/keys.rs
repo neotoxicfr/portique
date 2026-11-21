@@ -181,9 +181,10 @@ pub struct Mods {
 }
 
 /// Touche de la barre avec ses modificateurs : modificateurs enfoncés (Ctrl, Alt, Win), touche
-/// appuyée puis relâchée, modificateurs relâchés en ordre inverse. Sans touche (`None`), les
+/// appuyée puis relâchée, modificateurs relâchés en ordre inverse. `held` : modificateurs déjà
+/// maintenus (clavier matériel) : ni réappuyés ni relâchés, ils restent tels quels côté PC. Sans touche (`None`), les
 /// modificateurs seuls sont tapés (Win seul = menu Démarrer). Code inconnu : rien.
-pub fn chord(mods: Mods, code: Option<&str>) -> Vec<Input> {
+pub fn chord(mods: Mods, code: Option<&str>, held: Mods) -> Vec<Input> {
     let key = match code {
         Some(c) => match scancode(c) {
             Some(k) => Some(k),
@@ -191,11 +192,14 @@ pub fn chord(mods: Mods, code: Option<&str>) -> Vec<Input> {
         },
         None => None,
     };
-    let held: Vec<(u8, bool)> =
-        [(mods.ctrl, (0x1D, false)), (mods.alt, (0x38, false)), (mods.win, (0x5B, true))]
-            .into_iter()
-            .filter_map(|(on, k)| on.then_some(k))
-            .collect();
+    let held: Vec<(u8, bool)> = [
+        (mods.ctrl && !held.ctrl, (0x1D, false)),
+        (mods.alt && !held.alt, (0x38, false)),
+        (mods.win && !held.win, (0x5B, true)),
+    ]
+    .into_iter()
+    .filter_map(|(on, k)| on.then_some(k))
+    .collect();
     let mut out = Vec::new();
     for (code, ext) in &held {
         out.push(Input::Scancode { code: *code, flags: if *ext { EXTENDED } else { 0 } });
@@ -260,15 +264,19 @@ mod tests {
         let sc = |code, flags| Input::Scancode { code, flags };
         let alt = Mods { alt: true, ..Mods::default() };
         assert_eq!(
-            chord(alt, Some("Tab")),
+            chord(alt, Some("Tab"), Mods::default()),
             [sc(0x38, 0), sc(0x0F, 0), sc(0x0F, RELEASE), sc(0x38, RELEASE)],
             "Alt puis Tab = Alt+Tab"
         );
         let win = Mods { win: true, ..Mods::default() };
-        assert_eq!(chord(win, None), [sc(0x5B, EXTENDED), sc(0x5B, EXTENDED | RELEASE)], "Win seul");
+        assert_eq!(
+            chord(win, None, Mods::default()),
+            [sc(0x5B, EXTENDED), sc(0x5B, EXTENDED | RELEASE)],
+            "Win seul"
+        );
         let all = Mods { ctrl: true, alt: true, win: true };
         assert_eq!(
-            chord(all, Some("ArrowLeft")),
+            chord(all, Some("ArrowLeft"), Mods::default()),
             [
                 sc(0x1D, 0),
                 sc(0x38, 0),
@@ -280,9 +288,26 @@ mod tests {
                 sc(0x1D, RELEASE)
             ]
         );
-        assert_eq!(chord(Mods::default(), Some("F5")), tap(0x3F, false), "sans modificateur : un appui");
-        assert_eq!(chord(all, Some("Nope")), Vec::new(), "code inconnu : rien, modificateurs coincés exclus");
-        assert!(chord(Mods::default(), None).is_empty());
+        assert_eq!(
+            chord(Mods::default(), Some("F5"), Mods::default()),
+            tap(0x3F, false),
+            "sans modificateur : un appui"
+        );
+        assert_eq!(
+            chord(all, Some("Nope"), Mods::default()),
+            Vec::new(),
+            "code inconnu : rien, modificateurs coincés exclus"
+        );
+        assert!(chord(Mods::default(), None, Mods::default()).is_empty());
+        // Ctrl physique déjà maintenu : jamais relâché par la barre.
+        let ctrl = Mods { ctrl: true, ..Mods::default() };
+        assert_eq!(chord(ctrl, Some("Tab"), ctrl), tap(0x0F, false), "Ctrl déjà là : la touche seule");
+        let ctrl_alt = Mods { ctrl: true, alt: true, ..Mods::default() };
+        assert_eq!(
+            chord(ctrl_alt, Some("Tab"), ctrl),
+            [sc(0x38, 0), sc(0x0F, 0), sc(0x0F, RELEASE), sc(0x38, RELEASE)],
+            "seul Alt, ajouté par la barre, est relâché"
+        );
     }
 
     #[test]

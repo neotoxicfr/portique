@@ -170,6 +170,8 @@ pub enum AfterRead {
     Done,
     /// Attendre l'accusé de la dernière liste en vol (`join`).
     Join,
+    /// Dépassée par une lecture dont Windows a refusé le contenu : le PC n'est pas à jour, relire.
+    Retry,
     /// Contenu à publier (`set_local`, puis `sent` si une liste part).
     Publish,
 }
@@ -186,6 +188,8 @@ pub struct Announces {
     /// Numéro de départ de la plus récente lecture conclue (publiée, rejointe ou sans objet) : une
     /// lecture commencée avant elle est dépassée.
     published_seq: u64,
+    /// Windows a refusé la dernière liste de cette lecture conclue (rien d'autre en vol depuis).
+    refused: bool,
 }
 
 impl Announces {
@@ -232,12 +236,18 @@ impl Announces {
         // Une lecture commencée APRÈS celle-ci a déjà publié : ce contenu-ci est plus ancien. On
         // attend plutôt l'accusé de la publication récente, si elle est encore en vol. Une lecture
         // plus ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci.
+        // Accusé déjà reçu : un refus laisse le PC avec son ancien contenu, il faut relire.
         if self.published_seq > mark.seq {
-            return if self.pending.is_empty() { AfterRead::Done } else { AfterRead::Join };
+            return match (self.pending.is_empty(), self.refused) {
+                (false, _) => AfterRead::Join,
+                (true, true) => AfterRead::Retry,
+                (true, false) => AfterRead::Done,
+            };
         }
         // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
         // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
         self.published_seq = mark.seq;
+        self.refused = false;
         match self.latest() {
             // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : même accusé.
             Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
@@ -252,6 +262,9 @@ impl Announces {
     /// des attentes, lui, reste `Replaced` pour une liste suivie d'une autre.
     pub fn answered(&mut self, ok: bool, common: &mut Option<u64>) {
         let Some(a) = self.pending.pop_front() else { return };
+        if self.pending.is_empty() {
+            self.refused = !ok;
+        }
         let verdict = match (self.pending.is_empty(), ok) {
             (false, _) => Ack::Replaced,
             (true, true) => Ack::Accepted,
@@ -579,6 +592,14 @@ mod tests {
         a.answered(true, &mut common);
         a.answered(true, &mut common);
         assert_eq!(a.after_read(ma, 4, common, 400.0), AfterRead::Done);
+        // B refusée avant la fin de A : A ne conclut pas à un succès, elle fait relire.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 5, common, 410.0), AfterRead::Publish);
+        a.sent(Some(5), 410.0, None);
+        a.answered(false, &mut common);
+        assert_eq!(a.after_read(ma, 4, common, 420.0), AfterRead::Retry);
+        assert_eq!(a.after_read(ma, 4, common, 420.0), AfterRead::Retry, "rien n'a changé depuis");
         // Sans publication intermédiaire, la lecture se termine normalement.
         let m = a.mark();
         assert_eq!(a.after_read(m, 4, common, 500.0), AfterRead::Publish);

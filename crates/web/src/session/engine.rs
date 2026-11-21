@@ -4,7 +4,11 @@
 //! attend le décodage des images H.264 : l'ordre des commandes graphiques et les accusés
 //! d'image restent exacts. Les entrées (clavier, souris) partent directement sur le WebSocket.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use futures::{StreamExt, channel::mpsc};
 use portique_proto::SessionMessage;
@@ -90,6 +94,7 @@ struct Inner {
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
+    buttons: Held,
     connected: bool,
     closing: bool,
     /// Fermeture volontaire suivie d'une réouverture (H.264 inexploitable par ce navigateur).
@@ -205,6 +210,7 @@ impl Engine {
             desktop: (w, h),
             cursors: vec![None; 32],
             pressed: HashSet::new(),
+            buttons: Held::new(),
             connected: false,
             closing: false,
             restart: false,
@@ -393,7 +399,11 @@ impl Engine {
                     self.inner.borrow_mut().gfx_channel = Some(channel_id);
                     self.dvc_send(channel_id, &rdp_gfx::caps_advertise(avc));
                 } else if name == rdp_session::DVC_DISPLAY_CONTROL {
-                    self.inner.borrow_mut().display_channel = Some(channel_id);
+                    // Les limites sont celles du canal qui les annonce : un nouveau canal ouvert avant
+                    // la fermeture de l'ancien n'est prêt qu'à sa propre CAPS PDU.
+                    let mut i = self.inner.borrow_mut();
+                    i.display_channel = Some(channel_id);
+                    i.display_caps = None;
                 }
             }
             Event::DvcData { channel_id, data } => {
@@ -430,10 +440,17 @@ impl Engine {
                 }
             }
             Event::Pointer(p) => self.pointer(p),
-            Event::ServerError(t) => (self.status)(Status::Closed { reason: t, retry: Retry::No }),
-            Event::Disconnected(t) => {
-                self.inner.borrow_mut().connected = false;
-                (self.status)(Status::Closed { reason: t, retry: Retry::No });
+            // Refus ou fin voulue par le PC : la fermeture du WebSocket qui suit ne relance rien et
+            // garde le premier motif (Set Error Info, plus précis, précède la déconnexion MCS).
+            Event::ServerError(t) | Event::Disconnected(t) => {
+                let first = {
+                    let mut i = self.inner.borrow_mut();
+                    i.connected = false;
+                    !std::mem::replace(&mut i.closing, true)
+                };
+                if first {
+                    (self.status)(Status::Closed { reason: t, retry: Retry::No });
+                }
             }
             Event::Clipboard(msg) => self.clipboard(&msg),
             Event::Deactivated | Event::KeyboardIndicators(_) | Event::Ignored(_) => {}
@@ -657,7 +674,7 @@ impl Engine {
         let (Some(channel), Some(caps)) = (channel, caps) else {
             return Err("le PC n'accepte pas encore de changement d'affichage".into());
         };
-        let (monitors, rects) = views::layout(screens, current);
+        let (monitors, rects) = views::layout(screens, current)?;
         caps.check(&monitors)?;
         let secondary: Vec<usize> = (0..screens.len()).filter(|&i| i != current).collect();
         let (k, closed, changed) = {
@@ -685,18 +702,21 @@ impl Engine {
             return Err("écrans changés pendant l'extension : recommencer".into());
         };
         let (win, canvas) = views::open_window(&screens[idx], idx)?;
-        let mut v = View::new(canvas, rects[idx], Some(win.clone())).inspect_err(|_| {
+        let v = View::new(canvas, rects[idx], Some(win.clone())).inspect_err(|_| {
             let _ = win.close();
         })?;
-        // Index définitif de la vue une fois installée (la vue 0 est la fenêtre principale).
-        self.wire_view(&mut v, 1 + k);
         let mut i = self.inner.borrow_mut();
         i.staged.push(v);
         if i.staged.len() < secondary.len() {
             return Ok(Extend::Next { opened: 1 + i.staged.len(), total: screens.len() });
         }
-        let staged = std::mem::take(&mut i.staged);
+        let mut staged = std::mem::take(&mut i.staged);
         i.staged_screens = None;
+        // Entrées branchées à l'installation seulement : une fenêtre préparée (noire) ne transmet
+        // rien au PC, pas même ses touches. Index définitif : la vue 0 est la fenêtre principale.
+        for (k, v) in staged.iter_mut().enumerate() {
+            self.wire_view(v, 1 + k);
+        }
         i.views.extend(staged);
         i.multi = Some(std::iter::once(current).chain(secondary).map(|idx| rects[idx]).collect());
         drop(i);
@@ -737,7 +757,7 @@ impl Engine {
         use wasm_bindgen::closure::Closure;
         use web_sys::{KeyboardEvent, PointerEvent, WheelEvent};
         let target: &web_sys::EventTarget = v.canvas.as_ref();
-        for kind in ["pointermove", "pointerdown", "pointerup"] {
+        for kind in ["pointermove", "pointerdown", "pointerup", "pointercancel"] {
             let e = self.clone();
             let f = Closure::<dyn FnMut(PointerEvent)>::new(move |ev: PointerEvent| {
                 e.pointer_input(idx, &ev, kind)
@@ -783,7 +803,6 @@ impl Engine {
 
     /// Événement pointeur (souris, stylet, tactile) d'une vue.
     pub fn pointer_input(&self, idx: usize, e: &web_sys::PointerEvent, kind: &str) {
-        use rdp_pdu::fastpath::ptr;
         if !self.is_connected() {
             return;
         }
@@ -796,35 +815,17 @@ impl Engine {
         if idx == 0 && e.pointer_type() == "touch" {
             return self.touch_input(e, kind);
         }
-        if kind == "pointercancel" {
+        let Some(point) = self.desktop_point(idx, e.client_x(), e.client_y()) else {
             return;
+        };
+        let event =
+            button_input(&mut self.inner.borrow_mut().buttons, e.pointer_id(), kind, e.button(), point);
+        let Some(event) = event else { return };
+        if kind == "pointerdown"
+            && let Some(v) = self.inner.borrow().views.get(idx)
+        {
+            let _ = v.canvas.set_pointer_capture(e.pointer_id());
         }
-        let Some((x, y)) = self.desktop_point(idx, e.client_x(), e.client_y()) else {
-            return;
-        };
-        let event = match kind {
-            "pointermove" => Input::Mouse { flags: ptr::MOVE, x, y },
-            _ => {
-                let (flag, extended) = match e.button() {
-                    0 => (ptr::BUTTON1, false),
-                    1 => (ptr::BUTTON3, false),
-                    2 => (ptr::BUTTON2, false),
-                    3 => (ptr::X_BUTTON1, true),
-                    4 => (ptr::X_BUTTON2, true),
-                    _ => return,
-                };
-                let down = kind == "pointerdown";
-                if down && let Some(v) = self.inner.borrow().views.get(idx) {
-                    let _ = v.canvas.set_pointer_capture(e.pointer_id());
-                }
-                match (extended, down) {
-                    (false, true) => Input::Mouse { flags: flag | ptr::DOWN, x, y },
-                    (false, false) => Input::Mouse { flags: flag, x, y },
-                    (true, true) => Input::MouseX { flags: flag | ptr::X_DOWN, x, y },
-                    (true, false) => Input::MouseX { flags: flag, x, y },
-                }
-            }
-        };
         self.input(&[event]);
     }
 
@@ -1214,8 +1215,9 @@ impl Engine {
     }
 
     /// Envoie au PC le contenu du presse-papier local s'il a changé, et attend que Windows l'ait
-    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste, ou si une liste plus
-    /// récente l'a remplacée avant sa réponse : il reste à réannoncer ou à rejoindre la suivante.
+    /// accepté (borné par l'appelant). Faux si Windows a refusé la liste, si une liste plus récente
+    /// l'a remplacée avant sa réponse, ou si la lecture plus récente qui a dépassé celle-ci a été
+    /// refusée : il reste à relire, réannoncer ou rejoindre la suivante.
     pub async fn sync_local_clipboard(&self) -> bool {
         if !self.is_connected() {
             return true;
@@ -1242,6 +1244,7 @@ impl Engine {
             let common = i.clip_last;
             match i.clip_announces.after_read(mark, fp, common, now) {
                 clip::AfterRead::Done => return true,
+                clip::AfterRead::Retry => return false,
                 clip::AfterRead::Join => {
                     i.clip_announces.join(tx);
                     Vec::new()
@@ -1407,6 +1410,50 @@ impl Engine {
     }
 }
 
+/// Boutons distants enfoncés, par pointeur (souris, stylet, doigt d'une fenêtre secondaire) :
+/// drapeaux du bouton, étendu (X1/X2), dernière position envoyée.
+type Held = HashMap<i32, (u16, bool, (u16, u16))>;
+
+/// Entrée RDP d'un événement pointeur hors gestes tactiles. Le bouton enfoncé au `pointerdown`
+/// est relâché une seule fois, au `pointerup` ou au `pointercancel` : après une annulation, le
+/// navigateur n'envoie pas de `pointerup` et Windows garderait le bouton enfoncé. Le relâchement
+/// reprend ce bouton-là, quel que soit celui que signale l'événement (boutons combinés).
+fn button_input(held: &mut Held, id: i32, kind: &str, button: i16, (x, y): (u16, u16)) -> Option<Input> {
+    use rdp_pdu::fastpath::ptr;
+    let (down, (flag, extended, (x, y))) = match kind {
+        "pointermove" => {
+            if let Some(h) = held.get_mut(&id) {
+                h.2 = (x, y);
+            }
+            return Some(Input::Mouse { flags: ptr::MOVE, x, y });
+        }
+        "pointerdown" => {
+            let (flag, extended) = match button {
+                0 => (ptr::BUTTON1, false),
+                1 => (ptr::BUTTON3, false),
+                2 => (ptr::BUTTON2, false),
+                3 => (ptr::X_BUTTON1, true),
+                4 => (ptr::X_BUTTON2, true),
+                _ => return None,
+            };
+            held.insert(id, (flag, extended, (x, y)));
+            (true, (flag, extended, (x, y)))
+        }
+        "pointerup" => {
+            let (flag, extended, _) = held.remove(&id)?;
+            (false, (flag, extended, (x, y)))
+        }
+        // Annulation : sa position n'est pas fiable, le bouton est relâché là où il était.
+        _ => (false, held.remove(&id)?),
+    };
+    Some(match (extended, down) {
+        (false, true) => Input::Mouse { flags: flag | ptr::DOWN, x, y },
+        (false, false) => Input::Mouse { flags: flag, x, y },
+        (true, true) => Input::MouseX { flags: flag | ptr::X_DOWN, x, y },
+        (true, false) => Input::MouseX { flags: flag, x, y },
+    })
+}
+
 /// Écran seul à envoyer pour `size` (déjà bornée), `None` s'il n'y a rien à envoyer. `desired`
 /// retient la taille et un retour forcé à un écran tant qu'aucune disposition n'est partie :
 /// contrôle d'affichage pas prêt (`caps` absent) ou PC trop limité. Le PC peut garder sa
@@ -1499,6 +1546,37 @@ mod tests {
         let tiny = Some(DisplayCaps { max_monitors: 1, max_area: 100 * 100 });
         assert!(single_layout(&mut desired, tiny, (1920, 1080), true, (1920, 1080)).is_err());
         assert_eq!(desired, Some(((1920, 1080), true)));
+    }
+
+    #[test]
+    fn pointer_button_released_once_on_up_or_cancel() {
+        use rdp_pdu::fastpath::ptr;
+        let mut held = Held::new();
+        let mouse = |flags, (x, y)| Some(Input::Mouse { flags, x, y });
+        // Stylet posé, déplacé, puis geste annulé par le navigateur : relâché où il était, une fois.
+        assert_eq!(
+            button_input(&mut held, 7, "pointerdown", 0, (10, 20)),
+            mouse(ptr::BUTTON1 | ptr::DOWN, (10, 20))
+        );
+        assert_eq!(button_input(&mut held, 7, "pointermove", -1, (30, 40)), mouse(ptr::MOVE, (30, 40)));
+        assert_eq!(button_input(&mut held, 7, "pointercancel", -1, (0, 0)), mouse(ptr::BUTTON1, (30, 40)));
+        assert_eq!(button_input(&mut held, 7, "pointercancel", -1, (0, 0)), None);
+        assert_eq!(button_input(&mut held, 7, "pointerup", 0, (30, 40)), None, "déjà relâché");
+        // Boutons combinés : le dernier relâché (droit) termine le geste, c'est le gauche qui part.
+        button_input(&mut held, 1, "pointerdown", 0, (5, 5));
+        assert_eq!(button_input(&mut held, 1, "pointerup", 2, (6, 6)), mouse(ptr::BUTTON1, (6, 6)));
+        // Boutons étendus, et bouton inconnu (gomme) ignoré jusqu'au bout.
+        assert_eq!(
+            button_input(&mut held, 1, "pointerdown", 3, (1, 2)),
+            Some(Input::MouseX { flags: ptr::X_BUTTON1 | ptr::X_DOWN, x: 1, y: 2 })
+        );
+        assert_eq!(
+            button_input(&mut held, 1, "pointerup", 3, (1, 2)),
+            Some(Input::MouseX { flags: ptr::X_BUTTON1, x: 1, y: 2 })
+        );
+        assert_eq!(button_input(&mut held, 2, "pointerdown", 5, (1, 2)), None);
+        assert_eq!(button_input(&mut held, 2, "pointerup", 5, (1, 2)), None);
+        assert!(held.is_empty());
     }
 
     #[test]

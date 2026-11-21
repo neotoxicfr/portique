@@ -130,21 +130,62 @@ pub fn screens(details: &JsValue) -> Result<(Vec<ScreenGeom>, usize), String> {
 /// Écran envoyé au PC : x, y relatifs à l'écran principal, largeur, hauteur.
 pub type Monitor = (i32, i32, u32, u32);
 
-/// Disposition à envoyer (relative à l'écran principal) et rectangles attendus en sortie.
-pub fn layout(screens: &[ScreenGeom], primary: usize) -> (Vec<Monitor>, Vec<Rect>) {
+/// Disposition à envoyer (relative à l'écran principal) et rectangles attendus en sortie, ou la
+/// raison pour laquelle le PC l'ignorerait (MS-RDPEDISP 2.2.2.2.1). La largeur doit être paire :
+/// tous les bords verticaux sont ramenés au pair inférieur, si bien que deux écrans voisins le
+/// restent (arrondir la seule largeur ouvrirait un intervalle d'un pixel).
+pub fn layout(screens: &[ScreenGeom], primary: usize) -> Result<(Vec<Monitor>, Vec<Rect>), String> {
     let p = &screens[primary];
-    let rel: Vec<Monitor> = screens
-        .iter()
-        .map(|s| {
-            let (w, h) = crate::session::engine::clamp_size(s.width, s.height);
-            (s.left - p.left, s.top - p.top, w, h)
-        })
-        .collect();
+    let even = |v: i64| v & !1;
+    let mut rel: Vec<Monitor> = Vec::with_capacity(screens.len());
+    for s in screens {
+        let x = i64::from(s.left) - i64::from(p.left);
+        let w = u32::try_from(even(x + i64::from(s.width)) - even(x)).unwrap_or(0);
+        if !(200..=8192).contains(&w) || !(200..=8192).contains(&s.height) {
+            return Err(format!(
+                "écran {}×{} hors des limites du protocole (200 à 8192 px)",
+                s.width, s.height
+            ));
+        }
+        rel.push((even(x) as i32, (i64::from(s.top) - i64::from(p.top)) as i32, w, s.height));
+    }
+    check_arrangement(&rel)?;
     let min_x = rel.iter().map(|r| r.0).min().unwrap_or(0);
     let min_y = rel.iter().map(|r| r.1).min().unwrap_or(0);
     let rects =
         rel.iter().map(|&(x, y, w, h)| Rect { x: (x - min_x) as u32, y: (y - min_y) as u32, w, h }).collect();
-    (rel, rects)
+    Ok((rel, rects))
+}
+
+/// Écrans sans recouvrement et reliés entre eux par leurs bords, sans intervalle (un contact par
+/// un coin suffit).
+fn check_arrangement(m: &[Monitor]) -> Result<(), String> {
+    let r: Vec<[i64; 4]> = m
+        .iter()
+        .map(|&(x, y, w, h)| [x.into(), y.into(), i64::from(x) + i64::from(w), i64::from(y) + i64::from(h)])
+        .collect();
+    // Projections sur l'axe `k` (0 : x, 1 : y) : recouvrement d'une longueur non nulle, ou contact.
+    let cross = |a: &[i64; 4], b: &[i64; 4], k: usize| a[k].max(b[k]) < a[k + 2].min(b[k + 2]);
+    let meet = |a: &[i64; 4], b: &[i64; 4], k: usize| a[k].max(b[k]) <= a[k + 2].min(b[k + 2]);
+    let touch = |a: &[i64; 4], b: &[i64; 4]| {
+        ((a[2] == b[0] || b[2] == a[0]) && meet(a, b, 1)) || ((a[3] == b[1] || b[3] == a[1]) && meet(a, b, 0))
+    };
+    for (i, a) in r.iter().enumerate() {
+        if r[i + 1..].iter().any(|b| cross(a, b, 0) && cross(a, b, 1)) {
+            return Err("écrans qui se recouvrent : disposition refusée par le protocole".into());
+        }
+    }
+    // Reliés : à partir du premier, on gagne de proche en proche tout écran qui en touche un atteint.
+    let mut reached: Vec<bool> = (0..r.len()).map(|i| i == 0).collect();
+    while let Some(j) =
+        (0..r.len()).find(|&j| !reached[j] && (0..r.len()).any(|i| reached[i] && touch(&r[i], &r[j])))
+    {
+        reached[j] = true;
+    }
+    if reached.contains(&false) {
+        return Err("écrans séparés par un intervalle : disposition refusée par le protocole".into());
+    }
+    Ok(())
 }
 
 /// Limites annoncées par le PC (DISPLAYCONTROL_CAPS_PDU, MS-RDPEDISP 2.2.2.1).
@@ -274,7 +315,7 @@ mod tests {
     #[test]
     fn secondary_on_the_left() {
         let screens = [s(0, 0, 1920, 1080), s(-1280, 56, 1280, 1024)];
-        let (rel, rects) = layout(&screens, 0);
+        let (rel, rects) = layout(&screens, 0).unwrap();
         assert_eq!(rel, [(0, 0, 1920, 1080), (-1280, 56, 1280, 1024)]);
         assert_eq!(rects[0], Rect { x: 1280, y: 0, w: 1920, h: 1080 });
         assert_eq!(rects[1], Rect { x: 0, y: 56, w: 1280, h: 1024 });
@@ -282,6 +323,26 @@ mod tests {
         assert_eq!(pdu.len(), 96);
         assert_eq!(&pdu[16..20], &1u32.to_le_bytes(), "principal");
         assert_eq!(&pdu[60..64], &(-1280i32).to_le_bytes());
+    }
+
+    #[test]
+    fn odd_widths_keep_screens_adjacent() {
+        // 1025 px puis un écran à x = 1025 : le bord commun passe à 1024 pour les deux.
+        let (rel, rects) = layout(&[s(0, 0, 1025, 768), s(1025, 0, 1920, 1080)], 0).unwrap();
+        assert_eq!(rel, [(0, 0, 1024, 768), (1024, 0, 1920, 1080)]);
+        assert_eq!(rects[1], Rect { x: 1024, y: 0, w: 1920, h: 1080 });
+        // Écran secondaire de largeur impaire à gauche (1366 px à 125 %) : collé au principal.
+        let (rel, _) = layout(&[s(0, 0, 1920, 1080), s(-1093, 0, 1093, 614)], 0).unwrap();
+        assert_eq!(rel[1], (-1094, 0, 1094, 614));
+        // Contact par un coin : accepté ; intervalle, recouvrement, taille hors bornes : refusés.
+        assert!(layout(&[s(0, 0, 1920, 1080), s(1920, 1080, 1920, 1080)], 0).is_ok());
+        assert!(layout(&[s(0, 0, 1920, 1080), s(1930, 0, 1920, 1080)], 0).is_err(), "intervalle");
+        assert!(layout(&[s(0, 0, 1920, 1080), s(1000, 0, 1920, 1080)], 1).is_err(), "recouvrement");
+        assert!(layout(&[s(0, 0, 1920, 1080), s(1920, 0, 9000, 1080)], 0).is_err(), "trop large");
+        assert!(layout(&[s(0, 0, 1920, 1080), s(1920, 0, 1920, 150)], 0).is_err(), "trop bas");
+        // Trois écrans en ligne : le troisième n'est relié qu'au deuxième.
+        let row = [s(0, 0, 1920, 1080), s(1920, 0, 1920, 1080), s(3840, 0, 1920, 1080)];
+        assert!(layout(&row, 1).is_ok());
     }
 
     #[test]

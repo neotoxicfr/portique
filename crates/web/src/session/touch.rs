@@ -117,8 +117,8 @@ pub struct Touch {
     zoom: Zoom,
     /// Canevas non transformé : gauche, haut, largeur, hauteur (px CSS).
     area: (f64, f64, f64, f64),
-    /// Dernier toucher rendu en clic : (x, y, instant).
-    last_tap: Option<(f64, f64, f64)>,
+    /// Dernier toucher rendu en clic : (x, y, instant, numéro du geste).
+    last_tap: Option<(f64, f64, f64, u32)>,
     /// Numéro du geste à un doigt en cours, rappelé par la minuterie d'appui long.
     serial: u32,
 }
@@ -294,15 +294,19 @@ impl Touch {
         let out = match self.state {
             State::Pending { f, x0, y0 } if f.id == id => {
                 self.state = State::Done;
+                // Double-clic seulement si le geste précédent était ce toucher : un glisser, un appui
+                // long ou un geste à deux doigts entre les deux rompt la paire.
                 let (x, y) = match self.last_tap {
-                    Some((lx, ly, lt))
-                        if t - lt <= DOUBLE_TAP_MS && dist((lx, ly), (x0, y0)) <= DOUBLE_TAP_RADIUS =>
+                    Some((lx, ly, lt, ls))
+                        if ls == self.serial.wrapping_sub(1)
+                            && t - lt <= DOUBLE_TAP_MS
+                            && dist((lx, ly), (x0, y0)) <= DOUBLE_TAP_RADIUS =>
                     {
                         (lx, ly)
                     }
                     _ => (x0, y0),
                 };
-                self.last_tap = Some((x, y, t));
+                self.last_tap = Some((x, y, t, self.serial));
                 click(Button::Left, x, y)
             }
             State::Dragging { f } if f.id == id => {
@@ -373,6 +377,28 @@ mod tests {
         // Trop tard : point réel.
         t.down(3, 108.0, 195.0);
         assert_eq!(t.up(3, 108.0, 195.0, 2500.0), click(Button::Left, 108.0, 195.0));
+    }
+
+    #[test]
+    fn tap_after_another_gesture_is_not_snapped() {
+        let mut t = touch();
+        // Toucher, glisser, puis toucher tout près du premier dans le délai : point réel.
+        t.down(1, 100.0, 200.0);
+        t.up(1, 100.0, 200.0, 1000.0);
+        t.down(2, 300.0, 300.0);
+        t.moved(2, 340.0, 340.0);
+        t.up(2, 340.0, 340.0, 1100.0);
+        t.down(3, 120.0, 200.0);
+        assert_eq!(t.up(3, 120.0, 200.0, 1200.0), click(Button::Left, 120.0, 200.0));
+        // Appui long entre deux touchers : pas de double-clic non plus.
+        t.down(4, 100.0, 200.0);
+        t.up(4, 100.0, 200.0, 3000.0);
+        t.down(5, 100.0, 200.0);
+        let serial = t.long_press_serial().unwrap();
+        t.long_press(serial);
+        t.up(5, 100.0, 200.0, 3100.0);
+        t.down(6, 110.0, 200.0);
+        assert_eq!(t.up(6, 110.0, 200.0, 3200.0), click(Button::Left, 110.0, 200.0));
     }
 
     #[test]

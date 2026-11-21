@@ -56,12 +56,13 @@ pub(crate) async fn session_has_mfa(
         return Ok(true);
     }
     let Some(token) = token else { return Ok(false) };
-    let mfa: Option<bool> =
-        sqlx::query_scalar("SELECT mfa FROM sessions WHERE token_hash = ? AND user_id = ?")
-            .bind(token)
-            .bind(user.id)
-            .fetch_optional(&state.db)
-            .await?;
+    let mfa: Option<bool> = sqlx::query_scalar(
+        "SELECT mfa FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at >= unixepoch()",
+    )
+    .bind(token)
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
     Ok(mfa == Some(true))
 }
 
@@ -415,6 +416,12 @@ pub(crate) mod tests {
         assert!(session_has_mfa(&s, &user, Some(b"avec")).await.unwrap());
         assert!(!session_has_mfa(&s, &user, None).await.unwrap(), "pas de session : refusé");
         assert!(!session_has_mfa(&s, &user, Some(b"inconnue")).await.unwrap());
+        sqlx::query("UPDATE sessions SET expires_at = unixepoch() - 1 WHERE token_hash = ?")
+            .bind(b"avec".as_slice())
+            .execute(&s.db)
+            .await
+            .unwrap();
+        assert!(!session_has_mfa(&s, &user, Some(b"avec")).await.unwrap(), "session expirée : refusée");
         // Mode proxy : la 2FA est l'affaire du proxy.
         let p = state("proxy").await;
         assert!(session_has_mfa(&p, &user, None).await.unwrap());

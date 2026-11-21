@@ -15,7 +15,7 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use portique_proto::{AuthMode, Me};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqliteExecutor, SqlitePool};
 use time::OffsetDateTime;
 
 use crate::{
@@ -131,21 +131,21 @@ pub fn validate_username(name: &str) -> Result<(), AppError> {
     if ok { Ok(()) } else { Err(AppError::BadRequest("identifiant invalide".into())) }
 }
 
-/// Vérifie un code TOTP et consomme son pas par une écriture conditionnelle : deux requêtes concurrentes
-/// avec le même code lisent le même `totp_last`, une seule l'emporte. L'écriture exige aussi la graine
-/// vérifiée : retirée ou remplacée entre-temps (remise à zéro de la 2FA), le code ne vaut plus rien.
+/// Vérifie un code TOTP et consomme son pas par une seule écriture conditionnelle, sans lecture préalable :
+/// un pas déjà consommé est refusé par l'écriture même, et de deux requêtes concurrentes avec le même code,
+/// une seule l'emporte. Dans une transaction (connexion), elle en est ainsi la première instruction : une
+/// lecture d'abord y deviendrait une écriture sur un instantané périmé (SQLITE_BUSY sous concurrence).
+/// L'écriture exige aussi la graine vérifiée : retirée ou remplacée entre-temps (remise à zéro de la 2FA),
+/// le code ne vaut plus rien.
 pub async fn consume_totp(
     state: &AppState,
+    db: impl SqliteExecutor<'_>,
     u: &UserRow,
     sealed: &[u8],
     code: &str,
 ) -> Result<bool, AppError> {
     let secret = state.vault.open(&format!("totp:{}", u.id), sealed)?;
-    let last: i64 = sqlx::query_scalar("SELECT totp_last FROM users WHERE id = ?")
-        .bind(u.id)
-        .fetch_one(&state.db)
-        .await?;
-    let Some(step) = crate::totp::verify(&secret, &u.username, code, last)? else {
+    let Some(step) = crate::totp::verify(&secret, &u.username, code, 0)? else {
         return Ok(false);
     };
     let r =
@@ -153,7 +153,7 @@ pub async fn consume_totp(
             .bind(step)
             .bind(u.id)
             .bind(sealed)
-            .execute(&state.db)
+            .execute(db)
             .await?;
     Ok(r.rows_affected() == 1)
 }
@@ -170,15 +170,17 @@ pub enum Proof<'a> {
 /// facteur (TOTP ou passkey). La preuve est revérifiée dans l'INSERT même : un changement de mot de passe,
 /// une remise à zéro de la 2FA ou une passkey retirée pendant la connexion ne laisse pas naître de session
 /// après la révocation (SQLite sérialise les écritures : avant, la révocation l'efface ; après, l'INSERT échoue).
+/// `db` : la transaction de la connexion, qui consomme aussi le code TOTP.
 pub async fn open_session(
     state: &AppState,
+    db: &mut SqliteConnection,
     jar: CookieJar,
     user_id: i64,
     proof: Proof<'_>,
 ) -> Result<CookieJar, AppError> {
     let (token, hash) = crypto::new_session_token();
     let expires = OffsetDateTime::now_utc() + time::Duration::days(SESSION_DAYS);
-    sqlx::query("DELETE FROM sessions WHERE expires_at < unixepoch()").execute(&state.db).await?;
+    sqlx::query("DELETE FROM sessions WHERE expires_at < unixepoch()").execute(&mut *db).await?;
     let insert =
         |sql: &'static str| sqlx::query(sql).bind(hash.clone()).bind(user_id).bind(expires.unix_timestamp());
     let r = match proof {
@@ -190,7 +192,7 @@ pub async fn open_session(
             .bind(totp.is_some())
             .bind(pw)
             .bind(totp)
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?
         }
         Proof::Passkey(id) => {
@@ -199,7 +201,7 @@ pub async fn open_session(
                  WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ?4 AND user_id = ?2)",
             )
             .bind(id)
-            .execute(&state.db)
+            .execute(&mut *db)
             .await?
         }
     };
@@ -381,7 +383,11 @@ mod tests {
         let s = crate::api::ssh::tests::state("builtin").await;
         let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
         let hash = u.password_hash.clone().unwrap();
-        let open = |proof| open_session(&s, CookieJar::new(), u.id, proof);
+        let (st, uid) = (&s, u.id);
+        let open = move |proof| async move {
+            let mut db = st.db.acquire().await.unwrap();
+            open_session(st, &mut db, CookieJar::new(), uid, proof).await
+        };
         assert!(open(Proof::Password { hash: &hash, totp: None }).await.is_ok());
         // Mot de passe changé (et sessions supprimées) entre la vérification et l'INSERT.
         sqlx::query("UPDATE users SET password_hash = 'autre' WHERE id = ?")
@@ -441,9 +447,9 @@ mod tests {
             .unwrap();
         let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
         let (a, b, c) = tokio::join!(
-            consume_totp(&s, &u, &sealed, &code),
-            consume_totp(&s, &u, &sealed, &code),
-            consume_totp(&s, &u, &sealed, &code)
+            consume_totp(&s, &s.db, &u, &sealed, &code),
+            consume_totp(&s, &s.db, &u, &sealed, &code),
+            consume_totp(&s, &s.db, &u, &sealed, &code)
         );
         let ok = [a.unwrap(), b.unwrap(), c.unwrap()];
         assert_eq!(ok.iter().filter(|o| **o).count(), 1, "{ok:?}");
@@ -457,7 +463,7 @@ mod tests {
         let secret = crate::totp::new_secret();
         let sealed = s.vault.seal(&format!("totp:{}", u.id), &secret);
         let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
-        assert!(!consume_totp(&s, &u, &sealed, &code).await.unwrap());
+        assert!(!consume_totp(&s, &s.db, &u, &sealed, &code).await.unwrap());
         let last: i64 = sqlx::query_scalar("SELECT totp_last FROM users WHERE id = ?")
             .bind(u.id)
             .fetch_one(&s.db)
@@ -481,9 +487,14 @@ mod tests {
                 (gate, task)
             })
             .unzip();
-        for _ in 0..4 {
-            started_rx.recv().await.unwrap();
-        }
+        // Délai borné : un calcul qui ne démarre pas fait échouer le test (et l'abandon de `gates` libère
+        // ceux qui ont démarré) au lieu de le bloquer.
+        let all_started = async {
+            for _ in 0..4 {
+                started_rx.recv().await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), all_started).await.expect("calculs démarrés");
         // Requêtes abandonnées pendant le calcul : les calculs continuent, leurs permis aussi.
         for t in &tasks {
             t.abort();

@@ -35,12 +35,12 @@ pub enum Ceremony {
         user_id: i64,
         state: PasskeyRegistration,
     },
-    /// `ip` : adresse du démarrage, celle sous laquelle la tentative a été réservée (et sera rendue).
+    /// `passkeys` : lignes des passkeys proposées au défi, seules à pouvoir ouvrir la session.
     Login {
         user_id: i64,
         state: PasskeyAuthentication,
         ticket: Ticket,
-        ip: std::net::IpAddr,
+        passkeys: Vec<i64>,
     },
 }
 
@@ -172,7 +172,7 @@ mod tests {
         let login = || {
             let (_, state) = s.webauthn.start_passkey_authentication(&keys).unwrap();
             let ticket = Arc::new(LoginLimiter::default()).reserve("192.0.2.1".parse().unwrap(), "").unwrap();
-            Ceremony::Login { user_id: 1, state, ticket, ip: "192.0.2.1".parse().unwrap() }
+            Ceremony::Login { user_id: 1, state, ticket, passkeys: vec![] }
         };
         let c = Ceremonies::default();
         let reg = c.insert(register());

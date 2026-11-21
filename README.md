@@ -89,12 +89,22 @@ navigateur côté client, ordinateur ou téléphone.
 ```sh
 mkdir -p portique && cd portique
 (umask 077; mkdir -p secrets data                   # rien de lisible par un autre compte
- openssl rand -base64 32 > secrets/master_key       # chiffre les identifiants en base
- openssl rand -base64 18 > secrets/admin_password)  # mot de passe du premier compte admin
+ [ -s secrets/master_key ] ||                       # jamais régénérée : la base en dépend
+   openssl rand -base64 32 > secrets/master_key     # chiffre les identifiants en base
+ [ -s secrets/admin_password ] ||
+   openssl rand -base64 18 > secrets/admin_password) # mot de passe du premier compte admin
 chmod 700 secrets data                              # aussi si les dossiers existaient déjà
 chmod 400 secrets/* && cat secrets/admin_password        # à noter : il sert à la première connexion
 sudo chown 10001:10001 data secrets/*               # le conteneur tourne sous l'UID 10001
 ```
+
+Sur une installation existante, ces commandes gardent les secrets en place : une nouvelle clé ne déchiffrerait
+plus les identifiants enregistrés, et `admin_password` ne sert qu'au premier démarrage (base sans admin), le
+modifier ensuite ne change rien au compte. Mot de passe admin perdu : un autre admin le remet dans **Admin**.
+Sinon, conteneur arrêté, retire les droits admin en base sous l'UID du conteneur
+(`sudo -u '#10001' sqlite3 data/portique.db 'UPDATE users SET is_admin = 0'`), remplace
+`secrets/admin_password` (avec `sudo`) et redémarre : le compte `admin` reçoit ce mot de passe et redevient
+admin ; rends ensuite leurs droits aux autres comptes dans **Admin**.
 
 L'UID 10001 ne doit être celui d'aucun compte de l'hôte : ce compte lirait la clé et la base. S'il est pris,
 isole le conteneur avec `userns-remap`.

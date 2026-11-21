@@ -81,5 +81,17 @@ INSERT INTO connections_new (id, name, host, port, username, domain, password, w
 DROP TABLE connections;
 ALTER TABLE connections_new RENAME TO connections;
 
+-- Les identifiants supprimés avant cette migration ne laissent aucune trace : la copie ne connaît que le plus
+-- grand restant, et une page ou un favori d'avant la mise à niveau peut encore citer un identifiant supérieur.
+-- Un identifiant attribué sans AUTOINCREMENT ne dépasse pas le nombre de lignes jamais créées : sur une
+-- installation existante (au moins un compte), les suivants partent 10 000 plus haut. Installation neuve
+-- (tables vides ici) : rien à éviter, on part de 1.
+DELETE FROM sqlite_sequence WHERE name IN ('users', 'connections');
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT name, top + 10000
+    FROM (SELECT 'users' AS name, (SELECT coalesce(max(id), 0) FROM users) AS top
+          UNION ALL SELECT 'connections', (SELECT coalesce(max(id), 0) FROM connections))
+    WHERE EXISTS (SELECT 1 FROM users);
+
 COMMIT;
 PRAGMA foreign_keys = ON;

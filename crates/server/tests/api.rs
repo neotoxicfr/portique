@@ -396,10 +396,10 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let gw_id = gw.body["id"].as_i64().unwrap();
 
     let pc = post(json!({"name": "PC", "host": "192.0.2.50", "username": "alice",
-        "ssh": {"user": "alice", "port": 2201, "jump_id": gw_id, "theme": "alerte"}}))
+        "ssh": {"user": "alice", "port": 2201, "jump": {"kind": "known", "id": gw_id}, "theme": "alerte"}}))
     .await;
     assert_eq!(pc.status, StatusCode::CREATED, "{:?}", pc.body);
-    assert_eq!(pc.body["ssh"]["jump_id"], gw_id);
+    assert_eq!(pc.body["ssh"]["jump"], json!({"kind": "known", "id": gw_id}));
     let pc_id = pc.body["id"].as_i64().unwrap();
 
     // Boucle : la passerelle ne peut pas passer par le PC qui passe par elle.
@@ -409,17 +409,18 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
         &format!("/api/admin/connections/{gw_id}"),
         Some(&admin),
         Some(json!({"name": "Passerelle", "host": "10.0.0.2", "rdp": false,
-            "ssh": {"user": "root", "jump_id": pc_id}})),
+            "ssh": {"user": "root", "jump": {"kind": "known", "id": pc_id}}})),
         &[],
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
     // Rebond qui n'est pas un hôte SSH, thème inconnu : refusés.
     let rdp_only = post(json!({"name": "RDP seul", "host": "10.0.0.3"})).await.body["id"].as_i64().unwrap();
-    let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "jump_id": rdp_only}})).await;
+    let to_rdp_only = json!({"kind": "known", "id": rdp_only});
+    let r = post(json!({"name": "X", "host": "10.0.0.4", "ssh": {"user": "a", "jump": to_rdp_only}})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     let r = post(
-        json!({"name": "X", "host": "10.0.0.4", "rdp": false, "ssh": {"user": "a", "jump_id": rdp_only}}),
+        json!({"name": "X", "host": "10.0.0.4", "rdp": false, "ssh": {"user": "a", "jump": to_rdp_only}}),
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -431,7 +432,7 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
         "PUT",
         &format!("/api/admin/connections/{rdp_only}"),
         Some(&admin),
-        Some(json!({"name": "Renommé", "host": "10.0.0.3", "ssh": {"user": "a", "jump_id": rdp_only}})),
+        Some(json!({"name": "Renommé", "host": "10.0.0.3", "ssh": {"user": "a", "jump": to_rdp_only}})),
         &[],
     )
     .await;
@@ -447,8 +448,8 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     // Réveil par un hôte SSH déclaré : un autre hôte, qui a le SSH.
     let wol = |via: i64| {
         json!({"name": "PC", "host": "192.0.2.50", "username": "alice", "wol_mac": "00:11:22:33:44:55",
-        "ssh": {"user": "alice", "port": 2201, "jump_id": gw_id},
-        "wol_command": {"via_id": via, "command": "wakeonlan {mac}"}})
+        "ssh": {"user": "alice", "port": 2201, "jump": {"kind": "known", "id": gw_id}},
+        "wol_command": {"via": {"kind": "known", "id": via}, "command": "wakeonlan {mac}"}})
     };
     for bad in [pc_id, rdp_only] {
         let r =
@@ -460,8 +461,7 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
         call(&app, "PUT", &format!("/api/admin/connections/{pc_id}"), Some(&admin), Some(wol(gw_id)), &[])
             .await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert_eq!(r.body["wol_command"]["via_id"], gw_id);
-    assert_eq!(r.body["wol_command"]["host"], "");
+    assert_eq!(r.body["wol_command"]["via"], json!({"kind": "known", "id": gw_id}));
     // SSH coupé ensuite sur l'hôte de réveil : le réveil est refusé, pas tenté avec ses identifiants.
     let r = call(
         &app,
@@ -476,12 +476,16 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.body["error"].as_str().unwrap().contains("n'a pas de SSH"), "{:?}", r.body);
-    // Hôte de réveil supprimé (wol_via_id remis à NULL) : pas de repli silencieux sur le paquet UDP.
+    // Hôte de réveil et rebond supprimés : le PC passe par des copies saisies, mot de passe compris.
     let r = call(&app, "DELETE", &format!("/api/admin/connections/{gw_id}"), Some(&admin), None, &[]).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
-    let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
-    assert!(r.body["error"].as_str().unwrap().contains("sans hôte de réveil"), "{:?}", r.body);
+    let all = call(&app, "GET", "/api/admin/connections", Some(&admin), None, &[]).await.body;
+    let pc = all.as_array().unwrap().iter().find(|c| c["id"] == pc_id).unwrap();
+    for hop in [&pc["wol_command"]["via"], &pc["ssh"]["jump"]] {
+        assert_eq!(hop["kind"], "host", "{pc:?}");
+        assert_eq!((hop["host"].as_str(), hop["user"].as_str()), (Some("10.0.0.2"), Some("root")));
+        assert_eq!(hop["has_password"], true);
+    }
 
     // Clé du service : créée une fois, stable ensuite.
     let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;

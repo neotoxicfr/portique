@@ -1,6 +1,7 @@
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 use portique_proto::{
-    ConnectionAdmin, ConnectionInput, ServiceKey, SshInput, TERMINAL_THEMES, UserAdmin, UserInput,
+    ConnectionAdmin, ConnectionInput, HopAdmin, HopInput, ServiceKey, SshInput, TERMINAL_THEMES, UserAdmin,
+    UserInput,
 };
 use wasm_bindgen::JsCast;
 
@@ -300,23 +301,16 @@ struct Form {
     forget_cert: RwSignal<bool>,
     /// Mode de réveil : direct (UDP) ou par commande SSH.
     wol_by_command: RwSignal<bool>,
-    cmd_host: RwSignal<String>,
-    cmd_user: RwSignal<String>,
-    cmd_password: RwSignal<String>,
     cmd_command: RwSignal<String>,
-    cmd_has_password: RwSignal<bool>,
-    cmd_hostkey: RwSignal<Option<String>>,
-    cmd_pending: RwSignal<Option<String>>,
-    cmd_approve: RwSignal<bool>,
-    /// Hôte SSH déclaré par lequel passe la commande ; vide = adresse saisie.
-    cmd_via: RwSignal<String>,
+    /// Rebond du réveil par commande.
+    cmd_hop: Hop,
     ssh: RwSignal<bool>,
     ssh_port: RwSignal<String>,
     ssh_user: RwSignal<String>,
     ssh_password: RwSignal<String>,
     ssh_has_password: RwSignal<bool>,
-    /// Identifiant de l'hôte de rebond ; vide = connexion directe.
-    ssh_jump: RwSignal<String>,
+    /// Rebond du terminal.
+    ssh_hop: Hop,
     /// Thème propre à l'hôte ; vide = thème du compte.
     ssh_theme: RwSignal<String>,
     ssh_hostkey: RwSignal<Option<String>>,
@@ -351,22 +345,15 @@ impl Form {
         let w = c.and_then(|c| c.wol_command.as_ref());
         self.wol.set(c.is_some_and(|c| c.wol_mac.is_some()) || w.is_some());
         self.wol_by_command.set(w.is_some());
-        self.cmd_host.set(s(w.map(|w| w.host.as_str())));
-        self.cmd_user.set(s(w.map(|w| w.user.as_str())));
         self.cmd_command.set(w.map(|w| w.command.clone()).unwrap_or_default());
-        self.cmd_password.set(String::new());
-        self.cmd_has_password.set(w.is_some_and(|w| w.has_password));
-        self.cmd_hostkey.set(w.and_then(|w| w.hostkey.clone()));
-        self.cmd_pending.set(w.and_then(|w| w.pending_hostkey.clone()));
-        self.cmd_approve.set(false);
-        self.cmd_via.set(w.and_then(|w| w.via_id).map(|v| v.to_string()).unwrap_or_default());
+        self.cmd_hop.fill(w.map(|w| &w.via), "host");
         let h = c.and_then(|c| c.ssh.as_ref());
         self.ssh.set(h.is_some());
         self.ssh_port.set(h.map(|h| h.port.to_string()).unwrap_or_default());
         self.ssh_user.set(s(h.map(|h| h.user.as_str())));
         self.ssh_password.set(String::new());
         self.ssh_has_password.set(h.is_some_and(|h| h.has_password));
-        self.ssh_jump.set(h.and_then(|h| h.jump_id).map(|j| j.to_string()).unwrap_or_default());
+        self.ssh_hop.fill(h.and_then(|h| h.jump.as_ref()), "");
         self.ssh_theme.set(s(h.and_then(|h| h.theme.as_deref())));
         self.ssh_hostkey.set(h.and_then(|h| h.hostkey.clone()));
         self.ssh_forget.set(false);
@@ -399,26 +386,194 @@ impl Form {
             allowed_users: self.allowed.get_untracked(),
             forget_certificate: self.forget_cert.get_untracked(),
             wol_command: by_command.then(|| portique_proto::WolCommandInput {
-                via_id: self.cmd_via.get_untracked().parse().ok(),
-                host: self.cmd_host.get_untracked(),
-                user: self.cmd_user.get_untracked(),
+                // Sans choix (liste vidée par la suppression de l'hôte), le serveur reçoit un Hôte vide et le refuse.
+                via: self.cmd_hop.input().unwrap_or_else(|| self.cmd_hop.host_input()),
                 command: self.cmd_command.get_untracked(),
-                password: Some(self.cmd_password.get_untracked()).filter(|p| !p.is_empty()),
-                approve_hostkey: self
-                    .cmd_approve
-                    .get_untracked()
-                    .then(|| self.cmd_pending.get_untracked())
-                    .flatten(),
             }),
             ssh: self.ssh.get_untracked().then(|| SshInput {
                 port: self.ssh_port.get_untracked().trim().parse().ok(),
                 user: self.ssh_user.get_untracked(),
                 password: opt(self.ssh_password),
-                jump_id: self.ssh_jump.get_untracked().parse().ok(),
+                jump: self.ssh_hop.input(),
                 theme: opt(self.ssh_theme),
                 forget_hostkey: self.ssh_forget.get_untracked(),
             }),
         }
+    }
+}
+
+/// Rebond (réveil ou terminal) : `sel` vaut « » (aucun), « host » (hôte saisi) ou l'identifiant d'un hôte connu.
+#[derive(Clone, Copy, Default)]
+struct Hop {
+    sel: RwSignal<String>,
+    host: RwSignal<String>,
+    port: RwSignal<String>,
+    user: RwSignal<String>,
+    password: RwSignal<String>,
+    has_password: RwSignal<bool>,
+    /// Hôte connu par lequel passe l'hôte saisi ; vide = aucun.
+    via: RwSignal<String>,
+    hostkey: RwSignal<Option<String>>,
+    pending: RwSignal<Option<String>>,
+    approve: RwSignal<bool>,
+    forget: RwSignal<bool>,
+}
+
+impl Hop {
+    /// `none` : sélection quand il n'y a pas de rebond enregistré.
+    fn fill(&self, hop: Option<&HopAdmin>, none: &str) {
+        let (mut host, mut port, mut user, mut has, mut via) =
+            (String::new(), String::new(), String::new(), false, String::new());
+        let (mut key, mut pending) = (None, None);
+        let sel = match hop {
+            None => none.to_owned(),
+            Some(HopAdmin::Known { id }) => id.to_string(),
+            Some(HopAdmin::Host {
+                host: h,
+                port: p,
+                user: u,
+                has_password,
+                via_id,
+                hostkey,
+                pending_hostkey,
+            }) => {
+                (host, port, user, has) = (h.clone(), p.to_string(), u.clone(), *has_password);
+                via = via_id.map(|v| v.to_string()).unwrap_or_default();
+                (key, pending) = (hostkey.clone(), pending_hostkey.clone());
+                "host".to_owned()
+            }
+        };
+        self.sel.set(sel);
+        self.host.set(host);
+        self.port.set(port);
+        self.user.set(user);
+        self.password.set(String::new());
+        self.has_password.set(has);
+        self.via.set(via);
+        self.hostkey.set(key);
+        self.pending.set(pending);
+        self.approve.set(false);
+        self.forget.set(false);
+    }
+
+    /// Hôte saisi tel que dans les champs.
+    fn host_input(&self) -> HopInput {
+        HopInput::Host {
+            host: self.host.get_untracked(),
+            port: self.port.get_untracked().trim().parse().ok(),
+            user: self.user.get_untracked(),
+            password: Some(self.password.get_untracked()).filter(|p| !p.is_empty()),
+            via_id: self.via.get_untracked().parse().ok(),
+            approve_hostkey: self.approve.get_untracked().then(|| self.pending.get_untracked()).flatten(),
+            forget_hostkey: self.forget.get_untracked(),
+        }
+    }
+
+    /// `None` = pas de rebond.
+    fn input(&self) -> Option<HopInput> {
+        match self.sel.get_untracked().as_str() {
+            "" => None,
+            "host" => Some(self.host_input()),
+            id => id.parse().ok().map(|id| HopInput::Known { id }),
+        }
+    }
+
+    /// Hôte connu supprimé : la sélection retombe sur `none`. Le « par » de l'hôte saisi, lui, reste : il peut
+    /// désigner la copie cachée laissée par une suppression (absente de la liste), que le serveur garde si elle
+    /// revient inchangée ; la vider couperait la chaîne.
+    fn forget_missing(&self, ids: &[String], none: &str) {
+        if self.sel.with(|v| v != "host" && !v.is_empty() && !ids.contains(v)) {
+            self.sel.set(none.to_owned());
+        }
+    }
+}
+
+/// Hôtes SSH proposables comme rebond (jamais la machine elle-même).
+fn ssh_hosts(conns: RwSignal<Vec<ConnectionAdmin>>, editing: RwSignal<Option<i64>>) -> Vec<ConnectionAdmin> {
+    conns.get().into_iter().filter(|c| c.ssh.is_some() && Some(c.id) != editing.get()).collect()
+}
+
+/// Rebond qui existe encore mais sans SSH : le serveur le garde. Il reste choisi et signalé, au lieu de passer en
+/// silence à « aucun » ; le serveur refuse l'enregistrement tant qu'un autre choix n'est pas fait.
+fn unavailable(conns: RwSignal<Vec<ConnectionAdmin>>, sel: RwSignal<String>) -> Option<(String, String)> {
+    let v = sel.get();
+    conns.with(|l| {
+        l.iter().find(|c| c.ssh.is_none() && c.id.to_string() == v).map(|c| (v.clone(), c.name.clone()))
+    })
+}
+
+/// Un menu d'hôtes connus (avec « Aucun » en tête si `none`), partagé par « Rebond » et « Par ».
+fn known_options(
+    conns: RwSignal<Vec<ConnectionAdmin>>,
+    editing: RwSignal<Option<i64>>,
+    sel: RwSignal<String>,
+) -> impl IntoView {
+    view! {
+        {move || unavailable(conns, sel).map(|(v, name)| view! {
+            <option value=v disabled prop:selected=true>{format!("{name} (SSH désactivé)")}</option>
+        })}
+        // Options recréées à chaque rechargement : chacune reprend sa sélection, sinon le navigateur retombe sur
+        // la première sans que la valeur change.
+        {move || ssh_hosts(conns, editing).into_iter()
+            .map(|c| {
+                let v = c.id.to_string();
+                view! { <option value=v.clone() prop:selected=move || sel.with(|j| *j == v)>{c.name}</option> }
+            })
+            .collect_view()}
+    }
+}
+
+/// Rebond : « Hôte » (saisi) ou hôte connu ; les champs de l'hôte ne s'affichent que pour « Hôte ».
+#[component]
+fn HopFields(
+    hop: Hop,
+    conns: RwSignal<Vec<ConnectionAdmin>>,
+    editing: RwSignal<Option<i64>>,
+    /// Propose « Aucun » (terminal) ; le réveil, lui, exige un rebond.
+    none: bool,
+) -> impl IntoView {
+    view! {
+        <label class="line"><span class="line-label">"Rebond"</span>
+            <select prop:value=move || hop.sel.get() on:change=input(hop.sel)>
+                {none.then(|| view! { <option value="" prop:selected=move || hop.sel.with(String::is_empty)>"Aucun"</option> })}
+                <option value="host" prop:selected=move || hop.sel.with(|s| s == "host")>"Hôte"</option>
+                {known_options(conns, editing, hop.sel)}
+            </select></label>
+        <Show when=move || hop.sel.with(|s| s == "host")>
+            <label class="line"><span class="line-label">"Adresse"</span>
+                <input type="text" class="mono" placeholder="192.0.2.254" prop:value=move || hop.host.get() on:input=input(hop.host)/></label>
+            <label class="line"><span class="line-label">"Port"</span>
+                <input type="number" min="1" max="65535" placeholder="22" prop:value=move || hop.port.get() on:input=input(hop.port)/></label>
+            <label class="line"><span class="line-label">"Utilisateur"</span>
+                <input type="text" autocomplete="off" prop:value=move || hop.user.get() on:input=input(hop.user)/></label>
+            <label class="line"><span class="line-label">"Mot de passe"</span>
+                <input type="password" autocomplete="new-password"
+                    placeholder=move || if hop.has_password.get() { "inchangé" } else { "facultatif : clé du service" }
+                    prop:value=move || hop.password.get() on:input=input(hop.password)/></label>
+            <label class="line"><span class="line-label">"Par"</span>
+                <select prop:value=move || hop.via.get() on:change=input(hop.via)>
+                    <option value="" prop:selected=move || hop.via.with(String::is_empty)>"Aucun"</option>
+                    {move || {
+                        let v = hop.via.get();
+                        let listed = conns.with(|l| l.iter().any(|c| c.id.to_string() == v));
+                        (!v.is_empty() && !listed).then(|| view! {
+                            <option value=v disabled prop:selected=true>"rebond conservé"</option>
+                        })
+                    }}
+                    {known_options(conns, editing, hop.via)}
+                </select></label>
+            {move || hop.hostkey.get().map(|k| view! {
+                <div class="line col"><span>"Clé approuvée"</span><span class="val">{k}</span></div>
+                <label class="line"><span class="line-label grow">"Oublier la clé (hôte réinstallé : à réapprouver)"</span>{switch(hop.forget)}</label>
+            })}
+            {move || hop.pending.get().map(|k| view! {
+                <div class="line col">
+                    <span>"Clé présentée par l'hôte, à comparer avec la sienne"</span>
+                    <span class="val">{k}</span>
+                </div>
+                <label class="line"><span class="line-label grow">"Elle est identique : approuver"</span>{switch(hop.approve)}</label>
+            })}
+        </Show>
     }
 }
 
@@ -620,32 +775,12 @@ fn Editor(
     };
 
     let non_admins = move || users.get().into_iter().filter(|u| !u.is_admin).collect::<Vec<_>>();
-    // Hôtes SSH proposables comme rebond ou comme relais de réveil (jamais la machine elle-même).
-    let ssh_hosts = move || {
-        conns
-            .get()
-            .into_iter()
-            .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
-            .collect::<Vec<_>>()
-    };
-    // Rebond ou relais supprimé : le serveur l'a déjà oublié (ON DELETE SET NULL), le sélecteur aussi.
+    // Rebond supprimé : le serveur l'a déjà converti ou oublié, la liste aussi.
     Effect::new(move || {
         let ids: Vec<String> = conns.with(|l| l.iter().map(|c| c.id.to_string()).collect());
-        for sel in [f.ssh_jump, f.cmd_via] {
-            if sel.with(|v| !v.is_empty() && !ids.contains(v)) {
-                sel.set(String::new());
-            }
-        }
+        f.ssh_hop.forget_missing(&ids, "");
+        f.cmd_hop.forget_missing(&ids, "host");
     });
-    // Rebond ou relais qui existe encore mais sans SSH : le serveur le garde. Il reste choisi et signalé, au
-    // lieu de passer en silence à « direct » ; le serveur refuse l'enregistrement tant qu'un autre choix n'est pas
-    // fait (« direct » compris).
-    let unavailable = move |sel: RwSignal<String>| {
-        let v = sel.get();
-        conns.with(|l| {
-            l.iter().find(|c| c.ssh.is_none() && c.id.to_string() == v).map(|c| (v.clone(), c.name.clone()))
-        })
-    };
 
     view! {
         <Show when=move || open.get()>
@@ -680,21 +815,7 @@ fn Editor(
                                 <input type="password" autocomplete="new-password"
                                     placeholder=move || if f.ssh_has_password.get() { "inchangé" } else { "facultatif : clé du service" }
                                     prop:value=move || f.ssh_password.get() on:input=input(f.ssh_password)/></label>
-                            <label class="line"><span class="line-label">"Rebond"</span>
-                                <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
-                                    <option value="">"direct"</option>
-                                    {move || unavailable(f.ssh_jump).map(|(v, name)| view! {
-                                        <option value=v disabled prop:selected=true>{format!("par {name} (SSH désactivé)")}</option>
-                                    })}
-                                    // Options recréées à chaque rechargement : chacune reprend sa sélection, sinon le
-                                    // navigateur retombe sur « direct » sans que la valeur change.
-                                    {move || ssh_hosts().into_iter()
-                                        .map(|c| {
-                                            let v = c.id.to_string();
-                                            view! { <option value=v.clone() prop:selected=move || f.ssh_jump.with(|j| *j == v)>{format!("par {}", c.name)}</option> }
-                                        })
-                                        .collect_view()}
-                                </select></label>
+                            <HopFields hop=f.ssh_hop conns editing=f.editing none=true/>
                             <label class="line"><span class="line-label">"Thème"</span>
                                 <select prop:value=move || f.ssh_theme.get() on:change=input(f.ssh_theme)>
                                     <option value="">"celui du compte"</option>
@@ -737,11 +858,9 @@ fn Editor(
                             <div class="line wake-mode"><span class="line-label grow">"Mode"</span>
                                 <div class="seg" role="group" aria-label="Mode de réveil">
                                     <button type="button" aria-pressed=move || (!f.wol_by_command.get()).to_string()
-                                        title="Paquet magique UDP : même réseau, ou broadcast dirigé"
-                                        on:click=move |_| f.wol_by_command.set(false)>"UDP direct"</button>
+                                        on:click=move |_| f.wol_by_command.set(false)>"Direct"</button>
                                     <button type="button" aria-pressed=move || f.wol_by_command.get().to_string()
-                                        title="Commande SSH sur un hôte du réseau du PC : indispensable à travers un VPN"
-                                        on:click=move |_| f.wol_by_command.set(true)>"Commande SSH"</button>
+                                        on:click=move |_| f.wol_by_command.set(true)>"Rebond"</button>
                                 </div></div>
                             <Show
                                 when=move || f.wol_by_command.get()
@@ -750,41 +869,9 @@ fn Editor(
                                         <input type="text" class="mono" placeholder="255.255.255.255:9" prop:value=move || f.wol_target.get() on:input=input(f.wol_target)/></label>
                                 }
                             >
-                                <label class="line"><span class="line-label">"Passer par"</span>
-                                    <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
-                                        <option value="">"une adresse saisie ci-dessous"</option>
-                                        {move || unavailable(f.cmd_via).map(|(v, name)| view! {
-                                            <option value=v disabled prop:selected=true>{format!("l'hôte « {name} » (SSH désactivé)")}</option>
-                                        })}
-                                        {move || ssh_hosts().into_iter()
-                                            .map(|c| {
-                                                let v = c.id.to_string();
-                                                view! { <option value=v.clone() prop:selected=move || f.cmd_via.with(|j| *j == v)>{format!("l'hôte SSH « {} »", c.name)}</option> }
-                                            })
-                                            .collect_view()}
-                                    </select></label>
-                                <Show when=move || f.cmd_via.get().is_empty()>
-                                    <label class="line"><span class="line-label">"Hôte SSH"</span>
-                                        <input type="text" class="mono" placeholder="192.0.2.254" prop:value=move || f.cmd_host.get() on:input=input(f.cmd_host)/></label>
-                                    <label class="line"><span class="line-label">"Utilisateur"</span>
-                                        <input type="text" autocomplete="off" prop:value=move || f.cmd_user.get() on:input=input(f.cmd_user)/></label>
-                                    <label class="line"><span class="line-label">"Mot de passe"</span>
-                                        <input type="password" autocomplete="new-password"
-                                            placeholder=move || if f.cmd_has_password.get() { "inchangé" } else { "facultatif : clé du service" }
-                                            prop:value=move || f.cmd_password.get() on:input=input(f.cmd_password)/></label>
-                                </Show>
+                                <HopFields hop=f.cmd_hop conns editing=f.editing none=false/>
                                 <label class="line col"><span>"Commande ({mac} est remplacé)"</span>
                                     <input type="text" class="mono" prop:value=move || f.cmd_command.get() on:input=input(f.cmd_command)/></label>
-                                {move || f.cmd_hostkey.get().map(|k| view! {
-                                    <div class="line col"><span>"Clé SSH approuvée"</span><span class="val">{k}</span></div>
-                                })}
-                                {move || f.cmd_pending.get().map(|k| view! {
-                                    <div class="line col">
-                                        <span>"Clé présentée par l'hôte, à comparer avec la sienne"</span>
-                                        <span class="val">{k}</span>
-                                    </div>
-                                    <label class="line"><span class="line-label grow">"Elle est identique : approuver"</span>{switch(f.cmd_approve)}</label>
-                                })}
                             </Show>
                         </Show>
                     </div>
@@ -958,11 +1045,11 @@ fn ServiceKeyPanel() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use leptos::prelude::Set;
+    use leptos::prelude::{GetUntracked, Set};
 
-    use portique_proto::{ConnectionAdmin, UserInput};
+    use portique_proto::{ConnectionAdmin, HopAdmin, HopInput, UserInput, WolCommandAdmin};
 
-    use super::{Form, restriction, sent_draft};
+    use super::{Form, Hop, restriction, sent_draft};
 
     #[test]
     fn only_the_sent_draft_is_cleared() {
@@ -1030,6 +1117,130 @@ mod tests {
         let i = f.input();
         assert_eq!((i.port, i.domain.len()), (Some(0), 256));
         assert_eq!(i.password.as_deref(), Some("brouillon"));
+    }
+
+    fn host_hop() -> HopAdmin {
+        HopAdmin::Host {
+            host: "192.0.2.254".into(),
+            port: 2222,
+            user: "relais".into(),
+            has_password: true,
+            via_id: Some(4),
+            hostkey: Some("SHA256:abc".into()),
+            pending_hostkey: Some("SHA256:def".into()),
+        }
+    }
+
+    #[test]
+    fn hop_input_follows_the_selection() {
+        let h = Hop::default();
+        h.fill(None, "");
+        assert_eq!(h.input(), None);
+        h.sel.set("host".into());
+        h.host.set("192.0.2.9".into());
+        h.user.set("root".into());
+        h.password.set("secret".into());
+        h.via.set("3".into());
+        h.pending.set(Some("SHA256:def".into()));
+        let expected = |port, approve| HopInput::Host {
+            host: "192.0.2.9".into(),
+            port,
+            user: "root".into(),
+            password: Some("secret".into()),
+            via_id: Some(3),
+            approve_hostkey: approve,
+            forget_hostkey: false,
+        };
+        assert_eq!(h.input(), Some(expected(None, None)));
+        h.port.set("2222".into());
+        h.approve.set(true);
+        assert_eq!(h.input(), Some(expected(Some(2222), Some("SHA256:def".into()))));
+        h.forget.set(true);
+        assert!(matches!(h.input(), Some(HopInput::Host { forget_hostkey: true, .. })));
+        h.forget.set(false);
+        // Hôte connu : les champs saisis ne partent pas.
+        h.sel.set("7".into());
+        assert_eq!(h.input(), Some(HopInput::Known { id: 7 }));
+    }
+
+    #[test]
+    fn hop_fill_reads_known_and_host() {
+        let h = Hop::default();
+        h.fill(Some(&host_hop()), "");
+        assert_eq!(h.sel.get_untracked(), "host");
+        assert_eq!(h.port.get_untracked(), "2222");
+        assert_eq!(h.via.get_untracked(), "4");
+        assert!(h.has_password.get_untracked());
+        assert_eq!(h.pending.get_untracked().as_deref(), Some("SHA256:def"));
+        assert!(!h.approve.get_untracked());
+        // Mot de passe jamais relu : champ vide, donc « inchangé » côté serveur.
+        assert_eq!(
+            h.input(),
+            Some(HopInput::Host {
+                host: "192.0.2.254".into(),
+                port: Some(2222),
+                user: "relais".into(),
+                password: None,
+                via_id: Some(4),
+                approve_hostkey: None,
+                forget_hostkey: false,
+            })
+        );
+        h.fill(Some(&HopAdmin::Known { id: 5 }), "");
+        assert_eq!(h.input(), Some(HopInput::Known { id: 5 }));
+        assert_eq!(h.host.get_untracked(), "");
+        h.fill(None, "host");
+        assert_eq!(h.sel.get_untracked(), "host");
+    }
+
+    #[test]
+    fn hidden_via_survives_a_list_reload() {
+        // « Par » vers la copie cachée d'un hôte supprimé : absente de la liste, mais renvoyée telle quelle.
+        let h = Hop::default();
+        h.fill(Some(&host_hop()), "");
+        h.forget_missing(&["9".to_owned()], "");
+        assert_eq!(h.via.get_untracked(), "4");
+        assert_eq!(h.sel.get_untracked(), "host");
+        // Hôte connu choisi puis supprimé : la sélection retombe sur `none`.
+        h.sel.set("7".into());
+        h.forget_missing(&["9".to_owned()], "");
+        assert_eq!(h.sel.get_untracked(), "");
+    }
+
+    #[test]
+    fn form_sends_the_wol_and_ssh_hops() {
+        let mut c = ConnectionAdmin {
+            id: 7,
+            name: "Bureau".into(),
+            host: "192.0.2.11".into(),
+            rdp: false,
+            port: 3389,
+            username: String::new(),
+            domain: String::new(),
+            has_password: false,
+            wol_mac: Some("00:11:22:33:44:55".into()),
+            wol_target: None,
+            allowed_users: vec![],
+            cert_fingerprint: None,
+            wol_command: Some(WolCommandAdmin { via: host_hop(), command: "wakeonlan {mac}".into() }),
+            ssh: None,
+        };
+        let f = Form::default();
+        f.fill(Some(&c));
+        assert!(f.wol_by_command.get_untracked());
+        assert_eq!(f.cmd_hop.host.get_untracked(), "192.0.2.254");
+        let i = f.input();
+        let w = i.wol_command.unwrap();
+        assert!(matches!(w.via, HopInput::Host { port: Some(2222), via_id: Some(4), .. }));
+        assert_eq!(w.command, "wakeonlan {mac}");
+        c.wol_command = Some(WolCommandAdmin { via: HopAdmin::Known { id: 2 }, command: "x".into() });
+        f.fill(Some(&c));
+        assert_eq!(f.input().wol_command.unwrap().via, HopInput::Known { id: 2 });
+        // Nouvelle machine : rebond du réveil sur « Hôte », celui du terminal sur « Aucun ».
+        f.fill(None);
+        assert_eq!(f.cmd_hop.sel.get_untracked(), "host");
+        f.ssh.set(true);
+        assert!(f.input().ssh.unwrap().jump.is_none());
     }
 
     #[test]

@@ -221,7 +221,8 @@ fn Shell(children: Children) -> impl IntoView {
         logout_error.set(None);
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            let result = api::send_empty::<()>("POST", "/api/auth/logout", None).await;
+            // Bornée : une requête sans réponse ne doit pas bloquer le bouton pour toujours.
+            let result = within(15_000, api::send_empty::<()>("POST", "/api/auth/logout", None)).await;
             // Libéré quelle que soit l'issue : un échec doit pouvoir être retenté.
             session.logging_out.set(false);
             // Session déjà terminée (reconnexion entre-temps) : réponse périmée, ignorée.
@@ -229,8 +230,9 @@ fn Shell(children: Children) -> impl IntoView {
                 return;
             }
             match result {
-                Ok(()) | Err(api::Error::Unauthorized) => session.me.set(None),
-                Err(e) => logout_error.set(Some(e.to_string())),
+                Some(Ok(()) | Err(api::Error::Unauthorized)) => session.me.set(None),
+                Some(Err(e)) => logout_error.set(Some(e.to_string())),
+                None => logout_error.set(Some("le serveur ne répond pas, réessaie".into())),
             }
         });
     };

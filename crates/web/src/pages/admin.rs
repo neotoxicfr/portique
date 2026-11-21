@@ -471,7 +471,30 @@ fn Editor(
                     f.fill(Some(c));
                 }
             }
-            if let Some(id) = target {
+            // Échec (réponse perdue comprise) alors que la machine a été rouverte : le serveur a pu écrire et le
+            // formulaire montre l'ancien instantané. Il reste figé jusqu'à une relecture de l'état serveur.
+            let mut keep_lock = false;
+            if let (Err(_), Some(id)) = (&r, target)
+                && !same
+                && f.editing.try_get_untracked() == Some(Some(id))
+            {
+                match api::get::<Vec<ConnectionAdmin>>("/api/admin/connections").await {
+                    Ok(list) => {
+                        if let Some(c) = list.iter().find(|c| c.id == id)
+                            && f.editing.try_get_untracked() == Some(Some(id))
+                        {
+                            f.fill(Some(c));
+                        }
+                    }
+                    Err(e) => {
+                        keep_lock = true;
+                        f.err.set(Some(format!("état de la machine à relire (recharge la page) : {e}")));
+                    }
+                }
+            }
+            if let Some(id) = target
+                && !keep_lock
+            {
                 writes.update(|w| w.retain(|x| *x != id));
             }
             match r {

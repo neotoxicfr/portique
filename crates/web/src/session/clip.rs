@@ -225,6 +225,12 @@ impl Announces {
         Mark { remote_copies: self.remote_copies, seq: self.started }
     }
 
+    /// Lecture commencée à `mark` encore valable : ni copie sur le PC, ni lecture plus récente conclue
+    /// depuis son départ.
+    pub fn is_current(&self, mark: Mark) -> bool {
+        self.remote_copies == mark.remote_copies && self.published_seq <= mark.seq
+    }
+
     /// Lecture locale commencée à `mark`, d'empreinte `fp` ; `common` : empreinte commune.
     /// `Publish` compte la publication : une lecture concurrente plus ancienne sera écartée.
     pub fn after_read(&mut self, mark: Mark, fp: u64, common: Option<u64>, now: f64) -> AfterRead {
@@ -669,6 +675,12 @@ mod tests {
         let mb = a.mark();
         assert_eq!(a.after_read(mb, 9, common, 1100.0), AfterRead::Join);
         assert_eq!(a.after_read(ma, 10, common, 1200.0), AfterRead::Join, "A ne publie pas");
+        // Une lecture dépassée n'est plus « courante » (elle ne doit rien enregistrer) ; la récente l'est.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert!(a.is_current(ma) && a.is_current(mb));
+        let _ = a.after_read(mb, 11, common, 1300.0);
+        assert!(!a.is_current(ma), "dépassée par mb");
         // Copie sur le PC pendant la lecture : écartée.
         let m = a.mark();
         a.remote_changed();

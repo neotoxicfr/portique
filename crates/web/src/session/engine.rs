@@ -775,7 +775,10 @@ impl Engine {
             };
             if waiting {
                 web_sys::console::warn_1(&"multi-écran : disposition non confirmée par le PC".into());
-                e.disable_multi_views();
+                // Retour forcé à un écran côté PC aussi : s'il adopte l'extension après le délai, il ne
+                // garderait pas des écrans dont les fenêtres sont fermées.
+                let (w, h) = super::viewport();
+                e.disable_multi(w, h);
                 (e.on_single)("Extension non confirmée par le PC");
             }
         });
@@ -1315,7 +1318,11 @@ impl Engine {
             let now = js_sys::Date::now();
             let unwritten = i.clip_unwritten == Some(i.clip_write_gen);
             let common = clip::common_for_read(i.clip_last, unwritten, i.clip_local, fp);
-            i.clip_local = Some(fp);
+            // Seule une lecture retenue (ni dépassée, ni écartée par une copie du PC) dit ce que contient
+            // le presse-papier local maintenant.
+            if i.clip_announces.is_current(mark) {
+                i.clip_local = Some(fp);
+            }
             match i.clip_announces.after_read(mark, fp, common, now) {
                 clip::AfterRead::Done => return Some(true),
                 clip::AfterRead::Retry => return Some(false),

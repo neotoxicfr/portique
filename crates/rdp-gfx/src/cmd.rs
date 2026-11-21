@@ -692,6 +692,59 @@ mod tests {
     }
 
     #[test]
+    fn avc444_from_rgb_recomposed_then_refused_for_good() {
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+        );
+        g.process(&wrap(&[create])).unwrap();
+        let full = Rect { x: 0, y: 0, w: 16, h: 16 };
+        let pending = |g: &mut Gfx| {
+            g.pending_avc =
+                Some(PendingAvc { surface: 0, rects: vec![full], aux: Some((vec![full], false)) });
+        };
+        fn rgba(d: &[u8]) -> crate::Rgba<'_> {
+            crate::Rgba { width: 16, height: 16, data: d, stride: 64 }
+        }
+        // Gris neutre : recomposé.
+        let gray = [128u8, 128, 128, 255].repeat(256);
+        pending(&mut g);
+        g.submit_avc444_rgba(Some(&rgba(&gray)), Some(&rgba(&gray))).unwrap();
+        assert!(!g.waiting_for_avc() && g.rgb_444());
+        assert_eq!(&g.surfaces[&0].rgba[..4], &[128, 128, 128, 255]);
+        // Chroma qui varie à l'intérieur des blocs 2×2 : interpolée par le navigateur. Refusée sans
+        // consommer la commande, pour le repli sur la principale seule.
+        let mut smooth = Vec::new();
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                smooth.extend([8 + 16 * x, 100, 248 - 16 * y, 255]);
+            }
+        }
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&smooth)), Some(&rgba(&gray))).is_err());
+        assert!(g.waiting_for_avc() && !g.rgb_444());
+        g.submit_rgba(&rgba(&smooth)).unwrap();
+        assert!(!g.waiting_for_avc());
+        assert_eq!(&g.surfaces[&0].rgba[..4], &[8, 100, 248, 255]);
+        // Plus de recomposition pour la session, même sur une image inversible.
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&gray)), Some(&rgba(&gray))).is_err());
+        // Image tronquée : refusée avant tout.
+        let mut g = Gfx::new();
+        g.process(&wrap(&[pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+        )]))
+        .unwrap();
+        pending(&mut g);
+        assert!(g.submit_avc444_rgba(Some(&rgba(&gray[..100])), None).is_err());
+        assert!(g.waiting_for_avc() && g.rgb_444());
+        // Chroma seule sans luma connue : refusée.
+        assert!(g.submit_avc444_rgba(None, Some(&rgba(&gray))).is_err());
+    }
+
+    #[test]
     fn avc444_planes_counted_even_if_the_frame_is_refused() {
         let mut g = Gfx::new();
         let create = pdu(

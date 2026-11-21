@@ -122,6 +122,8 @@ pub fn set_sharp(on: bool) {
 pub enum Kind {
     Avc420,
     Avc444,
+    /// AVC444 rendu en RGB par le navigateur, 4:4:4 retrouvé en inversant sa conversion.
+    Avc444Rgb,
 }
 
 /// Nom court d'un format d'image du décodeur.
@@ -152,6 +154,7 @@ pub fn path_label(h264: bool, chosen: bool, kind: Option<Kind>, format: Option<&
         (Some(Kind::Avc444), true) => {
             "H.264 4:2:0 (image principale seule : le navigateur donne du RGB)".to_owned()
         }
+        (Some(Kind::Avc444Rgb), _) => "H.264 4:4:4 (recomposé depuis du RGB)".to_owned(),
         (Some(Kind::Avc420), _) => "H.264 4:2:0".to_owned(),
     };
     if let Some(f) = format {
@@ -465,6 +468,10 @@ mod tests {
         assert_eq!(
             path_label(true, false, Some(Kind::Avc444), Some("BGRA")),
             "H.264 4:2:0 (image principale seule : le navigateur donne du RGB) · BGRA"
+        );
+        assert_eq!(
+            path_label(true, false, Some(Kind::Avc444Rgb), Some("BGRA")),
+            "H.264 4:4:4 (recomposé depuis du RGB) · BGRA"
         );
         assert_eq!(path_label(true, false, Some(Kind::Avc420), Some("I420")), "H.264 4:2:0 · I420");
         assert_eq!(

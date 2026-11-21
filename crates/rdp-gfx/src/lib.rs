@@ -28,6 +28,25 @@ pub struct Rgba<'a> {
     pub stride: u32,
 }
 
+impl Rgba<'_> {
+    fn check(&self) -> Result<(), Error> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::Invalid("image H.264 vide"));
+        }
+        let need = (self.height as u64 - 1) * self.stride as u64 + self.width as u64 * 4;
+        if (self.stride as u64) < self.width as u64 * 4 || (self.data.len() as u64) < need {
+            return Err(Error::Truncated("image RGBA"));
+        }
+        Ok(())
+    }
+}
+
+/// Sous-image auxiliaire d'un AVC444 : plans YUV, ou RGB du navigateur à inverser.
+enum AuxIn<'a> {
+    Yuv(&'a Yuv420<'a>),
+    Rgba(&'a Rgba<'a>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Truncated(&'static str),
@@ -130,6 +149,9 @@ pub struct Gfx {
     surface_bytes: usize,
     cache_bytes: usize,
     queued_bytes: usize,
+    /// La conversion RGB du navigateur ne s'inverse pas (chroma interpolée, autre matrice) : plus
+    /// de recomposition 4:4:4 depuis ses images RGB.
+    rgb_refused: bool,
 }
 
 // Plafonds : les données viennent du réseau, aucune allocation ni boucle n'est laissée libre.
@@ -171,6 +193,7 @@ impl Gfx {
             surface_bytes: 0,
             cache_bytes: 0,
             queued_bytes: 0,
+            rgb_refused: false,
         }
     }
 
@@ -267,6 +290,49 @@ impl Gfx {
         main: Option<&Yuv420<'_>>,
         aux: Option<&Yuv420<'_>>,
     ) -> Result<Vec<Out>, Error> {
+        self.avc444(main, aux.map(AuxIn::Yuv))
+    }
+
+    /// Image AVC444 que le navigateur n'a rendue qu'en RGB : les plans YUV des deux sous-images
+    /// sont retrouvés en inversant sa conversion (BT.709 pleine plage, chroma répétée sur 2×2),
+    /// puis recombinés en 4:4:4. Refusée, l'image restant en attente (l'appelant se rabat sur
+    /// `submit_rgba`), si une image est illisible ou si la conversion du navigateur se révèle
+    /// autre : constaté une fois, plus de recomposition pour la session. Une sous-image
+    /// auxiliaire jugée incohérente est ignorée (la principale reste affichée seule).
+    pub fn submit_avc444_rgba(
+        &mut self,
+        main: Option<&Rgba<'_>>,
+        aux: Option<&Rgba<'_>>,
+    ) -> Result<Vec<Out>, Error> {
+        const REFUSED: Error = Error::Invalid("conversion RGB du navigateur non inversible");
+        if self.rgb_refused {
+            return Err(REFUSED);
+        }
+        for f in main.iter().chain(aux.iter()) {
+            f.check()?;
+        }
+        // Chroma seule : il faut la luma d'une image précédente.
+        let has_planes = |g: &Self| {
+            g.pending_avc.as_ref().and_then(|p| g.surfaces.get(&p.surface)).is_some_and(|s| s.p444.is_some())
+        };
+        if main.is_none() && !has_planes(self) {
+            return Err(Error::Invalid("chroma AVC444 sans luma"));
+        }
+        let rects = self.pending_avc.as_ref().map(|p| p.rects.clone()).unwrap_or_default();
+        let main = main.map(|f| avc444::FromRgb::new(f, &rects, |_, _| None)).transpose()?;
+        if main.as_ref().is_some_and(avc444::FromRgb::interpolated) {
+            self.rgb_refused = true;
+            return Err(REFUSED);
+        }
+        self.avc444(main.as_ref().map(avc444::FromRgb::view).as_ref(), aux.map(AuxIn::Rgba))
+    }
+
+    /// Le 4:4:4 est-il encore recomposé depuis les images RGB du navigateur ?
+    pub fn rgb_444(&self) -> bool {
+        !self.rgb_refused
+    }
+
+    fn avc444(&mut self, main: Option<&Yuv420<'_>>, aux: Option<AuxIn<'_>>) -> Result<Vec<Out>, Error> {
         if let Some(p) = self.pending_avc.take() {
             let mut done = Vec::new();
             let mut origin = None;
@@ -294,11 +360,27 @@ impl Gfx {
                     }
                 }
                 if let (Some(f), Some((rects, v2))) = (aux, p.aux.as_ref()) {
-                    planes.apply_aux(f, rects, *v2)?;
-                    for r in rects {
-                        if let Some(r) = r.clip(sw, sh) {
-                            planes.to_rgba_444(r, &mut s.rgba, sw);
-                            done.push(r);
+                    let applied = match f {
+                        AuxIn::Yuv(f) => {
+                            planes.apply_aux(f, rects, *v2)?;
+                            true
+                        }
+                        AuxIn::Rgba(f) => {
+                            let a = planes.aux_from_rgba(f, rects, *v2)?;
+                            let ok = !a.interpolated() && planes.aux_consistent(&a, rects, *v2);
+                            if ok {
+                                planes.apply_aux_from(&a, rects, *v2);
+                            }
+                            self.rgb_refused |= !ok;
+                            ok
+                        }
+                    };
+                    if applied {
+                        for r in rects {
+                            if let Some(r) = r.clip(sw, sh) {
+                                planes.to_rgba_444(r, &mut s.rgba, sw);
+                                done.push(r);
+                            }
                         }
                     }
                 }

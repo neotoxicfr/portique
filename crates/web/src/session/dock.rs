@@ -81,6 +81,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyboard_needs_a_reference_taken_while_closed() {
+        // Sans référence, la première mesure (clavier déjà ouvert, fenêtre rétrécie avec lui) ne peut rien dire.
+        let mut w = KeyboardWatch::default();
+        assert!(!w.update(400.0, 450.0, 450.0));
+        // Référence prise à l'ouverture de la page, clavier fermé : la même mesure montre le clavier.
+        let mut w = KeyboardWatch::default();
+        assert!(!w.update(400.0, 844.0, 844.0));
+        assert!(w.update(400.0, 450.0, 450.0));
+    }
+
+    #[test]
     fn position_stays_inside_the_safe_area() {
         let a = Area::new((0.0, 0.0, 390.0, 844.0), (47.0, 0.0, 34.0, 0.0), 0.0);
         assert_eq!(a, Area(8.0, 55.0, 382.0, 802.0));

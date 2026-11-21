@@ -161,6 +161,9 @@ pub fn SessionPage() -> impl IntoView {
             kbd_shown.set(shown);
         }
     };
+    // Référence prise tout de suite, clavier fermé : sinon la première ouverture du clavier, premier événement
+    // reçu, servirait elle-même de référence et ne serait pas vue (fenêtre qui rétrécit avec lui).
+    refresh_visible();
     let dock_pos = RwSignal::new(dock::load());
     let mods = RwSignal::new(keys::Mods::default());
     let drag = StoredValue::new(None::<Drag>);

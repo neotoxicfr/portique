@@ -162,6 +162,8 @@ a { color: var(--link); text-decoration: none; }
 /* Éléments collés les uns aux autres (segments, lignes de la liste des machines, touches des barres) : un anneau
    extérieur déborderait sur le voisin ; il passe à l'intérieur et suit leur arrondi. */
 :is(.seg > a, .seg > button, .mrow, .keybar .key, .sk-key, .tag button):focus-visible { outline-offset: -3px; }
+/* Touche active (Ctrl, Alt… collants) : son fond a le bleu du focus, l'anneau intérieur passe en blanc pour rester visible. */
+:is(.keybar .key.on, .sk-key.on):focus-visible { outline-color: #ffffff; }
 /* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
 @media (forced-colors: active) {
   :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }

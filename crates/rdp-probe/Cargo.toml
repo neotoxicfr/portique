@@ -3,6 +3,7 @@ name = "rdp-probe"
 description = "Sonde : connexion, session, rendu EGFX et capture d'un vrai serveur RDP"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

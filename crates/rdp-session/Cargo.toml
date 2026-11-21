@@ -3,6 +3,7 @@ name = "rdp-session"
 description = "Session RDP sans I/O : séquence de connexion après NLA, canaux, entrées, curseur"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

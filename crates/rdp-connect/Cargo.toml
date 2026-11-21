@@ -3,6 +3,7 @@ name = "rdp-connect"
 description = "Connexion RDP côté serveur Portique : TCP, négociation, TLS épinglé, NLA"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

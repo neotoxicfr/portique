@@ -3,6 +3,7 @@ name = "rdp-clip"
 description = "Presse-papier RDP sans I/O (MS-RDPECLIP) : texte, HTML, images"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

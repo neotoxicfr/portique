@@ -3,6 +3,7 @@ name = "rdp-gfx"
 description = "Pipeline graphique EGFX (MS-RDPEGFX) sans I/O : surfaces, cache, codecs, composition"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

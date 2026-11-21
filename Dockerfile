@@ -5,7 +5,7 @@ FROM rust:1.100.0-slim-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends perl make pkg-config curl openssl \
  && rm -rf /var/lib/apt/lists/* \
  && rustup target add wasm32-unknown-unknown \
- && cargo install --locked trunk --version 0.21.14
+ && cargo install --locked trunk --version 0.22.2
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

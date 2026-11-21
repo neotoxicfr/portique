@@ -21,7 +21,8 @@ pub fn Admin() -> impl IntoView {
     let session = Session::get();
     let users = RwSignal::new(Vec::<UserAdmin>::new());
     let conns = RwSignal::new(Vec::<ConnectionAdmin>::new());
-    let load_err = RwSignal::new(None::<String>);
+    let users_err = RwSignal::new(None::<String>);
+    let conns_err = RwSignal::new(None::<String>);
     // Seul le dernier rechargement publie : une reprise lente lancée avant une suppression réafficherait
     // la machine supprimée.
     let generation = StoredValue::new(0u32);
@@ -34,41 +35,20 @@ pub fn Admin() -> impl IntoView {
             return;
         };
         let epoch = session.epoch.get_untracked();
-        spawn_local(async move {
-            let current = || generation.try_get_value() == Some(mine);
-            let mut failure = None;
-            let r = api::get("/api/admin/users").await;
-            if !current() {
-                return;
-            }
-            match r {
-                Ok(u) => users.set(u),
-                Err(e) => {
-                    session.handle(epoch, &e);
-                    failure = Some(e.to_string());
-                }
-            }
-            let r = api::get("/api/admin/connections").await;
-            if !current() {
-                return;
-            }
-            match r {
-                Ok(c) => conns.set(c),
-                Err(e) => {
-                    session.handle(epoch, &e);
-                    failure = Some(e.to_string());
-                }
-            }
-            load_err.set(failure);
-        })
+        let current = move || generation.try_get_value() == Some(mine);
+        // Deux lectures indépendantes, chacune publiée dès sa réponse : une liste reste utilisable, et l'échec
+        // de l'autre visible, même si l'une des deux ne revient jamais.
+        spawn_local(load_list("/api/admin/users", users, users_err, current, session, epoch));
+        spawn_local(load_list("/api/admin/connections", conns, conns_err, current, session, epoch));
     };
+    let load_err = move || users_err.get().or_else(|| conns_err.get());
     reload();
     let f = Form::default();
     f.fill(None);
     let open = RwSignal::new(false);
     view! {
         <h1 class="sr-only">"Administration"</h1>
-        {move || load_err.get().map(|m| view! {
+        {move || load_err().map(|m| view! {
             <div class="banner error" role="alert">
                 <span>{sentence(&m)}</span>
                 <button type="button" on:click=move |_| reload()>"Réessayer"</button>
@@ -82,6 +62,32 @@ pub fn Admin() -> impl IntoView {
             </div>
             <Editor conns users f open reload/>
         </div>
+    }
+}
+
+/// Lit une liste d'administration, bornée dans le temps, et la publie si `current` (dernier rechargement).
+async fn load_list<T: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    url: &'static str,
+    list: RwSignal<Vec<T>>,
+    err: RwSignal<Option<String>>,
+    current: impl Fn() -> bool,
+    session: Session,
+    epoch: u32,
+) {
+    let r = crate::within(15_000, api::get::<Vec<T>>(url)).await;
+    if !current() {
+        return;
+    }
+    match r {
+        Some(Ok(l)) => {
+            list.set(l);
+            err.set(None);
+        }
+        Some(Err(e)) => {
+            session.handle(epoch, &e);
+            err.set(Some(e.to_string()));
+        }
+        None => err.set(Some("le serveur ne répond pas".into())),
     }
 }
 
@@ -104,6 +110,11 @@ fn confirm(msg: &str) -> bool {
     window().confirm_with_message(msg).unwrap_or(false)
 }
 
+/// Le formulaire de création contient-il encore le compte envoyé ?
+fn sent_draft(sent: &UserInput, name: Option<String>, pw: Option<String>, admin: Option<bool>) -> bool {
+    name.as_ref() == Some(&sent.username) && pw == sent.password && admin == Some(sent.is_admin)
+}
+
 #[component]
 fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
     let session = Session::get();
@@ -111,23 +122,40 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
     let pw = RwSignal::new(String::new());
     let admin = RwSignal::new(false);
     let adding = RwSignal::new(false);
+    // Création en vol : une seule à la fois.
+    let creating = RwSignal::new(false);
     let err = RwSignal::new(None::<String>);
     let me_id = move || session.me.with(|m| m.as_ref().map(|m| m.id));
 
     let create = move |ev: SubmitEvent| {
         ev.prevent_default();
+        if creating.get_untracked() {
+            return;
+        }
         let body = UserInput {
             username: name.get_untracked(),
             password: Some(pw.get_untracked()),
             is_admin: admin.get_untracked(),
         };
+        creating.set(true);
         spawn_local(async move {
-            match api::send_empty("POST", "/api/admin/users", Some(&body)).await {
+            let r = api::send_empty("POST", "/api/admin/users", Some(&body)).await;
+            creating.set(false);
+            match r {
                 Ok(()) => {
-                    name.set(String::new());
-                    pw.set(String::new());
-                    admin.set(false);
-                    adding.set(false);
+                    // Seul le brouillon envoyé est effacé et replié : un autre, commencé pendant l'envoi, reste.
+                    // Page quittée : signaux disparus, rien à effacer.
+                    if sent_draft(
+                        &body,
+                        name.try_get_untracked(),
+                        pw.try_get_untracked(),
+                        admin.try_get_untracked(),
+                    ) {
+                        name.set(String::new());
+                        pw.set(String::new());
+                        admin.set(false);
+                        adding.set(false);
+                    }
                     err.set(None);
                     reload();
                 }
@@ -180,7 +208,7 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
                     </div>
                     <div class="actions">
                         <button type="button" class="secondary" on:click=move |_| adding.set(false)>"Annuler"</button>
-                        <button type="submit">"Créer"</button>
+                        <button type="submit" disabled=move || creating.get()>"Créer"</button>
                     </div>
                 </form>
             </Show>
@@ -560,16 +588,24 @@ fn Editor(
             .filter(|c| c.ssh.is_some() && Some(c.id) != f.editing.get())
             .collect::<Vec<_>>()
     };
-    // Rebond ou relais qui n'est plus proposé (supprimé, SSH retiré) : vidé, pour que la valeur envoyée
-    // reste celle qu'affiche le sélecteur.
+    // Rebond ou relais supprimé : le serveur l'a déjà oublié (ON DELETE SET NULL), le sélecteur aussi.
     Effect::new(move || {
-        let ids: Vec<String> = ssh_hosts().iter().map(|c| c.id.to_string()).collect();
+        let ids: Vec<String> = conns.with(|l| l.iter().map(|c| c.id.to_string()).collect());
         for sel in [f.ssh_jump, f.cmd_via] {
             if sel.with(|v| !v.is_empty() && !ids.contains(v)) {
                 sel.set(String::new());
             }
         }
     });
+    // Rebond ou relais qui existe encore mais sans SSH : le serveur le garde. Il reste choisi et signalé, au
+    // lieu de passer en silence à « direct » ; le serveur refuse l'enregistrement tant qu'un autre choix n'est pas
+    // fait (« direct » compris).
+    let unavailable = move |sel: RwSignal<String>| {
+        let v = sel.get();
+        conns.with(|l| {
+            l.iter().find(|c| c.ssh.is_none() && c.id.to_string() == v).map(|c| (v.clone(), c.name.clone()))
+        })
+    };
 
     view! {
         <Show when=move || open.get()>
@@ -599,6 +635,9 @@ fn Editor(
                             <label class="line"><span class="line-label">"Rebond"</span>
                                 <select prop:value=move || f.ssh_jump.get() on:change=input(f.ssh_jump)>
                                     <option value="">"direct"</option>
+                                    {move || unavailable(f.ssh_jump).map(|(v, name)| view! {
+                                        <option value=v disabled prop:selected=true>{format!("par {name} (SSH désactivé)")}</option>
+                                    })}
                                     // Options recréées à chaque rechargement : chacune reprend sa sélection, sinon le
                                     // navigateur retombe sur « direct » sans que la valeur change.
                                     {move || ssh_hosts().into_iter()
@@ -666,6 +705,9 @@ fn Editor(
                                 <label class="line"><span class="line-label">"Passer par"</span>
                                     <select prop:value=move || f.cmd_via.get() on:change=input(f.cmd_via)>
                                         <option value="">"une adresse saisie ci-dessous"</option>
+                                        {move || unavailable(f.cmd_via).map(|(v, name)| view! {
+                                            <option value=v disabled prop:selected=true>{format!("l'hôte « {name} » (SSH désactivé)")}</option>
+                                        })}
                                         {move || ssh_hosts().into_iter()
                                             .map(|c| {
                                                 let v = c.id.to_string();
@@ -834,7 +876,23 @@ fn ServiceKeyPanel() -> impl IntoView {
 mod tests {
     use leptos::prelude::Set;
 
-    use super::{Form, restriction};
+    use portique_proto::UserInput;
+
+    use super::{Form, restriction, sent_draft};
+
+    #[test]
+    fn only_the_sent_draft_is_cleared() {
+        let sent =
+            UserInput { username: "alice".into(), password: Some("correct horse".into()), is_admin: false };
+        let s = |v: &str| Some(v.to_owned());
+        assert!(sent_draft(&sent, s("alice"), s("correct horse"), Some(false)));
+        // Brouillon suivant commencé pendant l'envoi : gardé.
+        assert!(!sent_draft(&sent, s("bob"), s("correct horse"), Some(false)));
+        assert!(!sent_draft(&sent, s("alice"), s(""), Some(false)));
+        assert!(!sent_draft(&sent, s("alice"), s("correct horse"), Some(true)));
+        // Page quittée pendant l'envoi : rien à effacer.
+        assert!(!sent_draft(&sent, None, None, None));
+    }
 
     #[test]
     fn hidden_udp_target_is_not_sent_in_command_mode() {

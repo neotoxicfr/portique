@@ -112,8 +112,9 @@ struct Inner {
     /// Génération du contenu à écrire localement : une écriture ou un réessai d'une génération
     /// dépassée (nouvelle copie d'un côté ou de l'autre) n'écrit rien.
     clip_write_gen: u32,
-    /// Écriture locale refusée (page sans focus) : retentée au prochain geste.
-    clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>)>,
+    /// Écriture locale refusée (page sans focus) : retentée au prochain geste. Génération, contenu,
+    /// empreinte de relecture.
+    clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>, u64)>,
     /// Génération du contenu du PC pas encore écrit localement (écriture en cours ou refusée).
     clip_unwritten: Option<u32>,
     /// Empreinte du presse-papier local tel qu'on l'a vu en dernier (lu, ou écrit par nous).
@@ -661,12 +662,13 @@ impl Engine {
             }
             return;
         }
-        if expected.is_some() && monitors.len() < 2 && i.views.len() > 1 {
+        let single = back_to_single(expected.is_some(), i.extend_wait.is_some(), monitors.len());
+        if expected.is_some() && single && i.views.len() > 1 {
             web_sys::console::warn_1(&"multi-écran : disposition non adoptée par le serveur".into());
         }
         let mut fell_back = false;
         let mut released = Vec::new();
-        if i.multi.is_none() || monitors.len() < 2 {
+        if single {
             released = release_secondary(&mut i.buttons);
             for v in i.views.iter().skip(1) {
                 v.close();
@@ -1043,11 +1045,7 @@ impl Engine {
         {
             return;
         }
-        // Clavier virtuel : `code` vide, mais les touches nommées (Retour arrière, Entrée,
-        // flèches…) portent dans `key` le même nom que leur position.
-        let scan = super::keys::scancode(&code)
-            .or_else(|| code.is_empty().then(|| super::keys::scancode(&key)).flatten());
-        if let Some((code, ext)) = scan {
+        if let Some((code, ext)) = super::keys::scancode_of(&code, &key) {
             e.prevent_default();
             self.key(code, ext, down);
         } else if let Some(c) = single {
@@ -1065,7 +1063,8 @@ impl Engine {
     /// Relâche sur le PC une touche encore enfoncée alors que le focus est passé à une commande
     /// locale (sans annuler l'événement : Espace active un bouton au relâchement).
     pub fn release_key(&self, e: &web_sys::KeyboardEvent) {
-        let Some(k) = super::keys::scancode(&e.code()) else { return };
+        // Même repli qu'à l'appui : une touche nommée du clavier virtuel se relâche aussi.
+        let Some(k) = super::keys::scancode_of(&e.code(), &e.key()) else { return };
         if self.inner.borrow().pressed.contains(&k) {
             self.key(k.0, k.1, false);
         }
@@ -1152,8 +1151,9 @@ impl Engine {
         // En-tête incomplet (réponse mutilée soldée par `rdp-clip`) : pas de type à interpréter.
         let kind = if msg.len() >= 8 { le16(0) } else { 0 };
         match kind {
-            // Monitor Ready : `rdp-clip` y répond par notre liste de formats, que Windows accusera.
-            1 => self.inner.borrow_mut().clip_announces.sent(None, js_sys::Date::now(), None),
+            // Monitor Ready : `rdp-clip` y répond par notre liste de formats, que Windows accusera ;
+            // rdpclip relancé ne répondra pas aux listes d'avant.
+            1 => self.inner.borrow_mut().clip_announces.ready(js_sys::Date::now()),
             // Format List Response : CB_RESPONSE_OK (0x0001) ou CB_RESPONSE_FAIL.
             3 => self.format_list_answered(le16(2) & 0x0001 != 0),
             _ => {}
@@ -1233,41 +1233,44 @@ impl Engine {
     /// permission du navigateur peut faire attendre l'écriture longtemps. Un PNG que le navigateur
     /// ne décode pas est remplacé par le DIB, s'il est proposé, plutôt que réessayé à chaque geste.
     fn write_remote(&self, items: Vec<rdp_clip::LocalData>) {
-        let (generation, announce) = {
+        let (generation, announce, provisional) = {
             let mut i = self.inner.borrow_mut();
             // Réponse restée dans la file après la fermeture : plus rien à écrire.
             if i.closing {
                 return;
             }
-            i.clip_last = Some(clip::fingerprint(&items));
+            let provisional = clip::fingerprint(&items);
+            i.clip_last = Some(provisional);
             i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
             i.clip_pending_write = None;
             i.clip_unwritten = Some(i.clip_write_gen);
-            (i.clip_write_gen, i.clip_fetch.generation())
+            (i.clip_write_gen, i.clip_fetch.generation(), provisional)
         };
         let e = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let png = items.iter().find_map(|d| match d {
-                rdp_clip::LocalData::Png(p) => Some(p),
-                _ => None,
-            });
-            if let Some(p) = png
-                && !clip::png_decodes(p).await
-            {
-                // Contenu dépassé ou session finie pendant le décodage : pas de repli non plus.
-                if e.inner.borrow().clip_write_gen == generation {
-                    web_sys::console::debug_1(
-                        &"presse-papier : PNG du PC illisible, repli sur le DIB".into(),
-                    );
-                    e.fetch_step(|f, request| f.png_unusable(announce, request));
-                }
+            let fp = clip::written_fingerprint(&items).await;
+            let mut i = e.inner.borrow_mut();
+            // Contenu dépassé ou session finie pendant le décodage : ni repli ni écriture.
+            if i.clip_write_gen != generation {
                 return;
             }
-            e.write_local(generation, items);
+            let Some(fp) = fp else {
+                drop(i);
+                web_sys::console::debug_1(&"presse-papier : PNG du PC illisible, repli sur le DIB".into());
+                e.fetch_step(|f, request| f.png_unusable(announce, request));
+                return;
+            };
+            // Empreinte d'un PNG connue après décodage : celle que donnera une relecture.
+            if i.clip_last == Some(provisional) {
+                i.clip_last = Some(fp);
+            }
+            drop(i);
+            e.write_local(generation, items, fp);
         });
     }
 
-    fn write_local(&self, generation: u32, items: Vec<rdp_clip::LocalData>) {
+    /// `fp` : empreinte de `items` relus après écriture (`clip::written_fingerprint`).
+    fn write_local(&self, generation: u32, items: Vec<rdp_clip::LocalData>, fp: u64) {
         let e = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let current = || e.inner.borrow().clip_write_gen == generation;
@@ -1279,13 +1282,14 @@ impl Engine {
             match result {
                 Ok(()) => {
                     i.clip_unwritten = None;
-                    i.clip_local = Some(clip::fingerprint(&items));
+                    i.clip_local = Some(fp);
+                    i.clip_announces.written_locally();
                 }
                 Err(err) => {
                     web_sys::console::debug_1(
                         &format!("presse-papier local : {err} (nouvel essai au prochain geste)").into(),
                     );
-                    i.clip_pending_write = Some((generation, items));
+                    i.clip_pending_write = Some((generation, items, fp));
                 }
             }
         });
@@ -1294,8 +1298,9 @@ impl Engine {
     /// Envoie au PC le contenu du presse-papier local s'il a changé, et attend que Windows l'ait
     /// accepté (borné par l'appelant). `Some(false)` si Windows a refusé la liste, si une liste plus
     /// récente l'a remplacée avant sa réponse, ou si la lecture plus récente qui a dépassé celle-ci
-    /// a été refusée : il reste à relire, réannoncer ou rejoindre la suivante. `None` si rien n'a
-    /// été lu (lecture refusée par le navigateur, presse-papier vide) : rien n'a changé côté PC.
+    /// a été refusée : il reste à relire, réannoncer ou rejoindre la suivante ; aussi si Windows ne
+    /// répond plus à nos listes (rien n'est annoncé). `None` si rien n'a été lu (lecture refusée
+    /// par le navigateur, presse-papier vide) : rien n'a changé côté PC.
     pub async fn sync_local_clipboard(&self) -> Option<bool> {
         if !self.is_connected() {
             return Some(true);
@@ -1325,7 +1330,7 @@ impl Engine {
             }
             match i.clip_announces.after_read(mark, fp, common, now) {
                 clip::AfterRead::Done => return Some(true),
-                clip::AfterRead::Retry => return Some(false),
+                clip::AfterRead::Retry | clip::AfterRead::Stalled => return Some(false),
                 clip::AfterRead::Join => {
                     i.clip_announces.join(tx);
                     Vec::new()
@@ -1357,12 +1362,12 @@ impl Engine {
         let pending = {
             let mut i = self.inner.borrow_mut();
             match i.clip_pending_write.take() {
-                Some((g, items)) if g == i.clip_write_gen => Some((g, items)),
+                Some((g, items, fp)) if g == i.clip_write_gen => Some((g, items, fp)),
                 _ => None,
             }
         };
-        if let Some((g, items)) = pending {
-            self.write_local(g, items);
+        if let Some((g, items, fp)) = pending {
+            self.write_local(g, items, fp);
         }
     }
 
@@ -1642,6 +1647,14 @@ fn single_layout(
     Ok(Some(monitor))
 }
 
+/// Un Reset Graphics qui n'adopte pas la disposition attendue ramène-t-il à un écran ? Oui sans
+/// extension, ou s'il n'a qu'un écran. Sauf pendant l'attente d'une extension : le PC traite les
+/// demandes dans l'ordre, ce Reset peut répondre à une taille à un écran envoyée avant elle ; le
+/// Reset de l'extension suit, ou le délai de garde ramène à un écran.
+fn back_to_single(extending: bool, waiting: bool, monitors: usize) -> bool {
+    !extending || (monitors < 2 && !waiting)
+}
+
 /// Zones d'image d'avant le dernier changement de taille d'un lot : `Gfx::process` a déjà remplacé
 /// le tampon, elles ne le décrivent plus. Les accusés (`Send`) gardent leur ordre.
 fn drop_stale_presents(outs: Vec<Out>) -> Vec<Out> {
@@ -1734,6 +1747,19 @@ mod tests {
         // Confirmée (`reset_views` efface `sent`) : une taille déjà appliquée reste ignorée.
         sent = None;
         assert_eq!(single_layout(&mut desired, &mut sent, caps, (1600, 900), false, desktop), Ok(None));
+    }
+
+    #[test]
+    fn earlier_single_reset_keeps_a_pending_extension() {
+        // Extension envoyée, pas encore adoptée : un Reset à un écran (taille demandée avant elle)
+        // ne la défait pas ; le délai de garde reste seul juge.
+        assert!(!back_to_single(true, true, 1));
+        assert!(!back_to_single(true, true, 0), "Reset sans liste d'écrans");
+        // Extension adoptée puis Reset à un écran : le PC est revenu à un écran.
+        assert!(back_to_single(true, false, 1));
+        // Plusieurs écrans dans une autre disposition : on attend, comme avant.
+        assert!(!back_to_single(true, false, 2));
+        assert!(back_to_single(false, false, 2), "sans extension : une seule vue");
     }
 
     #[test]

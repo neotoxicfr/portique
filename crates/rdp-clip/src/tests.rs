@@ -183,6 +183,25 @@ fn short_names_without_server_caps() {
 }
 
 #[test]
+fn channel_reinitialized_settles_the_request_in_flight() {
+    let mut c = ready();
+    let mut list = 13u32.to_le_bytes().to_vec();
+    list.extend_from_slice(&[0, 0]);
+    c.receive(&pdu(msg::FORMAT_LIST, 0, &list)).unwrap();
+    assert!(!sends(&c.request(&[ClipFormat::Text])).is_empty());
+    // rdpclip relancé sur le PC : capacités et Monitor Ready à nouveau, la demande est perdue.
+    c.receive(&unhex(SERVER_CAPS)).unwrap();
+    let ev = c.receive(&unhex(MONITOR_READY)).unwrap();
+    assert_eq!(sends(&ev).len(), 2, "capacités et liste de formats renvoyées");
+    assert_eq!(ev.last(), Some(&ClipEvent::RemoteData(None)));
+    assert!(!sends(&c.request(&[ClipFormat::Text])).is_empty(), "une nouvelle demande part");
+    // Sans demande en vol, Monitor Ready ne solde rien.
+    let mut c = ready();
+    let ev = c.receive(&unhex(MONITOR_READY)).unwrap();
+    assert!(!ev.contains(&ClipEvent::RemoteData(None)));
+}
+
+#[test]
 fn text_conversions() {
     assert_eq!(utf16_to_string(&string_to_utf16("é\r\nx\ny")), "é\nx\ny");
     assert_eq!(string_to_utf16("a\r\n"), unhex("61 00 0d 00 0a 00 00 00"));

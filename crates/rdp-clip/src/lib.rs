@@ -240,6 +240,12 @@ impl Clipboard {
                     ev.push(ClipEvent::Send(self.client_caps()));
                 }
                 ev.push(ClipEvent::Send(self.format_list()));
+                // Canal réinitialisé (rdpclip relancé sur le PC) : une demande partie avant ne
+                // recevra plus de réponse. Soldée ici, sinon plus aucune ne partirait.
+                if self.pending.take().is_some() {
+                    self.stale = false;
+                    ev.push(ClipEvent::RemoteData(None));
+                }
             }
             msg::FORMAT_LIST => {
                 // Liste inexploitable : CB_RESPONSE_FAIL (2.2.3.2), l'état précédent reste.

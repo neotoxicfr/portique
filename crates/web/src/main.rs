@@ -26,6 +26,9 @@ pub struct Session {
     /// Déconnexion en vol : une seule à la fois. Gardé ici pour survivre aux changements de page : une
     /// seconde réponse arrivée après une reconnexion effacerait le cookie de la nouvelle session.
     pub logging_out: RwSignal<bool>,
+    /// Message de l'écran de connexion après une fin de session décidée par le serveur (mot de passe changé) ;
+    /// effacé à la connexion suivante.
+    pub notice: RwSignal<Option<String>>,
 }
 
 impl Session {
@@ -50,6 +53,16 @@ impl Session {
                     m.totp_enabled = on;
                 }
             });
+        }
+    }
+
+    /// Fin de session prononcée par le serveur au succès d'une requête de la génération `epoch` : écran de
+    /// connexion avec `notice`, même si la page de la requête a été quittée. Rien si la session est déjà
+    /// terminée : la réponse fermerait la suivante.
+    pub fn ended_by_server(&self, epoch: u32, notice: &str) {
+        if self.epoch.get_untracked() == epoch {
+            self.notice.set(Some(notice.into()));
+            self.me.set(None);
         }
     }
 
@@ -128,13 +141,17 @@ fn App() -> impl IntoView {
         logout_error: RwSignal::new(None),
         epoch: RwSignal::new(0),
         logging_out: RwSignal::new(false),
+        notice: RwSignal::new(None),
     };
     provide_context(session);
-    // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion).
+    // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion), l'avis
+    // de l'écran de connexion pas à la connexion suivante.
     Effect::new(move || {
         if session.me.with(Option::is_none) {
             session.logout_error.set(None);
             session.epoch.update(|e| *e = e.wrapping_add(1));
+        } else {
+            session.notice.set(None);
         }
     });
     // Panne réseau ou serveur (hors 401) : on le dit et on propose de réessayer. Une requête qui ne revient
@@ -283,6 +300,7 @@ mod tests {
             logout_error: RwSignal::new(None),
             epoch: RwSignal::new(1),
             logging_out: RwSignal::new(false),
+            notice: RwSignal::new(None),
         };
         let me = |name: &str| Me {
             id: 1,
@@ -315,6 +333,7 @@ mod tests {
             logout_error: RwSignal::new(None),
             epoch: RwSignal::new(1),
             logging_out: RwSignal::new(false),
+            notice: RwSignal::new(None),
         };
         let me = |name: &str, totp: bool| Me {
             id: 1,
@@ -333,5 +352,37 @@ mod tests {
         let sent_by_bob = session.epoch.get_untracked();
         session.set_totp(sent_by_bob, true);
         assert_eq!(session.me.get_untracked(), Some(me("bob", true)));
+    }
+
+    #[test]
+    fn password_change_ends_only_the_session_that_sent_it() {
+        let session = Session {
+            info: RwSignal::new(None),
+            me: RwSignal::new(None),
+            checked: RwSignal::new(true),
+            logout_error: RwSignal::new(None),
+            epoch: RwSignal::new(1),
+            logging_out: RwSignal::new(false),
+            notice: RwSignal::new(None),
+        };
+        let me = |name: &str| Me {
+            id: 1,
+            username: name.into(),
+            is_admin: false,
+            totp_enabled: false,
+            external: false,
+        };
+        session.me.set(Some(me("alice")));
+        let sent_by_alice = session.epoch.get_untracked();
+        session.epoch.update(|e| *e += 1);
+        session.me.set(Some(me("bob")));
+        // Réponse tardive d'une session terminée : bob reste connecté, sans avis.
+        session.ended_by_server(sent_by_alice, "changé");
+        assert_eq!(session.me.get_untracked(), Some(me("bob")));
+        assert_eq!(session.notice.get_untracked(), None);
+        // Réponse de la session courante : écran de connexion et avis, page quittée ou non.
+        session.ended_by_server(session.epoch.get_untracked(), "changé");
+        assert_eq!(session.me.get_untracked(), None);
+        assert_eq!(session.notice.get_untracked().as_deref(), Some("changé"));
     }
 }

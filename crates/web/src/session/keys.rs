@@ -139,6 +139,13 @@ pub fn scancode(code: &str) -> Option<(u8, bool)> {
     })
 }
 
+/// Code de balayage d'un événement clavier : sa position (`code`) ; à défaut (clavier virtuel :
+/// `code` vide, ou « Unidentified » que permet UI Events), le nom de la touche (`key`), que les
+/// touches nommées (Retour arrière, Entrée, flèches…) partagent avec leur position.
+pub fn scancode_of(code: &str, key: &str) -> Option<(u8, bool)> {
+    scancode(code).or_else(|| matches!(code, "" | "Unidentified").then(|| scancode(key)).flatten())
+}
+
 /// Touches sans code de balayage simple, rendues par une séquence complète. Pause : Ctrl avec
 /// EXTENDED1 puis Verr num (MS-RDPBCGR 2.2.8.1.2.2.1), appui et relâchement envoyés à l'appui
 /// (la touche n'a pas de relâchement propre).
@@ -194,6 +201,15 @@ mod tests {
         assert_eq!(sequence("Pause", false), Some(Vec::new()));
         assert_eq!(sequence("KeyA", true), None);
         assert_eq!(scancode("Pause"), None, "jamais par la table : (code, E0) ne peut la représenter");
+    }
+
+    #[test]
+    fn named_keys_without_a_position() {
+        assert_eq!(scancode_of("", "ArrowDown"), scancode("ArrowDown"));
+        assert_eq!(scancode_of("Unidentified", "ArrowDown"), scancode("ArrowDown"));
+        assert_eq!(scancode_of("Unidentified", "Enter"), Some((0x1C, false)));
+        assert_eq!(scancode_of("Unidentified", "a"), None, "caractère : par Unicode");
+        assert_eq!(scancode_of("KeyQ", "a"), scancode("KeyQ"), "la position prime (AZERTY)");
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub fn Login() -> impl IntoView {
             <form class="login" on:submit=submit>
                 <img class="login-icon" src="/icon.svg" alt=""/>
                 <h1>"Portique"</h1>
+                {move || session.notice.get().map(|m| view! { <p class="alert ok" role="status">{m}</p> })}
                 <div class="group">
                     <label class="line">
                         <span class="line-label">"Identifiant"</span>

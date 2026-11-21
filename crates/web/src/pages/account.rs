@@ -110,7 +110,6 @@ fn Password() -> impl IntoView {
     let new = RwSignal::new(String::new());
     let st = status();
     let busy = RwSignal::new(false);
-    let done = RwSignal::new(false);
     let submit = move |ev: SubmitEvent| {
         ev.prevent_default();
         if busy.get_untracked() {
@@ -121,12 +120,13 @@ fn Password() -> impl IntoView {
         new.set(String::new());
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            // Le serveur ferme toutes les sessions du compte, celle-ci comprise.
+            // Le serveur ferme toutes les sessions du compte, celle-ci comprise : écran de connexion, même si
+            // la page a été quittée pendant l'envoi, avec la confirmation.
             match api::send_empty("POST", "/api/account/password", Some(&body)).await {
-                Ok(()) => {
-                    st.set(None);
-                    done.set(true);
-                }
+                Ok(()) => session.ended_by_server(
+                    epoch,
+                    "Mot de passe changé : toutes les sessions sont fermées. Reconnecte-toi avec le nouveau.",
+                ),
                 Err(e) => {
                     session.handle(epoch, &e);
                     st.set(Some(Err(e.to_string())));
@@ -138,27 +138,19 @@ fn Password() -> impl IntoView {
     view! {
         <section>
             <h2 class="group-title">"Mot de passe"</h2>
-            <Show
-                when=move || !done.get()
-                fallback=move || view! {
-                    <p class="alert ok" role="status">"Mot de passe changé : toutes les sessions sont fermées, celle-ci comprise."</p>
-                    <div class="actions"><button on:click=move |_| session.me.set(None)>"Se reconnecter"</button></div>
-                }
-            >
-                <form on:submit=submit>
-                    <div class="group">
-                        {proof.password_line("Actuel")}
-                        {proof.totp_line()}
-                        <label class="line">
-                            <span class="line-label">"Nouveau"</span>
-                            <input type="password" autocomplete="new-password" minlength="12" required placeholder="12 caractères minimum"
-                                prop:value=move || new.get() on:input=move |ev| new.set(event_target_value(&ev))/>
-                        </label>
-                    </div>
-                    {show_status(st)}
-                    <div class="actions"><button type="submit" disabled=move || busy.get()>"Changer"</button></div>
-                </form>
-            </Show>
+            <form on:submit=submit>
+                <div class="group">
+                    {proof.password_line("Actuel")}
+                    {proof.totp_line()}
+                    <label class="line">
+                        <span class="line-label">"Nouveau"</span>
+                        <input type="password" autocomplete="new-password" minlength="12" required placeholder="12 caractères minimum"
+                            prop:value=move || new.get() on:input=move |ev| new.set(event_target_value(&ev))/>
+                    </label>
+                </div>
+                {show_status(st)}
+                <div class="actions"><button type="submit" disabled=move || busy.get()>"Changer"</button></div>
+            </form>
         </section>
     }
 }
@@ -334,6 +326,9 @@ fn Totp(st: Status) -> impl IntoView {
 fn Passkeys(st: Status) -> impl IntoView {
     let session = Session::get();
     let list = RwSignal::new(Vec::<PasskeyInfo>::new());
+    // Échec de la dernière lecture (hors 401, qui renvoie à la connexion) : sans lui, une liste vide ne dirait
+    // pas si la lecture a abouti.
+    let load_err = RwSignal::new(None::<String>);
     let name = RwSignal::new(String::new());
     let adding = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -341,9 +336,16 @@ fn Passkeys(st: Status) -> impl IntoView {
     let reload = move || {
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::get("/api/account/passkeys").await {
-                Ok(l) => list.set(l),
-                Err(e) => session.handle(epoch, &e),
+            match crate::within(15_000, api::get("/api/account/passkeys")).await {
+                Some(Ok(l)) => {
+                    list.set(l);
+                    load_err.set(None);
+                }
+                Some(Err(e)) => {
+                    session.handle(epoch, &e);
+                    load_err.set(Some(e.to_string()));
+                }
+                None => load_err.set(Some("le serveur ne répond pas".into())),
             }
         })
     };
@@ -391,6 +393,12 @@ fn Passkeys(st: Status) -> impl IntoView {
     };
 
     view! {
+        {move || load_err.get().map(|m| view! {
+            <div class="line" role="alert">
+                <span class="grow error">{crate::sentence(&format!("passkeys non lues : {m}"))}</span>
+                <button type="button" class="secondary" on:click=move |_| reload()>"Réessayer"</button>
+            </div>
+        })}
         <For each=move || list.get() key=|p| p.id let(p)>
             {
                 let label = p.name.clone();
@@ -449,12 +457,17 @@ fn theme_label(t: &str) -> &str {
     }
 }
 
-/// Combinaisons sans doublon, dans l'ordre : chacune sert de clé à sa vignette (le serveur accepte les
-/// doublons, l'interface n'en crée pas).
+/// Même combinaison : mêmes octets envoyés (`Ctrl+C` et `ctrl+c`), comme le compte le serveur, qui refuse
+/// les doublons. `Alt+B` et `Alt+b` restent distinctes.
+fn same_combo(a: &str, b: &str) -> bool {
+    a == b || matches!((Combo::parse(a), Combo::parse(b)), (Some(x), Some(y)) if x.bytes() == y.bytes())
+}
+
+/// Combinaisons sans doublon, dans l'ordre, premier libellé gardé : chacune sert de clé à sa vignette.
 fn unique(combos: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(combos.len());
+    let mut out: Vec<String> = Vec::with_capacity(combos.len());
     for c in combos {
-        if !out.contains(&c) {
+        if !out.iter().any(|o| same_combo(o, &c)) {
             out.push(c);
         }
     }
@@ -510,7 +523,7 @@ fn Terminal() -> impl IntoView {
             )));
             return false;
         }
-        if !combos.with_untracked(|v| v.contains(&c)) {
+        if !combos.with_untracked(|v| v.iter().any(|x| same_combo(x, &c))) {
             if combos.with_untracked(Vec::len) >= MAX_COMBOS {
                 combo_err.set(Some(format!("{MAX_COMBOS} combinaisons au plus.")));
                 return false;
@@ -605,12 +618,24 @@ fn Terminal() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::unique;
+    use super::{same_combo, unique};
 
     #[test]
     fn loaded_duplicate_combos_are_shown_once() {
         let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(unique(v(&["Ctrl+C", "Ctrl+C", "Alt+B"])), v(&["Ctrl+C", "Alt+B"]));
         assert_eq!(unique(v(&["Alt+B", "Ctrl+C", "Alt+B"])), v(&["Alt+B", "Ctrl+C"]));
+    }
+
+    #[test]
+    fn combos_that_send_the_same_bytes_are_one() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Premier libellé gardé.
+        assert_eq!(unique(v(&["Ctrl+C", "ctrl+c", "CTRL+C"])), v(&["Ctrl+C"]));
+        assert_eq!(unique(v(&["Ctrl+Alt+D", "Alt+Ctrl+d"])), v(&["Ctrl+Alt+D"]));
+        // Octets différents : Alt+B (ESC B) et Alt+b (ESC b).
+        assert_eq!(unique(v(&["Alt+B", "Alt+b"])), v(&["Alt+B", "Alt+b"]));
+        assert!(same_combo("Ctrl+r", "Ctrl+R"));
+        assert!(!same_combo("Alt+r", "Alt+R"));
     }
 }

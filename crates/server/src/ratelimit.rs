@@ -17,10 +17,16 @@ const WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_PER_ACCOUNT: usize = 5;
 const MAX_PER_IP: usize = 20;
 /// Clés suivies au plus. Pleine, la table est purgée des clés expirées au plus une fois par `PURGE_EVERY`
-/// (un parcours complet à chaque appel, sous le verrou commun, ralentirait toutes les connexions) ; toujours
-/// pleine, elle refuse les nouvelles clés et garde les plafonds des comptes et adresses déjà suivis.
+/// (un parcours complet à chaque appel, sous le verrou commun, ralentirait toutes les connexions). Toujours
+/// pleine de clés actives, elle n'évince rien (ce serait rendre ses compteurs à un attaquant) et ne ferme
+/// pas non plus la porte à tous : les clés déjà suivies gardent leurs plafonds, les nouvelles sont comptées
+/// par préfixe grossier (/24, /48), puis, si ces seaux débordent aussi, dans un seau commun plafonné.
 const MAX_KEYS: usize = 10_000;
 const PURGE_EVERY: Duration = Duration::from_secs(60);
+/// Seaux de débordement : nombre de préfixes suivis, tentatives par préfixe, tentatives du seau commun.
+const MAX_PREFIXES: usize = 1_024;
+const MAX_PER_PREFIX: usize = 20;
+const MAX_COMMON: usize = 200;
 
 #[derive(Default)]
 pub struct LoginLimiter {
@@ -36,6 +42,8 @@ struct Inner {
     in_flight: HashSet<u64>,
     /// Dernière purge des clés expirées.
     purged: Option<Instant>,
+    /// Débordement, table pleine : préfixe grossier (ou « * », seau commun) → tentatives de la fenêtre.
+    overflow: HashMap<String, Vec<Instant>>,
 }
 
 /// Réservation d'une tentative : `succeeded` ou `release` rendent à l'IP la place de CETTE tentative,
@@ -68,6 +76,24 @@ fn ip_key(ip: IpAddr) -> String {
             }
         },
         v4 => v4.to_string(),
+    }
+}
+
+/// Préfixe de débordement : /24 en IPv4, /48 en IPv6 (un site entier).
+fn prefix_key(ip: IpAddr) -> String {
+    let v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+    };
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(m) => v4(m),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+            }
+        },
+        IpAddr::V4(a) => v4(a),
     }
 }
 
@@ -115,32 +141,35 @@ impl LoginLimiter {
     pub fn reserve(self: &Arc<Self>, ip: IpAddr, username: &str) -> Option<Ticket> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let Inner { attempts: map, in_flight, purged } = &mut *inner;
+        let Inner { attempts: map, in_flight, purged, overflow } = &mut *inner;
         let keys = Self::keys(ip, username);
         let room = |map: &HashMap<_, _>| {
             map.len() + keys.iter().filter(|(k, _)| !map.contains_key(k)).count() <= MAX_KEYS
         };
         if !room(map) && purged.is_none_or(|t| now.duration_since(t) >= PURGE_EVERY) {
             map.retain(|_, v| v.iter().any(|(t, _)| now.duration_since(*t) < WINDOW));
+            overflow.retain(|_, v| v.iter().any(|t| now.duration_since(*t) < WINDOW));
             *purged = Some(now);
         }
-        // Toujours pleine : on évince les clés dont la dernière tentative est la plus ancienne (hors tentatives
-        // en vol) plutôt que de refuser. Refuser bloquerait les connexions de tout le monde dès qu'une rafale
-        // de préfixes a rempli la table ; évincer ne rend à l'attaquant que ses propres vieux compteurs.
-        while !room(map) {
-            let victim = map
-                .iter()
-                .filter(|(k, v)| {
-                    !keys.iter().any(|(own, _)| own == *k) && !v.iter().any(|(_, n)| in_flight.contains(n))
-                })
-                .min_by_key(|(_, v)| v.iter().map(|(t, _)| *t).max())
-                .map(|(k, _)| k.clone());
-            match victim {
-                Some(k) => {
-                    map.remove(&k);
-                }
-                None => break,
+        if !room(map) {
+            // Pleine de clés actives : comptée dans un seau grossier, sans verdict possible (un succès n'y
+            // rend rien), ce qui ne pénalise que les nouveaux venus pendant la saturation.
+            let prefix = prefix_key(ip);
+            let (bucket, cap) = if overflow.contains_key(&prefix) || overflow.len() < MAX_PREFIXES {
+                (prefix, MAX_PER_PREFIX)
+            } else {
+                ("*".to_owned(), MAX_COMMON)
+            };
+            let v = overflow.entry(bucket).or_default();
+            v.retain(|t| now.duration_since(*t) < WINDOW);
+            if v.len() >= cap {
+                return None;
             }
+            v.push(now);
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            in_flight.insert(n);
+            drop(inner);
+            return Some(Ticket { limiter: Arc::clone(self), n, keys: [String::new(), String::new()] });
         }
         let allowed = room(map)
             && keys.iter().all(|(k, max)| {
@@ -237,9 +266,10 @@ mod tests {
         drop(again);
     }
 
-    /// Une table pleine de clés actives n'est jamais fermée à tous : la moins récente part.
+    /// Une table pleine de clés actives ne perd aucun compteur et n'est pas fermée à tous : les nouveaux
+    /// venus sont comptés par préfixe grossier.
     #[test]
-    fn full_table_evicts_the_least_recent_keys_instead_of_refusing() {
+    fn full_table_keeps_its_counters_and_overflows_per_prefix() {
         let l = Arc::new(LoginLimiter::default());
         let old = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
         {
@@ -250,10 +280,16 @@ mod tests {
             }
             inner.purged = Some(Instant::now());
         }
-        assert!(l.reserve(IpAddr::from([192, 0, 2, 9]), "eve").is_some(), "pleine : éviction, pas de refus");
+        // Même /24 : MAX_PER_PREFIX nouveaux venus, puis refus ; un autre préfixe passe encore.
+        for k in 0..MAX_PER_PREFIX {
+            let who = format!("eve{k}");
+            assert!(l.reserve(IpAddr::from([192, 0, 2, 9]), &who).is_some(), "débordement {k}");
+        }
+        assert!(l.reserve(IpAddr::from([192, 0, 2, 10]), "mallory").is_none(), "préfixe plein");
+        assert!(l.reserve(IpAddr::from([198, 51, 100, 1]), "bob").is_some(), "autre préfixe");
         let inner = l.inner.lock().unwrap();
         assert_eq!(inner.attempts.len(), MAX_KEYS);
-        assert!(!inner.attempts.contains_key("ancienne"), "la moins récente part");
+        assert!(inner.attempts.contains_key("ancienne"), "aucun compteur actif évincé");
     }
 
     #[test]

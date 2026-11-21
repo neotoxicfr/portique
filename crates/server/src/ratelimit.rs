@@ -81,6 +81,12 @@ fn ip_key(ip: IpAddr) -> String {
     }
 }
 
+/// Identifiant tel qu'il entre dans une clé : replié comme `COLLATE NOCASE` (ASCII) et borné à 64 caractères
+/// (aucun compte n'en a plus) : un identifiant géant envoyé en boucle ne fait pas grossir la table.
+fn user_key(username: &str) -> String {
+    username.chars().take(64).collect::<String>().to_ascii_lowercase()
+}
+
 /// Préfixe de débordement : /24 en IPv4, /48 en IPv6 (un site entier).
 fn prefix_key(ip: IpAddr) -> String {
     let v4 = |v4: std::net::Ipv4Addr| {
@@ -134,7 +140,7 @@ impl LoginLimiter {
     /// comptes en base, ils ne partagent pas leur plafond.
     fn keys(ip: IpAddr, username: &str) -> [(String, usize); 2] {
         let ip = ip_key(ip);
-        [(format!("{ip}|{}", username.to_ascii_lowercase()), MAX_PER_ACCOUNT), (ip, MAX_PER_IP)]
+        [(format!("{ip}|{}", user_key(username)), MAX_PER_ACCOUNT), (ip, MAX_PER_IP)]
     }
 
     /// Réserve une tentative : plafonds vérifiés et tentative comptée sous le même verrou, avant tout travail
@@ -167,10 +173,13 @@ impl LoginLimiter {
                 return None;
             }
             let prefix = prefix_key(ip);
-            let user = format!("{prefix}|{}", username.to_ascii_lowercase());
+            let user = format!("{prefix}|{}", user_key(username));
             let mut buckets = Vec::new();
+            let mut new = 0;
             for (bucket, cap) in [(prefix, MAX_PER_PREFIX), (user, MAX_PER_ACCOUNT)] {
-                if overflow.contains_key(&bucket) || overflow.len() < MAX_PREFIXES {
+                let known = overflow.contains_key(&bucket);
+                if known || overflow.len() + new < MAX_PREFIXES {
+                    new += usize::from(!known);
                     buckets.push((bucket, cap));
                 } else {
                     buckets.push(("*".to_owned(), MAX_COMMON));
@@ -269,6 +278,15 @@ mod tests {
 
     /// Table pleine : purge des clés expirées au plus une fois par `PURGE_EVERY`, aucune nouvelle clé tant
     /// qu'il n'y a pas de place, les clés déjà suivies gardent leurs compteurs.
+    #[test]
+    fn giant_usernames_make_bounded_keys() {
+        let l = Arc::new(LoginLimiter::default());
+        let huge = "A".repeat(100_000);
+        let _t = l.reserve(IpAddr::from([192, 0, 2, 1]), &huge).unwrap();
+        let inner = l.inner.lock().unwrap();
+        assert!(inner.attempts.keys().all(|k| k.len() < 100), "clé bornée");
+    }
+
     #[test]
     fn full_table_is_purged_at_most_once_per_interval_and_keeps_its_keys() {
         let l = Arc::new(LoginLimiter::default());

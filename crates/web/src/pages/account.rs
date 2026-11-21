@@ -337,8 +337,13 @@ fn Passkeys(st: Status) -> impl IntoView {
     let generation = StoredValue::new(0u32);
     let reload = move || {
         let epoch = session.epoch.get_untracked();
-        generation.update_value(|g| *g = g.wrapping_add(1));
-        let mine = generation.get_value();
+        // Page quittée (rechargement après un ajout ou une suppression) : plus rien à mettre à jour.
+        let Some(mine) = generation.try_update_value(|g| {
+            *g = g.wrapping_add(1);
+            *g
+        }) else {
+            return;
+        };
         spawn_local(async move {
             let result = crate::within(15_000, api::get("/api/account/passkeys")).await;
             if generation.try_get_value() != Some(mine) {

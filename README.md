@@ -101,17 +101,25 @@ sudo chown 10001:10001 data secrets/*               # le conteneur tourne sous l
 Sur une installation existante, ces commandes gardent les secrets en place : une nouvelle clé ne déchiffrerait
 plus les identifiants enregistrés, et `admin_password` ne sert qu'au premier démarrage (base sans admin), le
 modifier ensuite ne change rien au compte. Mot de passe admin perdu : un autre admin le remet dans **Admin**.
-Sinon, conteneur arrêté, retire les droits admin en base depuis un conteneur jetable (ses UID sont remappés
+Sinon, conteneur arrêté, retire les droits admin, puis remets à zéro la double authentification du compte
+`admin` (TOTP ou passkey perdus) et ferme ses sessions (un cookie volé ne doit pas retrouver le rôle admin),
+depuis un conteneur jetable (ses UID sont remappés
 comme ceux de Portique, Docker rootless et `userns-remap` compris ; le `chown` final rend la base à l'UID 10001) :
 
 ```sh
 docker run --rm -v "$PWD/data:/data" alpine:3.20 sh -c \
-  'apk add -q sqlite && sqlite3 /data/portique.db "UPDATE users SET is_admin = 0" && chown 10001:10001 /data/portique.db*'
+  'apk add -q sqlite && sqlite3 /data/portique.db "BEGIN;
+     UPDATE users SET is_admin = 0;
+     UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0 WHERE username = '\''admin'\'';
+     DELETE FROM passkeys WHERE user_id = (SELECT id FROM users WHERE username = '\''admin'\'');
+     DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = '\''admin'\'');
+     COMMIT;" && chown 10001:10001 /data/portique.db*'
 ```
 
 Remplace ensuite
 `secrets/admin_password` (avec `sudo`) et redémarre : le compte `admin` reçoit ce mot de passe et redevient
-admin ; rends ensuite leurs droits aux autres comptes dans **Admin**.
+admin ; réactive sa double authentification dans **Compte**, puis rends leurs droits aux autres comptes dans
+**Admin**.
 
 L'UID 10001 ne doit être celui d'aucun compte de l'hôte : ce compte lirait la clé et la base. S'il est pris,
 isole le conteneur avec `userns-remap`.

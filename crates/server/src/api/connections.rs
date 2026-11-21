@@ -53,6 +53,17 @@ macro_rules! columns {
     };
 }
 
+/// Maillons saisis d'un emplacement : la ligne cachée `?1` de `?2`, puis les lignes cachées de `?2` par
+/// lesquelles elle passe (copies laissées par la suppression d'un hôte connu), `?3` au plus.
+macro_rules! links {
+    () => {
+        "WITH RECURSIVE link(id, n) AS (
+             SELECT id, 0 FROM connections WHERE id = ?1 AND inline_for = ?2
+             UNION SELECT c.ssh_jump_id, link.n + 1 FROM link JOIN connections c ON c.id = link.id
+                 WHERE c.ssh_jump_id IN (SELECT id FROM connections WHERE inline_for = ?2) AND link.n < ?3) "
+    };
+}
+
 /// Réveil par commande de `id` : SSH par un rebond (hôte connu ou saisi), puis la commande.
 async fn save_wol_command(
     vault: &Vault,
@@ -60,11 +71,19 @@ async fn save_wol_command(
     id: i64,
     cmd: &Option<portique_proto::WolCommandInput>,
 ) -> ApiResult<()> {
+    // Ancien réveil par adresse saisie que le démarrage n'a pas pu reprendre : repris ici, ou modification
+    // refusée, plutôt que d'effacer ses réglages. L'admin le voyait comme un réveil direct : une commande
+    // absente ne le supprime donc pas.
+    let converted = convert_legacy_wol_host(vault, db, id).await.map_err(|e| {
+        bad(format!("réveil : l'ancien réglage par adresse saisie n'a pas pu être repris ({e:#})"))
+    })?;
     // Les colonnes wol_ssh_* autres que la commande ne servent plus (reprises par `convert_legacy_wol_hosts`).
     let clear = "UPDATE connections SET wol_ssh_host = NULL, wol_ssh_user = NULL, wol_ssh_password = NULL,
          wol_ssh_command = NULL, wol_ssh_hostkey = NULL, wol_ssh_hostkey_pending = NULL, wol_via_id = NULL WHERE id = ?";
     let Some(r) = cmd else {
-        sqlx::query(clear).bind(id).execute(&mut *db).await?;
+        if !converted {
+            sqlx::query(clear).bind(id).execute(&mut *db).await?;
+        }
         return Ok(());
     };
     wol::validate_command(r.command.trim()).map_err(bad)?;
@@ -181,20 +200,24 @@ pub async fn wake(
 
 /// Réveil par un rebond (hôte connu ou saisi) : sa chaîne de rebonds, puis la commande. Renvoie son nom.
 async fn wake_via(state: &AppState, via: i64, template: &str, mac: [u8; 6]) -> anyhow::Result<String> {
-    let host = find_hop(&state.db, via).await.map_err(|_| anyhow::anyhow!("hôte de réveil introuvable"))?;
-    let name = host.name.clone();
-    let hops = crate::api::ssh::chain(state, host).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let hops = crate::api::ssh::chain(state, via).await.map_err(|e| match e {
+        AppError::NotFound => anyhow::anyhow!("hôte de réveil introuvable"),
+        e => anyhow::anyhow!("{e:?}"),
+    })?;
+    let name = hops.last().map(|h| h.name.clone()).unwrap_or_default();
     let key = crate::ssh::service_key(state).await?;
     let chain = match crate::ssh::connect(&hops, &key, None).await {
         Ok(c) => c,
         Err(crate::ssh::OpenError::Unapproved { id, name, fingerprint, .. }) => {
             // Rien n'a été envoyé. Rebond saisi : la clé présentée attend l'approbation dans l'admin de sa
             // machine, si l'adresse n'a pas changé depuis la lecture (sinon elle serait approuvable pour la
-            // nouvelle). Hôte connu : son terminal sert à l'approuver.
+            // nouvelle) et si un terminal ne l'a pas épinglée entre-temps. Hôte connu : son terminal sert à
+            // l'approuver.
             if let Some(hop) = hops.iter().find(|h| h.id == id) {
                 let owner: Option<i64> = sqlx::query_scalar(
                     "UPDATE connections SET ssh_hostkey_pending = ?
-                     WHERE id = ? AND inline_for IS NOT NULL AND host = ? AND ssh_port = ? RETURNING inline_for",
+                     WHERE id = ? AND inline_for IS NOT NULL AND ssh_hostkey IS NULL AND host = ? AND ssh_port = ?
+                     RETURNING inline_for",
                 )
                 .bind(&fingerprint)
                 .bind(id)
@@ -223,12 +246,24 @@ async fn wake_via(state: &AppState, via: i64, template: &str, mac: [u8; 6]) -> a
 
 /// Rebond `id` d'un emplacement de `owner`, tel que l'admin le voit : hôte saisi (ligne cachée de `owner`)
 /// ou hôte connu.
-async fn hop_admin(db: &SqlitePool, owner: i64, id: Option<i64>) -> ApiResult<Option<HopAdmin>> {
+async fn hop_admin(db: &mut SqliteConnection, owner: i64, id: Option<i64>) -> ApiResult<Option<HopAdmin>> {
     let Some(id) = id else { return Ok(None) };
-    let h = find_hop(db, id).await?;
+    let h = find_hop(&mut *db, id).await?;
     if h.inline_for != Some(owner) {
         return Ok(Some(HopAdmin::Known { id }));
     }
+    // Clé en attente du premier maillon saisi qui en a une : celui-ci, ou une copie cachée par laquelle il
+    // passe, qui n'a pas d'admin à elle.
+    let pending: Option<String> = sqlx::query_scalar(concat!(
+        links!(),
+        "SELECT c.ssh_hostkey_pending FROM link JOIN connections c ON c.id = link.id
+         WHERE c.ssh_hostkey_pending IS NOT NULL ORDER BY link.n LIMIT 1"
+    ))
+    .bind(id)
+    .bind(owner)
+    .bind(crate::ssh::MAX_HOPS as i64)
+    .fetch_optional(&mut *db)
+    .await?;
     Ok(Some(HopAdmin::Host {
         host: h.host,
         port: h.ssh_port as u16,
@@ -236,25 +271,27 @@ async fn hop_admin(db: &SqlitePool, owner: i64, id: Option<i64>) -> ApiResult<Op
         has_password: h.ssh_password.is_some(),
         via_id: h.ssh_jump_id,
         hostkey: h.ssh_hostkey,
-        pending_hostkey: h.ssh_hostkey_pending,
+        pending_hostkey: pending,
     }))
 }
 
-async fn to_admin(db: &SqlitePool, r: Row) -> ApiResult<ConnectionAdmin> {
+/// Vue admin de `r`. `db` : la connexion qui a lu `r`, dans la même transaction, pour que les rebonds lus
+/// soient ceux qu'elle désigne (une suppression d'hôte convertit les références puis supprime l'hôte).
+async fn to_admin(db: &mut SqliteConnection, r: Row) -> ApiResult<ConnectionAdmin> {
     let allowed_users =
         sqlx::query_scalar("SELECT user_id FROM connection_access WHERE connection_id = ? ORDER BY user_id")
             .bind(r.id)
-            .fetch_all(db)
+            .fetch_all(&mut *db)
             .await?;
     // Commande sans rebond (hôte de réveil supprimé avant la conversion des dépendants) : rendue comme un
     // réveil direct, le réveil lui-même refuse de partir (voir `wake`).
-    let via = hop_admin(db, r.id, r.wol_via_id).await?;
+    let via = hop_admin(&mut *db, r.id, r.wol_via_id).await?;
     let wol_command = r
         .wol_ssh_command
         .clone()
         .zip(via)
         .map(|(command, via)| portique_proto::WolCommandAdmin { via, command });
-    let jump = hop_admin(db, r.id, r.ssh_jump_id).await?;
+    let jump = hop_admin(&mut *db, r.id, r.ssh_jump_id).await?;
     Ok(ConnectionAdmin {
         id: r.id,
         name: r.name,
@@ -284,16 +321,18 @@ pub async fn admin_list(
     State(state): State<AppState>,
     _: AdminUser,
 ) -> ApiResult<Json<Vec<ConnectionAdmin>>> {
+    // Une transaction de lecture : machines et rebonds vus dans le même instantané.
+    let mut tx = state.db.begin().await?;
     let rows: Vec<Row> = sqlx::query_as(concat!(
         "SELECT ",
         columns!(),
         " FROM connections WHERE inline_for IS NULL ORDER BY name COLLATE NOCASE"
     ))
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        out.push(to_admin(&state.db, r).await?);
+        out.push(to_admin(&mut tx, r).await?);
     }
     Ok(Json(out))
 }
@@ -307,11 +346,19 @@ struct Valid {
     wol_target: Option<String>,
 }
 
-/// Adresse d'un hôte (RDP, SSH, rebond saisi).
-fn host_ok(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c))
+/// Adresse d'un hôte (RDP, SSH, rebond saisi) sous la forme que `connect` utilise telle quelle : nom, IPv4,
+/// ou IPv6 sans crochets (ceux d'une saisie `[2001:db8::1]` sont retirés). `None` si elle est invalide.
+fn normalize_host(host: &str) -> Option<&str> {
+    let host = host.trim();
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if bare.contains(':') {
+        return bare.parse::<std::net::Ipv6Addr>().is_ok().then_some(bare);
+    }
+    let name = !bare.is_empty()
+        && bare.len() <= 253
+        && bare.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c));
+    // Des crochets n'entourent qu'une IPv6.
+    (name && bare == host).then_some(bare)
 }
 
 fn ssh_user_ok(user: &str) -> bool {
@@ -323,10 +370,7 @@ fn validate(i: &ConnectionInput) -> ApiResult<Valid> {
     if name.is_empty() || name.len() > 100 {
         return Err(bad("nom requis (100 caractères maximum)"));
     }
-    let host = i.host.trim();
-    if !host_ok(host) {
-        return Err(bad("hôte invalide"));
-    }
+    let host = normalize_host(&i.host).ok_or_else(|| bad("hôte invalide"))?;
     if !i.rdp && i.ssh.is_none() {
         return Err(bad("choisir au moins un protocole (RDP ou SSH)"));
     }
@@ -420,6 +464,8 @@ async fn save_ssh(
     .bind(id)
     .execute(&mut *db)
     .await?;
+    // Son terminal (la cible compte dans sa chaîne) et ceux des autres qui passent par lui.
+    check_through(db, id).await?;
     if let Some(pw) = &s.password {
         let sealed = (!pw.is_empty()).then(|| vault.seal(&format!("ssh:{id}"), pw.as_bytes()));
         sqlx::query("UPDATE connections SET ssh_password = ? WHERE id = ?")
@@ -466,9 +512,7 @@ async fn save_hop(
             *forget_hostkey,
         ),
     };
-    if !host_ok(host) {
-        return Err(bad("rebond : adresse invalide"));
-    }
+    let host = normalize_host(host).ok_or_else(|| bad("rebond : adresse invalide"))?;
     if port == 0 {
         return Err(bad("rebond : port SSH invalide"));
     }
@@ -532,12 +576,16 @@ async fn save_hop(
     // Sans boucle par `owner`, et bornée : la ligne cachée compte comme un saut.
     check_jump(db, owner, id).await?;
     if let Some(fp) = approve.as_deref().filter(|f| !f.is_empty()) {
-        // Approbation explicite : seulement la clé effectivement présentée par l'hôte.
-        let done = sqlx::query(
+        // Approbation explicite : seulement la clé effectivement présentée, par ce maillon ou une copie
+        // cachée de l'emplacement par laquelle il passe.
+        let done = sqlx::query(concat!(
+            links!(),
             "UPDATE connections SET ssh_hostkey = ssh_hostkey_pending, ssh_hostkey_pending = NULL
-             WHERE id = ? AND ssh_hostkey_pending = ?",
-        )
+             WHERE id IN (SELECT id FROM link) AND ssh_hostkey_pending = ?4"
+        ))
         .bind(id)
+        .bind(owner)
+        .bind(crate::ssh::MAX_HOPS as i64)
         .bind(fp)
         .execute(&mut *db)
         .await?;
@@ -572,7 +620,9 @@ async fn prune_inline(db: &mut SqliteConnection, owner: i64) -> ApiResult<()> {
     Ok(())
 }
 
-/// Le rebond doit être un autre hôte SSH, sans boucle (A par B par A).
+/// Le rebond doit être un autre hôte SSH, sans boucle (A par B par A), et la chaîne qui part de `jump`
+/// compter au plus `MAX_HOPS` hôtes : la borne d'un réveil. Celle d'un terminal, qui compte aussi sa
+/// cible, est vérifiée par `check_through`.
 async fn check_jump(db: &mut SqliteConnection, id: i64, jump: i64) -> ApiResult<()> {
     let mut cur = Some(jump);
     for _ in 0..crate::ssh::MAX_HOPS {
@@ -580,17 +630,56 @@ async fn check_jump(db: &mut SqliteConnection, id: i64, jump: i64) -> ApiResult<
         if c == id {
             return Err(bad("rebond en boucle : un hôte ne peut pas passer par lui-même"));
         }
-        let next: Option<(bool, Option<i64>)> =
-            sqlx::query_as("SELECT ssh_enabled, ssh_jump_id FROM connections WHERE id = ?")
+        let next: Option<(bool, Option<i64>, String)> =
+            sqlx::query_as("SELECT ssh_enabled, ssh_jump_id, name FROM connections WHERE id = ?")
                 .bind(c)
                 .fetch_optional(&mut *db)
                 .await?;
         match next {
-            Some((true, j)) => cur = j,
-            _ => return Err(bad("le rebond doit être un hôte SSH existant")),
+            Some((true, j, _)) => cur = j,
+            Some((false, _, name)) => return Err(bad(format!("le rebond « {name} » n'a pas de SSH"))),
+            None => return Err(bad("le rebond doit être un hôte SSH existant")),
         }
     }
-    Err(bad("trop de rebonds enchaînés"))
+    if cur.is_some() {
+        return Err(bad("trop de rebonds enchaînés"));
+    }
+    Ok(())
+}
+
+/// Le rebond de `id` vient de changer : les chaînes qui passent par lui (terminal d'un hôte, lui compris, ou
+/// réveil d'une machine) doivent rester dans la borne. Refus en nommant la première qui la dépasserait.
+async fn check_through(db: &mut SqliteConnection, id: i64) -> ApiResult<()> {
+    let max = crate::ssh::MAX_HOPS as i64;
+    // `down` : hôtes de la chaîne de `id`, lui compris ; `up` : lignes qui passent par `id`, à n sauts.
+    let over: Option<(String, bool)> = sqlx::query_as(
+        "WITH RECURSIVE
+             down(id, n) AS (
+                 SELECT ?1, 1
+                 UNION SELECT c.ssh_jump_id, down.n + 1 FROM down JOIN connections c ON c.id = down.id
+                     WHERE c.ssh_jump_id IS NOT NULL AND down.n <= ?2),
+             up(id, n) AS (
+                 SELECT ?1, 0
+                 UNION SELECT c.id, up.n + 1 FROM up JOIN connections c ON c.ssh_jump_id = up.id WHERE up.n <= ?2),
+             own(n) AS (SELECT max(n) FROM down)
+         SELECT c.name, 0 FROM up JOIN connections c ON c.id = up.id
+             WHERE c.inline_for IS NULL AND c.ssh_enabled AND up.n + (SELECT n FROM own) > ?2
+         UNION ALL
+         SELECT w.name, 1 FROM up JOIN connections w ON w.wol_via_id = up.id
+             WHERE w.wol_ssh_command IS NOT NULL AND up.n + (SELECT n FROM own) > ?2
+         LIMIT 1",
+    )
+    .bind(id)
+    .bind(max)
+    .fetch_optional(&mut *db)
+    .await?;
+    match over {
+        Some((name, wake)) => Err(bad(format!(
+            "chaîne trop longue pour {} de « {name} » ({max} hôtes SSH au plus)",
+            if wake { "le réveil" } else { "le terminal" }
+        ))),
+        None => Ok(()),
+    }
 }
 
 async fn save_password(
@@ -636,9 +725,10 @@ pub async fn create(
     save_wol_command(&state.vault, &mut tx, id, &i.wol_command).await?;
     save_ssh(&state.vault, &mut tx, id, &i.ssh).await?;
     prune_inline(&mut tx, id).await?;
+    let row = find_hop(&mut *tx, id).await?;
+    let view = to_admin(&mut tx, row).await?;
     tx.commit().await?;
-    let row = find_allowed(&state.db, 0, true, id).await?;
-    Ok((StatusCode::CREATED, Json(to_admin(&state.db, row).await?)))
+    Ok((StatusCode::CREATED, Json(view)))
 }
 
 pub async fn update(
@@ -679,9 +769,10 @@ pub async fn update(
             .execute(&mut *tx)
             .await?;
     }
+    let row = find_hop(&mut *tx, id).await?;
+    let view = to_admin(&mut tx, row).await?;
     tx.commit().await?;
-    let row = find_allowed(&state.db, 0, true, id).await?;
-    Ok(Json(to_admin(&state.db, row).await?))
+    Ok(Json(view))
 }
 
 pub async fn delete(
@@ -700,9 +791,12 @@ pub async fn delete(
     }
     // Qui passait par cet hôte garde son chemin : à chaque emplacement, une copie cachée (un hôte saisi) le
     // remplace, rebond compris. Ses propres lignes cachées partent avec lui (ON DELETE CASCADE) ; une ligne
-    // cachée d'une autre machine qui passait par lui reçoit une copie possédée par cette machine.
+    // cachée d'une autre machine qui passait par lui reçoit une copie possédée par cette machine. Le rebond
+    // noté d'une machine au SSH coupé n'est pas copié (ni identifiants ni mot de passe) : il s'efface avec
+    // l'hôte (ON DELETE SET NULL).
     let users: Vec<(i64, i64, bool, bool)> = sqlx::query_as(
-        "SELECT id, coalesce(inline_for, id), wol_via_id IS ?1, ssh_jump_id IS ?1 FROM connections
+        "SELECT id, coalesce(inline_for, id), wol_via_id IS ?1,
+             ssh_jump_id IS ?1 AND (ssh_enabled OR inline_for IS NOT NULL) FROM connections
          WHERE (wol_via_id = ?1 OR ssh_jump_id = ?1) AND inline_for IS NOT ?1",
     )
     .bind(id)
@@ -733,7 +827,7 @@ pub async fn delete(
 
 /// Copie cachée, pour `owner`, de l'hôte `gone` sur le point d'être supprimé, avec la suite de sa chaîne :
 /// un hôte connu reste désigné, un rebond saisi de `gone` (qui part avec lui) est copié aussi. Chaque mot de
-/// passe est rouvert puis rescellé pour sa nouvelle ligne. Renvoie la copie de `gone`.
+/// passe est rouvert puis rescellé pour sa nouvelle ligne ; un SSH coupé le reste. Renvoie la copie de `gone`.
 async fn copy_hop(vault: &Vault, db: &mut SqliteConnection, gone: i64, owner: i64) -> ApiResult<i64> {
     let mut rows = vec![find_hop(&mut *db, gone).await?];
     let mut next = rows[0].ssh_jump_id;
@@ -751,11 +845,12 @@ async fn copy_hop(vault: &Vault, db: &mut SqliteConnection, gone: i64, owner: i6
         copy = sqlx::query_scalar(
             "INSERT INTO connections (name, host, port, rdp_enabled, ssh_enabled, ssh_port, ssh_user,
                  ssh_hostkey, ssh_hostkey_pending, ssh_jump_id, inline_for)
-             VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?) RETURNING id",
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&r.name)
         .bind(&r.host)
         .bind(r.port)
+        .bind(r.ssh_enabled)
         .bind(r.ssh_port)
         .bind(&r.ssh_user)
         .bind(&r.ssh_hostkey)
@@ -787,7 +882,13 @@ pub async fn convert_legacy_wol_hosts(state: &AppState) -> anyhow::Result<()> {
     .fetch_all(&state.db)
     .await?;
     for id in ids {
-        match convert_legacy_wol_host(state, id).await {
+        let done = async {
+            let mut tx = state.db.begin().await?;
+            convert_legacy_wol_host(&state.vault, &mut tx, id).await?;
+            tx.commit().await?;
+            anyhow::Ok(())
+        };
+        match done.await {
             Ok(()) => tracing::info!(connection = id, "réveil par adresse saisie repris en hôte saisi"),
             Err(e) => tracing::error!(connection = id, "reprise du réveil par adresse saisie : {e:#}"),
         }
@@ -795,16 +896,17 @@ pub async fn convert_legacy_wol_hosts(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn convert_legacy_wol_host(state: &AppState, id: i64) -> anyhow::Result<()> {
+/// Reprise d'une machine dans la transaction `db` ; `false` si elle n'avait rien à reprendre.
+async fn convert_legacy_wol_host(vault: &Vault, db: &mut SqliteConnection, id: i64) -> anyhow::Result<bool> {
     type Legacy = (String, Option<String>, Option<Vec<u8>>, Option<String>, Option<String>);
-    let mut tx = state.db.begin().await?;
-    let (host, user, password, hostkey, pending): Legacy = sqlx::query_as(
+    let legacy: Option<Legacy> = sqlx::query_as(
         "SELECT wol_ssh_host, wol_ssh_user, wol_ssh_password, wol_ssh_hostkey, wol_ssh_hostkey_pending
          FROM connections WHERE id = ? AND wol_ssh_host IS NOT NULL AND wol_via_id IS NULL",
     )
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *db)
     .await?;
+    let Some((host, user, password, hostkey, pending)) = legacy else { return Ok(false) };
     // L'ancien réveil se connectait toujours au port 22.
     let hop: i64 = sqlx::query_scalar(
         "INSERT INTO connections (name, host, port, rdp_enabled, ssh_enabled, ssh_port, ssh_user, ssh_hostkey,
@@ -818,14 +920,14 @@ async fn convert_legacy_wol_host(state: &AppState, id: i64) -> anyhow::Result<()
     .bind(hostkey)
     .bind(pending)
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *db)
     .await?;
     if let Some(sealed) = password {
-        let pw = state.vault.open(&format!("wol-ssh:{id}"), &sealed)?;
+        let pw = vault.open(&format!("wol-ssh:{id}"), &sealed)?;
         sqlx::query("UPDATE connections SET ssh_password = ? WHERE id = ?")
-            .bind(state.vault.seal(&format!("ssh:{hop}"), &pw))
+            .bind(vault.seal(&format!("ssh:{hop}"), &pw))
             .bind(hop)
-            .execute(&mut *tx)
+            .execute(&mut *db)
             .await?;
     }
     sqlx::query(
@@ -834,10 +936,9 @@ async fn convert_legacy_wol_host(state: &AppState, id: i64) -> anyhow::Result<()
     )
     .bind(hop)
     .bind(id)
-    .execute(&mut *tx)
+    .execute(&mut *db)
     .await?;
-    tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -978,7 +1079,7 @@ mod tests {
             .execute(&s.db)
             .await
             .unwrap();
-        let hops = crate::api::ssh::chain(&s, find_hop(&s.db, pc).await.unwrap()).await.unwrap();
+        let hops = crate::api::ssh::chain(&s, pc).await.unwrap();
         assert_eq!(hops.iter().map(|h| h.id).collect::<Vec<_>>(), [row, pc]);
     }
 
@@ -1183,7 +1284,9 @@ mod tests {
     }
 
     /// Faux serveur SSH local : présente sa clé d'hôte, n'accepte personne. Renvoie (port, empreinte).
-    async fn fake_sshd() -> (u16, String) {
+    /// `pin` : à chaque connexion, avant de répondre, épingle sa clé sur les rebonds saisis qui le visent
+    /// (comme un terminal qui l'approuverait pendant un réveil).
+    async fn fake_sshd(pin: Option<sqlx::SqlitePool>) -> (u16, String) {
         use russh::keys::{HashAlg, PrivateKey, ssh_key::private::Ed25519Keypair};
         struct Refuse;
         impl russh::server::Handler for Refuse {
@@ -1194,8 +1297,20 @@ mod tests {
         let config = std::sync::Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let fp = fingerprint.clone();
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
+                if let Some(db) = &pin {
+                    sqlx::query(
+                        "UPDATE connections SET ssh_hostkey = ? WHERE host = '127.0.0.1' AND ssh_port = ?
+                         AND inline_for IS NOT NULL",
+                    )
+                    .bind(&fp)
+                    .bind(i64::from(port))
+                    .execute(db)
+                    .await
+                    .unwrap();
+                }
                 let config = config.clone();
                 tokio::spawn(async move {
                     if let Ok(session) = russh::server::run_stream(config, sock, Refuse).await {
@@ -1211,7 +1326,7 @@ mod tests {
     async fn wake_holds_inline_hostkey_for_approval() {
         let s = state("builtin").await;
         let a = admin(&s).await;
-        let (port, fingerprint) = fake_sshd().await;
+        let (port, fingerprint) = fake_sshd(None).await;
         let mut hop = host("127.0.0.1", None);
         hop["port"] = json!(port);
         let pc = save(&s, None, machine(Some(hop.clone()), None)).await.unwrap().id;
@@ -1301,7 +1416,7 @@ mod tests {
             assert_eq!(password(&s, c).await, "pw-d", "rescellé pour la copie");
             assert_eq!(scalar::<String>(&s, "SELECT name FROM connections WHERE id = ?", c).await, "d");
         }
-        let hops = crate::api::ssh::chain(&s, find_hop(&s.db, pc).await.unwrap()).await.unwrap();
+        let hops = crate::api::ssh::chain(&s, pc).await.unwrap();
         assert_eq!(hops.iter().map(|h| h.id).collect::<Vec<_>>(), [j, jump, pc], "chaîne conservée");
         // Renvoyée par l'admin, la copie garde son nom ; une autre adresse le remplace.
         let mut same =
@@ -1317,7 +1432,7 @@ mod tests {
 
         // Copie de e, puis copie de son hôte saisi (supprimé avec lui), puis j.
         let ec: i64 = scalar(&s, "SELECT wol_via_id FROM connections WHERE id = ?", laptop).await;
-        let hops = crate::api::ssh::chain(&s, find_hop(&s.db, ec).await.unwrap()).await.unwrap();
+        let hops = crate::api::ssh::chain(&s, ec).await.unwrap();
         assert_eq!(hops.len(), 3, "j, copie du saisi de e, copie de e");
         assert_eq!((hops[0].id, hops[1].host.as_str(), hops[2].host.as_str()), (j, "192.0.2.4", "192.0.2.3"));
         assert_eq!(password(&s, hops[1].id).await, "pw-saisi");
@@ -1357,7 +1472,7 @@ mod tests {
             "copie à y"
         );
         assert_eq!(password(&s, dc).await, "pw-d");
-        let hops = crate::api::ssh::chain(&s, find_hop(&s.db, r).await.unwrap()).await.unwrap();
+        let hops = crate::api::ssh::chain(&s, r).await.unwrap();
         assert_eq!(hops.iter().map(|h| h.id).collect::<Vec<_>>(), [j, dc, r], "chaîne conservée");
         let via = get(&s, y).await.wol_command.unwrap().via;
         let HopAdmin::Host { via_id, .. } = via else { panic!("hôte saisi") };
@@ -1368,5 +1483,227 @@ mod tests {
         assert_eq!(scalar::<i64>(&s, "SELECT ssh_jump_id FROM connections WHERE id = ?", r).await, dc);
         save(&s, Some(y), machine(Some(host("192.0.2.9", None)), None)).await.unwrap();
         assert_eq!(hidden(&s).await, 1, "seul r reste");
+    }
+
+    // Revue de la PR 10.
+
+    /// Liste admin et chaîne lisent la machine et ses rebonds dans un même instantané : la suppression d'un
+    /// hôte entre deux lectures (références converties, puis hôte supprimé) ne fait pas échouer la lecture.
+    #[tokio::test]
+    async fn admin_view_and_chain_read_one_snapshot() {
+        // Base sur disque (WAL) : une lecture en cours sur une connexion, la suppression sur une autre.
+        let path = std::env::temp_dir().join(format!("portique-instantane-{}.db", std::process::id()));
+        let db = crate::open_db(&format!("sqlite://{}", path.display())).await.unwrap();
+        let s = state_on("builtin", db).await;
+        let g = known(&s, "g", "192.0.2.1", None).await;
+        let to_g = || json!({"kind": "known", "id": g});
+        let m = save(&s, None, machine(Some(to_g()), Some(Some(to_g())))).await.unwrap().id;
+        let mut read = s.db.begin().await.unwrap();
+        let row = find_hop(&mut *read, m).await.unwrap();
+        delete(State(s.clone()), AdminUser(admin(&s).await), Path(g)).await.unwrap();
+        assert!(find_hop(&s.db, g).await.is_err(), "hors de l'instantané, g n'existe plus");
+        let view = super::to_admin(&mut read, row).await.unwrap();
+        assert_eq!(view.ssh.unwrap().jump, Some(HopAdmin::Known { id: g }));
+        assert_eq!(view.wol_command.unwrap().via, HopAdmin::Known { id: g });
+        let hops = crate::api::ssh::chain_in(&mut read, &s.vault, m).await.unwrap();
+        assert_eq!(hops.iter().map(|h| h.id).collect::<Vec<_>>(), [g, m]);
+        drop(read);
+        s.db.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// Cinq hôtes SSH au plus par chaîne : un réveil en compte cinq, un terminal quatre rebonds et sa cible.
+    #[tokio::test]
+    async fn chain_budgets_for_wake_and_terminal() {
+        let s = state("builtin").await;
+        // k1 ← k2 ← k3 ← k4 : chaîne de k4 = k4, k3, k2, k1.
+        let mut k = known(&s, "k1", "192.0.2.1", None).await;
+        let mut ks = vec![k];
+        for i in 2..=5 {
+            k = known(&s, &format!("k{i}"), &format!("192.0.2.{i}"), Some(json!({"kind": "known", "id": k})))
+                .await;
+            ks.push(k);
+        }
+        // Réveil par un hôte saisi derrière k4 : 5 hôtes, accepté ; derrière k5 : 6, refusé.
+        assert!(save(&s, None, machine(Some(host("192.0.2.9", Some(ks[3]))), None)).await.is_ok());
+        let r = save(&s, None, machine(Some(host("192.0.2.9", Some(ks[4]))), None)).await;
+        assert!(matches!(r, Err(AppError::BadRequest(_))), "6 hôtes");
+        // Terminal par k4 : cible + 4 rebonds, accepté ; par k5 : refusé.
+        assert!(
+            save(&s, None, machine(None, Some(Some(json!({"kind": "known", "id": ks[3]}))))).await.is_ok()
+        );
+        let r = save(&s, None, machine(None, Some(Some(json!({"kind": "known", "id": ks[4]}))))).await;
+        assert!(matches!(r, Err(AppError::BadRequest(_))), "cible + 5 rebonds");
+    }
+
+    /// Le rebond d'un relais change : les chaînes des autres qui passent par lui restent dans la borne.
+    #[tokio::test]
+    async fn relay_change_keeps_other_chains_bounded() {
+        let s = state("builtin").await;
+        let g = known(&s, "g", "192.0.2.1", None).await;
+        let d = known(&s, "d", "192.0.2.2", Some(json!({"kind": "known", "id": g}))).await;
+        let c = known(&s, "c", "192.0.2.3", Some(json!({"kind": "known", "id": d}))).await;
+        let b = known(&s, "b", "192.0.2.4", Some(json!({"kind": "known", "id": c}))).await;
+        // Terminal de a : a, b, c, d, g.
+        let a = known(&s, "a", "192.0.2.5", Some(json!({"kind": "known", "id": b}))).await;
+        let g_jump = |jump: Option<Value>| json!({"name": "g", "host": "192.0.2.1", "rdp": false, "ssh": {"user": "root", "port": 2222, "jump": jump}});
+        let r = save(&s, Some(g), g_jump(Some(host("192.0.2.6", None)))).await;
+        let Err(AppError::BadRequest(msg)) = r else { panic!("{r:?}") };
+        assert!(msg.contains("terminal de « a »"), "{msg}");
+        assert_eq!(hidden(&s).await, 0, "rien d'écrit");
+        // SSH de a coupé ; réveil de w par un hôte saisi derrière b : r, b, c, d, g.
+        save(&s, Some(a), json!({"name": "a", "host": "192.0.2.5", "rdp": true})).await.unwrap();
+        let w = save(&s, None, machine(Some(host("192.0.2.9", Some(b))), None)).await.unwrap();
+        let r = save(&s, Some(g), g_jump(Some(host("192.0.2.6", None)))).await;
+        let Err(AppError::BadRequest(msg)) = r else { panic!("{r:?}") };
+        assert!(msg.contains(&format!("réveil de « {} »", w.name)), "{msg}");
+        // Réveil direct : plus rien ne passe par g à cette profondeur.
+        save(&s, Some(w.id), machine(None, None)).await.unwrap();
+        save(&s, Some(g), g_jump(Some(host("192.0.2.6", None)))).await.unwrap();
+    }
+
+    /// Réveil par un hôte saisi qui passe par une copie cachée (hôte connu supprimé avant d'avoir sa clé) :
+    /// la clé en attente de la copie s'affiche et s'approuve dans l'admin de la machine.
+    #[tokio::test]
+    async fn nested_copy_hostkey_is_approvable() {
+        let s = state("builtin").await;
+        let a = admin(&s).await;
+        let (port, fingerprint) = fake_sshd(None).await;
+        let d = save(
+            &s,
+            None,
+            json!({"name": "d", "host": "127.0.0.1", "rdp": false,
+            "ssh": {"user": "root", "port": port}}),
+        )
+        .await
+        .unwrap()
+        .id;
+        let y = save(&s, None, machine(Some(host("192.0.2.9", Some(d))), None)).await.unwrap().id;
+        delete(State(s.clone()), AdminUser(a.clone()), Path(d)).await.unwrap();
+        let r = wake(State(s.clone()), CurrentUser(a.clone()), Path(y)).await;
+        let Err(AppError::BadRequest(msg)) = r else { panic!("{r:?}") };
+        assert!(msg.contains("à approuver dans l'admin de « PC »"), "{msg}");
+        let HopAdmin::Host { pending_hostkey, via_id, .. } = get(&s, y).await.wol_command.unwrap().via else {
+            panic!("hôte saisi")
+        };
+        assert_eq!(pending_hostkey.as_deref(), Some(fingerprint.as_str()), "clé de la copie affichée");
+        let copy = via_id.unwrap();
+
+        // Une clé en attente hors de la chaîne de y (autre machine) ne s'approuve pas d'ici.
+        let z = save(&s, None, machine(Some(host("192.0.2.8", None)), None)).await.unwrap().id;
+        sqlx::query("UPDATE connections SET ssh_hostkey_pending = 'SHA256:ailleurs' WHERE inline_for = ?")
+            .bind(z)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let mut hop = host("192.0.2.9", Some(copy));
+        hop["password"] = Value::Null;
+        hop["approve_hostkey"] = json!("SHA256:ailleurs");
+        assert!(save(&s, Some(y), machine(Some(hop.clone()), None)).await.is_err());
+
+        hop["approve_hostkey"] = json!(fingerprint);
+        save(&s, Some(y), machine(Some(hop), None)).await.unwrap();
+        let key: Option<String> = scalar(&s, "SELECT ssh_hostkey FROM connections WHERE id = ?", copy).await;
+        assert_eq!(key.as_deref(), Some(fingerprint.as_str()), "approuvée sur la copie");
+        let HopAdmin::Host { pending_hostkey, .. } = get(&s, y).await.wol_command.unwrap().via else {
+            panic!()
+        };
+        assert_eq!(pending_hostkey, None);
+    }
+
+    /// Un terminal épingle la clé pendant le réveil : le réveil ne la remet pas en attente.
+    #[tokio::test]
+    async fn wake_does_not_hold_a_key_pinned_meanwhile() {
+        let s = state("builtin").await;
+        let (port, fingerprint) = fake_sshd(Some(s.db.clone())).await;
+        let mut hop = host("127.0.0.1", None);
+        hop["port"] = json!(port);
+        let pc = save(&s, None, machine(Some(hop), None)).await.unwrap().id;
+        let r = wake(State(s.clone()), CurrentUser(admin(&s).await), Path(pc)).await;
+        assert!(matches!(r, Err(AppError::BadRequest(_))), "{r:?}");
+        let HopAdmin::Host { pending_hostkey, hostkey, .. } = get(&s, pc).await.wol_command.unwrap().via
+        else {
+            panic!("hôte saisi")
+        };
+        assert_eq!((hostkey.as_deref(), pending_hostkey), (Some(fingerprint.as_str()), None));
+    }
+
+    /// Le rebond noté d'une machine au SSH coupé disparaît avec l'hôte supprimé, sans copie de ses identifiants.
+    #[tokio::test]
+    async fn delete_drops_inactive_ssh_jump() {
+        let s = state("builtin").await;
+        let g = known(&s, "g", "192.0.2.1", None).await;
+        let to_g = || json!({"kind": "known", "id": g});
+        let pc = save(&s, None, machine(Some(to_g()), Some(Some(to_g())))).await.unwrap().id;
+        save(&s, Some(pc), machine(Some(to_g()), None)).await.unwrap();
+        delete(State(s.clone()), AdminUser(admin(&s).await), Path(g)).await.unwrap();
+        let jump: Option<i64> = scalar(&s, "SELECT ssh_jump_id FROM connections WHERE id = ?", pc).await;
+        assert_eq!(jump, None);
+        assert_eq!(hidden(&s).await, 1, "seul le réveil (actif) est converti");
+    }
+
+    /// Une adresse acceptée sert telle quelle à la connexion : IPv6 sans crochets, nom, IPv4.
+    #[tokio::test]
+    async fn addresses_are_usable_as_is() {
+        use super::normalize_host as n;
+        assert_eq!(n(" [2001:db8::20] "), Some("2001:db8::20"));
+        assert_eq!(n("2001:db8::20"), Some("2001:db8::20"));
+        assert_eq!(n("pc-1.example.com"), Some("pc-1.example.com"));
+        for bad in ["[192.0.2.1]", "[pc]", "pc:22", "192.0.2.1:22", "[2001:db8::20", "[[::1]]", "", "a b"] {
+            assert_eq!(n(bad), None, "{bad:?}");
+        }
+        let s = state("builtin").await;
+        let mut body = machine(Some(host("[2001:db8::21]", None)), Some(Some(host("[2001:db8::22]", None))));
+        body["host"] = json!("[2001:db8::20]");
+        let pc = save(&s, None, body).await.unwrap();
+        assert_eq!(pc.host, "2001:db8::20");
+        let HopAdmin::Host { host: wol, .. } = pc.wol_command.unwrap().via else { panic!() };
+        let Some(HopAdmin::Host { host: jump, .. }) = pc.ssh.unwrap().jump else { panic!() };
+        assert_eq!((wol.as_str(), jump.as_str()), ("2001:db8::21", "2001:db8::22"));
+        for (target, hop) in [("[192.0.2.1]", "192.0.2.2"), ("192.0.2.1", "192.0.2.2:22")] {
+            let mut body = machine(Some(host(hop, None)), None);
+            body["host"] = json!(target);
+            assert!(save(&s, None, body).await.is_err(), "{target} / {hop}");
+        }
+    }
+
+    /// Ancien réveil que le démarrage n'a pas repris : une modification sans rapport ne l'efface pas. Repris
+    /// alors si possible ; sinon la modification est refusée et ses réglages restent.
+    #[tokio::test]
+    async fn unconverted_legacy_wol_survives_an_update() {
+        let s = state("builtin").await;
+        let pc = save(&s, None, json!({"name": "PC", "host": "192.0.2.50", "wol_mac": "00:11:22:33:44:55"}))
+            .await
+            .unwrap()
+            .id;
+        let legacy = |sealed: Vec<u8>| {
+            sqlx::query(
+                "UPDATE connections SET wol_ssh_host = '192.0.2.1', wol_ssh_user = 'admin', wol_ssh_password = ?,
+                 wol_ssh_command = 'wakeonlan {mac}', wol_ssh_hostkey = 'SHA256:epinglee' WHERE id = ?",
+            )
+            .bind(sealed)
+            .bind(pc)
+            .execute(&s.db)
+        };
+        // Illisible (scellé pour une autre ligne) : modification refusée, réglages intacts.
+        legacy(s.vault.seal("wol-ssh:0", b"pw-rebond")).await.unwrap();
+        let unrelated = json!({"name": "Renommé", "host": "192.0.2.50", "wol_mac": "00:11:22:33:44:55"});
+        assert!(matches!(save(&s, Some(pc), unrelated.clone()).await, Err(AppError::BadRequest(_))));
+        let kept: Option<String> = scalar(&s, "SELECT wol_ssh_host FROM connections WHERE id = ?", pc).await;
+        assert_eq!(kept.as_deref(), Some("192.0.2.1"));
+        // Lisible : repris pendant la modification, et gardé bien que l'admin l'ait vu comme un réveil direct.
+        legacy(s.vault.seal(&format!("wol-ssh:{pc}"), b"pw-rebond")).await.unwrap();
+        let back = save(&s, Some(pc), unrelated).await.unwrap();
+        assert_eq!(back.name, "Renommé");
+        let wol = back.wol_command.expect("réveil gardé");
+        let HopAdmin::Host { host, hostkey, has_password, .. } = wol.via else { panic!("hôte saisi") };
+        assert_eq!(
+            (host.as_str(), hostkey.as_deref(), has_password),
+            ("192.0.2.1", Some("SHA256:epinglee"), true)
+        );
+        let hop: i64 = scalar(&s, "SELECT wol_via_id FROM connections WHERE id = ?", pc).await;
+        assert_eq!(password(&s, hop).await, "pw-rebond");
     }
 }

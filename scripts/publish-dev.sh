@@ -22,7 +22,10 @@ up="docker compose pull -q && docker compose up -d"
 if [[ -n ${DEPLOY_DIR:-} ]]; then
   ssh "$DOCKER_SSH" "cd $(quote "$DEPLOY_DIR") && $up"
 fi
-# Autres déploiements (facultatif), joints en SSH DEPUIS l'hôte Docker : « hôte:dossier » séparés par des espaces.
-for d in ${DEPLOY_OTHERS:-}; do
+# Autres déploiements (facultatif), joints en SSH DEPUIS l'hôte Docker : « hôte:dossier » séparés par « ; »
+# (un dossier peut contenir des espaces).
+IFS=';' read -r -a others <<<"${DEPLOY_OTHERS:-}"
+for d in "${others[@]}"; do
+  [[ -n ${d// /} ]] || continue
   ssh "$DOCKER_SSH" "ssh $(quote "${d%%:*}") $(quote "cd $(quote "${d#*:}") && $up")"
 done

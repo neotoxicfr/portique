@@ -486,6 +486,10 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
         assert_eq!((hop["host"].as_str(), hop["user"].as_str()), (Some("10.0.0.2"), Some("root")));
         assert_eq!(hop["has_password"], true);
     }
+    // Copies d'une passerelle au SSH coupé : coupées aussi, le réveil reste refusé.
+    let r = call(&app, "POST", &format!("/api/connections/{pc_id}/wake"), Some(&admin), None, &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body["error"].as_str().unwrap().contains("n'a pas de SSH"), "{:?}", r.body);
 
     // Clé du service : créée une fois, stable ensuite.
     let k1 = call(&app, "GET", "/api/admin/ssh-key", Some(&admin), None, &[]).await.body;

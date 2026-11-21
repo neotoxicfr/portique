@@ -15,14 +15,16 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use portique_proto::{AuthMode, ServiceKey, SshControl, SshMessage};
 use russh::ChannelMsg;
+use sqlx::SqliteConnection;
 
 use crate::{
     api::{
         account::terminal_prefs,
-        connections::{Row, find_allowed, find_hop},
+        connections::{find_allowed, find_hop},
         session::{REVALIDATE_EVERY, same_origin, still_allowed},
     },
     auth::{AdminUser, ClientIp, CurrentUser, UserRow},
+    crypto::Vault,
     ssh::{self, Hop, OpenError},
     state::{ApiResult, AppError, AppState, bad},
 };
@@ -131,12 +133,20 @@ async fn prepare(
         None => None,
     };
     let host_theme = row.ssh_theme.clone();
-    Ok((chain(state, row).await?, host_theme, trust))
+    Ok((chain(state, row.id).await?, host_theme, trust))
 }
 
-/// Chaîne des sauts, premier rebond d'abord, cible en dernier. Les rebonds n'ont pas à être
+/// Chaîne des sauts, premier rebond d'abord, cible en dernier, lue dans une transaction : une suppression
+/// d'hôte qui convertit les références entre deux lectures ne la casse pas. Les rebonds n'ont pas à être
 /// accessibles à l'utilisateur : seul l'accès à la cible compte.
-pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> {
+pub(crate) async fn chain(state: &AppState, target: i64) -> ApiResult<Vec<Hop>> {
+    let mut tx = state.db.begin().await?;
+    chain_in(&mut tx, &state.vault, target).await
+}
+
+/// `chain` sur une connexion déjà ouverte (et son instantané).
+pub(crate) async fn chain_in(db: &mut SqliteConnection, vault: &Vault, target: i64) -> ApiResult<Vec<Hop>> {
+    let target = find_hop(&mut *db, target).await?;
     // Vérifié ici pour tous les appelants (terminal, réveil par un hôte) : le SSH a pu être coupé depuis.
     if !target.ssh_enabled {
         return Err(bad(format!("« {} » n'a pas de SSH", target.name)));
@@ -146,7 +156,7 @@ pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> 
         if rows.len() >= ssh::MAX_HOPS || rows.iter().any(|r| r.id == jump) {
             return Err(bad("chaîne de rebonds invalide (boucle ou trop longue)"));
         }
-        let r = find_hop(&state.db, jump).await?;
+        let r = find_hop(&mut *db, jump).await?;
         if !r.ssh_enabled {
             return Err(bad(format!("le rebond « {} » n'a pas de SSH", r.name)));
         }
@@ -156,10 +166,9 @@ pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> 
     rows.into_iter()
         .map(|r| {
             let password = match &r.ssh_password {
-                Some(sealed) => Some(
-                    String::from_utf8_lossy(&state.vault.open(&format!("ssh:{}", r.id), sealed)?)
-                        .into_owned(),
-                ),
+                Some(sealed) => {
+                    Some(String::from_utf8_lossy(&vault.open(&format!("ssh:{}", r.id), sealed)?).into_owned())
+                }
                 None => None,
             };
             Ok(Hop {

@@ -478,12 +478,17 @@ impl Hop {
         }
     }
 
-    /// Hôte connu supprimé : la sélection retombe sur `none`. Le « par » de l'hôte saisi, lui, reste : il peut
-    /// désigner la copie cachée laissée par une suppression (absente de la liste), que le serveur garde si elle
-    /// revient inchangée ; la vider couperait la chaîne.
-    fn forget_missing(&self, ids: &[String], none: &str) {
+    /// Hôte connu choisi puis supprimé : le serveur a converti ou effacé le rebond ; on reprend ce qu'il renvoie
+    /// pour la machine éditée (`server`), jamais un « aucun » silencieux qui l'enregistrerait en direct. Machine
+    /// pas encore enregistrée : la sélection retombe sur `none`, visible. Le « par » d'un hôte saisi reste : il peut
+    /// désigner la copie cachée laissée par une suppression (absente de la liste), gardée si elle revient inchangée.
+    fn reconcile(&self, ids: &[String], saved: bool, server: Option<&HopAdmin>, none: &str) {
         if self.sel.with(|v| v != "host" && !v.is_empty() && !ids.contains(v)) {
-            self.sel.set(none.to_owned());
+            if saved {
+                self.fill(server, none);
+            } else {
+                self.sel.set(none.to_owned());
+            }
         }
     }
 }
@@ -775,11 +780,16 @@ fn Editor(
     };
 
     let non_admins = move || users.get().into_iter().filter(|u| !u.is_admin).collect::<Vec<_>>();
-    // Rebond supprimé : le serveur l'a déjà converti ou oublié, la liste aussi.
+    // Rebond supprimé : le serveur l'a déjà converti ou effacé ; le formulaire reprend son état.
     Effect::new(move || {
         let ids: Vec<String> = conns.with(|l| l.iter().map(|c| c.id.to_string()).collect());
-        f.ssh_hop.forget_missing(&ids, "");
-        f.cmd_hop.forget_missing(&ids, "host");
+        let fresh =
+            f.editing.get_untracked().and_then(|id| conns.with(|l| l.iter().find(|c| c.id == id).cloned()));
+        let saved = fresh.is_some();
+        let jump = fresh.as_ref().and_then(|c| c.ssh.as_ref()).and_then(|s| s.jump.as_ref());
+        f.ssh_hop.reconcile(&ids, saved, jump, "");
+        let via = fresh.as_ref().and_then(|c| c.wol_command.as_ref()).map(|w| &w.via);
+        f.cmd_hop.reconcile(&ids, saved, via, "host");
     });
 
     view! {
@@ -1198,13 +1208,22 @@ mod tests {
         // « Par » vers la copie cachée d'un hôte supprimé : absente de la liste, mais renvoyée telle quelle.
         let h = Hop::default();
         h.fill(Some(&host_hop()), "");
-        h.forget_missing(&["9".to_owned()], "");
+        h.reconcile(&["9".to_owned()], true, None, "");
         assert_eq!(h.via.get_untracked(), "4");
         assert_eq!(h.sel.get_untracked(), "host");
-        // Hôte connu choisi puis supprimé : la sélection retombe sur `none`.
+        // Hôte connu choisi puis supprimé : on reprend la copie que le serveur a créée, pas « aucun ».
         h.sel.set("7".into());
-        h.forget_missing(&["9".to_owned()], "");
+        h.reconcile(&["9".to_owned()], true, Some(&host_hop()), "");
+        assert_eq!(h.sel.get_untracked(), "host");
+        assert_eq!(h.input().map(|i| matches!(i, HopInput::Host { .. })), Some(true));
+        // Le serveur a effacé le rebond (SSH coupé) : « aucun », comme lui.
+        h.sel.set("7".into());
+        h.reconcile(&["9".to_owned()], true, None, "");
         assert_eq!(h.sel.get_untracked(), "");
+        // Machine pas encore enregistrée : la sélection retombe sur `none`, visible.
+        h.sel.set("7".into());
+        h.reconcile(&["9".to_owned()], false, None, "host");
+        assert_eq!(h.sel.get_untracked(), "host");
     }
 
     #[test]

@@ -20,11 +20,13 @@ const MAX_PER_IP: usize = 20;
 /// (un parcours complet à chaque appel, sous le verrou commun, ralentirait toutes les connexions). Toujours
 /// pleine de clés actives, elle n'évince rien (ce serait rendre ses compteurs à un attaquant) et ne ferme
 /// pas non plus la porte à tous : les clés déjà suivies gardent leurs plafonds, les nouvelles sont comptées
-/// par préfixe grossier (/24, /48), puis, si ces seaux débordent aussi, dans un seau commun plafonné.
-const MAX_KEYS: usize = 10_000;
+/// par préfixe grossier (/24, /48) et par (préfixe, identifiant), puis, si ces seaux débordent aussi, dans
+/// un seau commun plafonné. Compromis assumé : sous une inondation qui remplit 100 000 clés et 10 000
+/// préfixes (des milliers d'adresses), les nouveaux venus attendent ; les comptes déjà suivis passent.
+const MAX_KEYS: usize = 100_000;
 const PURGE_EVERY: Duration = Duration::from_secs(60);
 /// Seaux de débordement : nombre de préfixes suivis, tentatives par préfixe, tentatives du seau commun.
-const MAX_PREFIXES: usize = 1_024;
+const MAX_PREFIXES: usize = 10_000;
 const MAX_PER_PREFIX: usize = 20;
 const MAX_COMMON: usize = 200;
 
@@ -152,24 +154,51 @@ impl LoginLimiter {
             *purged = Some(now);
         }
         if !room(map) {
-            // Pleine de clés actives : comptée dans un seau grossier, sans verdict possible (un succès n'y
-            // rend rien), ce qui ne pénalise que les nouveaux venus pendant la saturation.
-            let prefix = prefix_key(ip);
-            let (bucket, cap) = if overflow.contains_key(&prefix) || overflow.len() < MAX_PREFIXES {
-                (prefix, MAX_PER_PREFIX)
-            } else {
-                ("*".to_owned(), MAX_COMMON)
-            };
-            let v = overflow.entry(bucket).or_default();
-            v.retain(|t| now.duration_since(*t) < WINDOW);
-            if v.len() >= cap {
+            // Pleine de clés actives. Les clés déjà suivies (adresse, compte) gardent leur plafond et
+            // comptent la tentative ; ce qui manque est compté dans des seaux grossiers, sans verdict possible
+            // (un succès n'y rend rien), ce qui ne pénalise que les nouveaux venus pendant la saturation.
+            let tracked_full = keys.iter().any(|(k, max)| {
+                map.get_mut(k).is_some_and(|v| {
+                    v.retain(|(t, _)| now.duration_since(*t) < WINDOW);
+                    v.len() >= *max
+                })
+            });
+            if tracked_full {
                 return None;
             }
-            v.push(now);
+            let prefix = prefix_key(ip);
+            let user = format!("{prefix}|{}", username.to_ascii_lowercase());
+            let mut buckets = Vec::new();
+            for (bucket, cap) in [(prefix, MAX_PER_PREFIX), (user, MAX_PER_ACCOUNT)] {
+                if overflow.contains_key(&bucket) || overflow.len() < MAX_PREFIXES {
+                    buckets.push((bucket, cap));
+                } else {
+                    buckets.push(("*".to_owned(), MAX_COMMON));
+                    break;
+                }
+            }
+            let full = buckets.iter().any(|(b, cap)| {
+                overflow.get_mut(b).is_some_and(|v| {
+                    v.retain(|t| now.duration_since(*t) < WINDOW);
+                    v.len() >= *cap
+                })
+            });
+            if full {
+                return None;
+            }
+            for (b, _) in buckets {
+                overflow.entry(b).or_default().push(now);
+            }
             let n = self.next.fetch_add(1, Ordering::Relaxed);
+            for (k, _) in &keys {
+                if let Some(v) = map.get_mut(k) {
+                    v.push((now, n));
+                }
+            }
             in_flight.insert(n);
             drop(inner);
-            return Some(Ticket { limiter: Arc::clone(self), n, keys: [String::new(), String::new()] });
+            let [(account, _), (ip, _)] = keys;
+            return Some(Ticket { limiter: Arc::clone(self), n, keys: [account, ip] });
         }
         let allowed = room(map)
             && keys.iter().all(|(k, max)| {
@@ -275,17 +304,25 @@ mod tests {
         {
             let mut inner = l.inner.lock().unwrap();
             inner.attempts.insert("ancienne".into(), vec![(old, u64::MAX)]);
-            for k in 1..MAX_KEYS {
+            for k in 2..MAX_KEYS {
                 inner.attempts.insert(format!("x{k}"), vec![(Instant::now(), u64::MAX)]);
             }
+            // Une adresse déjà suivie, à son plafond.
+            inner.attempts.insert("192.0.2.77".into(), vec![(Instant::now(), u64::MAX); MAX_PER_IP]);
             inner.purged = Some(Instant::now());
         }
+        assert!(l.reserve(IpAddr::from([192, 0, 2, 77]), "nouveau").is_none(), "plafond de l'adresse suivie");
         // Même /24 : MAX_PER_PREFIX nouveaux venus, puis refus ; un autre préfixe passe encore.
         for k in 0..MAX_PER_PREFIX {
             let who = format!("eve{k}");
             assert!(l.reserve(IpAddr::from([192, 0, 2, 9]), &who).is_some(), "débordement {k}");
         }
         assert!(l.reserve(IpAddr::from([192, 0, 2, 10]), "mallory").is_none(), "préfixe plein");
+        // Même identifiant depuis un autre /24 : plafond d'un compte (5) dans le débordement aussi.
+        for _ in 0..MAX_PER_ACCOUNT {
+            assert!(l.reserve(IpAddr::from([203, 0, 113, 1]), "victime").is_some());
+        }
+        assert!(l.reserve(IpAddr::from([203, 0, 113, 2]), "victime").is_none(), "compte plafonné");
         assert!(l.reserve(IpAddr::from([198, 51, 100, 1]), "bob").is_some(), "autre préfixe");
         let inner = l.inner.lock().unwrap();
         assert_eq!(inner.attempts.len(), MAX_KEYS);

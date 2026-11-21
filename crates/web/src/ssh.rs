@@ -303,7 +303,6 @@ pub fn SshPage() -> impl IntoView {
                         combos.set(c);
                         status.set(Status::Connected);
                         lm.refit();
-                        lm.term.focus();
                     }
                     Ok(SshMessage::UntrustedHostKey { connection_id, name, fingerprint, can_approve }) => {
                         status.set(Status::UntrustedKey { connection_id, name, fingerprint, can_approve })
@@ -445,11 +444,33 @@ pub fn SshPage() -> impl IntoView {
         }
     };
 
+    // Alerte affichée : l'en-tête, le terminal et la barre de touches passent en `inert` (ni clic, ni
+    // Tab, ni frappe vers l'hôte), le focus va sur la première action de l'alerte, puis revient au
+    // terminal une fois connecté. Après l'image suivante : `inert` n'est posé ou levé qu'ensuite.
+    let blocked = move || !matches!(status.get(), Status::Connected);
+    Effect::new(move |_| {
+        let b = blocked();
+        request_animation_frame(move || {
+            if b {
+                if let Some(el) = document()
+                    .query_selector(".session-overlay :is(button, a)")
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = el.focus();
+                }
+            } else if let Some(Some(l)) = live.try_get_value() {
+                l.term.focus();
+            }
+        });
+    });
+
     view! {
         <div class="ssh"
             style:height=move || frame.get().map(|(h, _)| format!("{h}px"))
             style:top=move || frame.get().map(|(_, t)| format!("{t}px"))>
-            <div class="ssh-top">
+            <div class="ssh-top" inert=blocked>
                 <a href="/" class="ssh-back" title="Retour aux connexions" aria-label="Retour aux connexions">{crate::icon(glyphs::BACK)}</a>
                 <span class="ssh-name">{move || host_name.get()}</span>
                 <button class="ssh-toggle" title="Afficher ou masquer la barre de touches" aria-label="Barre de touches" aria-pressed=move || show_bar.get().to_string() on:click=move |_| {
@@ -462,9 +483,9 @@ pub fn SshPage() -> impl IntoView {
                     let _ = window().request_animation_frame(cb.unchecked_ref());
                 }>{crate::icon(glyphs::KEYBOARD)}</button>
             </div>
-            <div class="ssh-term" node_ref=term_ref></div>
+            <div class="ssh-term" node_ref=term_ref inert=blocked></div>
             <Show when=move || show_bar.get()>
-                <div class="keybar">
+                <div class="keybar" inert=blocked>
                     {key("Échap", "Échap", b"\x1b")}
                     {key("Tab", "Tabulation", b"\t")}
                     {sticky("Ctrl", ctrl)}

@@ -14,7 +14,7 @@ use std::{
 };
 
 const WINDOW: Duration = Duration::from_secs(15 * 60);
-const MAX_PER_ACCOUNT: usize = 5;
+pub(crate) const MAX_PER_ACCOUNT: usize = 5;
 const MAX_PER_IP: usize = 20;
 /// Clés suivies au plus. Pleine, la table est purgée des clés expirées au plus une fois par `PURGE_EVERY`
 /// (un parcours complet à chaque appel, sous le verrou commun, ralentirait toutes les connexions). Toujours
@@ -223,23 +223,37 @@ impl LoginLimiter {
             let [(account, _), (ip, _)] = keys;
             return Some(Ticket { limiter: Arc::clone(self), n, keys: [account, ip], overflow: debited });
         }
-        let allowed = room(map)
-            && keys.iter().all(|(k, max)| {
-                map.get_mut(k).is_none_or(|v| {
-                    v.retain(|(t, _)| now.duration_since(*t) < WINDOW);
-                    v.len() < *max
-                })
-            });
+        // Retour de débordement (une purge a fait de la place) : les seaux de préfixe encore actifs de cette
+        // tentative gardent leurs débits et leurs plafonds jusqu'à expiration, sinon la purge rendrait les
+        // tentatives comptées pendant la saturation. Le seau commun n'est pas repris : il ne compte personne.
+        let prefix = prefix_key(ip);
+        let carried: Vec<(String, usize)> =
+            [(format!("{prefix}|{}", user_key(username)), MAX_PER_ACCOUNT), (prefix, MAX_PER_PREFIX)]
+                .into_iter()
+                .filter(|(b, _)| overflow.contains_key(b))
+                .collect();
+        let under = |m: &mut HashMap<String, Vec<(Instant, u64)>>, (k, max): &(String, usize)| {
+            m.get_mut(k).is_none_or(|v| {
+                v.retain(|(t, _)| now.duration_since(*t) < WINDOW);
+                v.len() < *max
+            })
+        };
+        let allowed =
+            room(map) && keys.iter().all(|k| under(map, k)) && carried.iter().all(|b| under(overflow, b));
         let n = allowed.then(|| self.next.fetch_add(1, Ordering::Relaxed));
+        let carried: Vec<String> = carried.into_iter().map(|(b, _)| b).collect();
         if let Some(n) = n {
             for (k, _) in &keys {
                 map.entry(k.clone()).or_default().push((now, n));
+            }
+            for b in &carried {
+                overflow.entry(b.clone()).or_default().push((now, n));
             }
             in_flight.insert(n);
         }
         drop(inner);
         let [(account, _), (ip, _)] = keys;
-        n.map(|n| Ticket { limiter: Arc::clone(self), n, keys: [account, ip], overflow: Vec::new() })
+        n.map(|n| Ticket { limiter: Arc::clone(self), n, keys: [account, ip], overflow: carried })
     }
 }
 
@@ -318,10 +332,18 @@ mod tests {
         fill(expired, MAX_KEYS - 2);
         assert!(l.reserve(ip(2), "bob").is_some(), "clés expirées purgées");
         assert_eq!(len(), 4);
-        // Purge récente : pas de nouvelle purge, mais les clés les moins récentes (ici expirées) cèdent la place.
+        // Purge récente : pas de nouvelle purge, rien n'est évincé (même expiré) ; carol est comptée en
+        // débordement, sans clé dans la table.
         fill(expired, MAX_KEYS - 4);
-        assert!(l.reserve(ip(3), "carol").is_some(), "éviction plutôt que refus");
+        let carol = l.reserve(ip(3), "carol").expect("débordement plutôt que refus");
+        assert!(!carol.overflow.is_empty(), "carol comptée hors des seaux de débordement");
         assert_eq!(len(), MAX_KEYS);
+        {
+            let inner = l.inner.lock().unwrap();
+            assert!((0..MAX_KEYS - 4).all(|k| inner.attempts.contains_key(&format!("x{k}"))), "clé évincée");
+            assert!(!inner.attempts.contains_key("192.0.2.3|carol"));
+        }
+        drop(carol);
         let again = l.reserve(ip(1), "alice").expect("clés déjà suivies");
         assert_eq!(l.inner.lock().unwrap().attempts["192.0.2.1|alice"].len(), 2, "échec d'alice gardé");
         drop(again);
@@ -367,6 +389,46 @@ mod tests {
         let inner = l.inner.lock().unwrap();
         assert_eq!(inner.attempts.len(), MAX_KEYS);
         assert!(inner.attempts.contains_key("ancienne"), "aucun compteur actif évincé");
+    }
+
+    /// Cinq échecs comptés en débordement, puis une purge fait de la place : la tentative suivante du même
+    /// compte, depuis la même adresse, reste refusée jusqu'à l'expiration de ces échecs.
+    #[test]
+    fn overflow_debits_survive_the_return_to_the_table() {
+        let l = Arc::new(LoginLimiter::default());
+        let ip = IpAddr::from([192, 0, 2, 9]);
+        let expired = Instant::now().checked_sub(WINDOW + Duration::from_secs(1)).unwrap();
+        {
+            let mut inner = l.inner.lock().unwrap();
+            for k in 0..MAX_KEYS {
+                // Deux clés expirées, que seule la prochaine purge retirera.
+                let at = if k < 2 { expired } else { Instant::now() };
+                inner.attempts.insert(format!("x{k}"), vec![(at, u64::MAX)]);
+            }
+            inner.purged = Some(Instant::now());
+        }
+        for _ in 0..MAX_PER_ACCOUNT {
+            drop(l.reserve(ip, "alice").expect("débordement"));
+        }
+        assert!(l.reserve(ip, "alice").is_none(), "plafond du compte en débordement");
+        // Purge permise : les deux clés expirées partent, alice a de nouveau sa place dans la table.
+        l.inner.lock().unwrap().purged = Some(expired);
+        assert!(l.reserve(ip, "alice").is_none(), "échecs du débordement oubliés au retour dans la table");
+        assert!(!l.inner.lock().unwrap().attempts.contains_key("192.0.2.9|alice"));
+        // Un autre compte de la même adresse passe, et compte aussi dans le seau du préfixe.
+        let bob = l.reserve(ip, "bob").expect("autre compte");
+        assert_eq!(bob.overflow, ["192.0.2.0/24".to_owned()]);
+        bob.succeeded();
+        assert_eq!(
+            l.inner.lock().unwrap().overflow["192.0.2.0/24"].len(),
+            MAX_PER_ACCOUNT,
+            "succès remboursé"
+        );
+        // Fenêtre écoulée pour les échecs du débordement : alice repasse.
+        for v in l.inner.lock().unwrap().overflow.values_mut() {
+            v.iter_mut().for_each(|e| e.0 = expired);
+        }
+        assert!(l.reserve(ip, "alice").is_some(), "toujours refusée après la fenêtre");
     }
 
     #[test]

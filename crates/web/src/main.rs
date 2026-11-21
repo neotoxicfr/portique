@@ -29,6 +29,10 @@ pub struct Session {
     /// Message de l'écran de connexion après une fin de session décidée par le serveur (mot de passe changé) ;
     /// effacé à la connexion suivante.
     pub notice: RwSignal<Option<String>>,
+    /// Requête TOTP en vol (configuration, confirmation, désactivation) : gardé ici pour survivre aux
+    /// changements de page. Une seconde configuration lancée après un retour sur Compte pourrait sinon finir
+    /// avant la première : le QR affiché ne serait plus la graine que le serveur attend.
+    pub totp_busy: RwSignal<bool>,
 }
 
 impl Session {
@@ -146,6 +150,7 @@ fn App() -> impl IntoView {
         epoch: RwSignal::new(0),
         logging_out: RwSignal::new(false),
         notice: RwSignal::new(None),
+        totp_busy: RwSignal::new(false),
     };
     provide_context(session);
     // L'erreur ne survit pas à la session qu'elle concernait (sinon elle reviendrait après reconnexion), l'avis
@@ -242,8 +247,17 @@ fn Shell(children: Children) -> impl IntoView {
         logout_error.set(None);
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            // Bornée : une requête sans réponse ne doit pas bloquer le bouton pour toujours.
-            let result = within(15_000, api::send_empty::<()>("POST", "/api/auth/logout", None)).await;
+            // Bornée : une requête sans réponse ne doit pas bloquer le bouton pour toujours. Abandonnée au délai,
+            // avant tout nouvel essai : sa réponse tardive porterait encore un Set-Cookie d'effacement, que le
+            // navigateur appliquerait au cookie d'une reconnexion faite entre-temps.
+            let abort = web_sys::AbortController::new().ok();
+            let signal = abort.as_ref().map(web_sys::AbortController::signal);
+            let result = within(15_000, logout_request(signal.as_ref())).await;
+            if result.is_none()
+                && let Some(a) = &abort
+            {
+                a.abort();
+            }
             // Libéré quelle que soit l'issue : un échec doit pouvoir être retenté.
             session.logging_out.set(false);
             // Session déjà terminée (reconnexion entre-temps) : réponse périmée, ignorée.
@@ -291,6 +305,28 @@ fn Shell(children: Children) -> impl IntoView {
     }
 }
 
+/// POST de déconnexion, annulable par `signal` (`api::send_empty` n'en prend pas).
+async fn logout_request(signal: Option<&web_sys::AbortSignal>) -> api::Result<()> {
+    let res = gloo_net::http::Request::post("/api/auth/logout")
+        .header("x-portique", "1")
+        .abort_signal(signal)
+        .send()
+        .await
+        .map_err(|e| api::Error::Message(format!("réseau : {e}")))?;
+    if res.ok() {
+        return Ok(());
+    }
+    if res.status() == 401 {
+        return Err(api::Error::Unauthorized);
+    }
+    let msg = res
+        .json::<portique_proto::ApiError>()
+        .await
+        .map(|e| e.error)
+        .unwrap_or_else(|_| format!("erreur HTTP {}", res.status()));
+    Err(api::Error::Message(msg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +341,7 @@ mod tests {
             epoch: RwSignal::new(1),
             logging_out: RwSignal::new(false),
             notice: RwSignal::new(None),
+            totp_busy: RwSignal::new(false),
         };
         let me = |name: &str| Me {
             id: 1,
@@ -338,6 +375,7 @@ mod tests {
             epoch: RwSignal::new(1),
             logging_out: RwSignal::new(false),
             notice: RwSignal::new(None),
+            totp_busy: RwSignal::new(false),
         };
         let me = |name: &str, totp: bool| Me {
             id: 1,
@@ -368,6 +406,7 @@ mod tests {
             epoch: RwSignal::new(1),
             logging_out: RwSignal::new(false),
             notice: RwSignal::new(None),
+            totp_busy: RwSignal::new(false),
         };
         let me = |name: &str| Me {
             id: 1,

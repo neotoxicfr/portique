@@ -22,7 +22,8 @@ function Set-Dw($path, $name, $val, $type = 'DWord') {
   New-ItemProperty -Path $path -Name $name -Value $val -PropertyType $type -Force | Out-Null
 }
 function Get-ActiveNic { Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1 }
-# Carte dont la preparation a autorise le reveil : l'annulation la retrouve meme debranchee.
+# Cartes dont la preparation a autorise le reveil, une valeur par carte (adresse MAC) : l'annulation les
+# retrouve toutes, meme debranchees ou remplacees depuis par une autre carte.
 $mem = 'HKLM:\SOFTWARE\Portique'
 # Etapes natives (netsh, powercfg, gpupdate) : $ErrorActionPreference ne voit pas leur code de sortie.
 $echecs = @()
@@ -42,12 +43,22 @@ if ($Annuler) {
   Set-Dw 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 1
   netsh advfirewall firewall set rule group=$grp new enable=No | Out-Null
   $null = Test-Exit 'Pare-feu'
-  # Carte memorisee a la preparation ; a defaut, la carte active.
-  $desc = (Get-ItemProperty -Path $mem -Name WakeNic -ErrorAction SilentlyContinue).WakeNic
-  if (-not $desc) { $desc = (Get-ActiveNic).InterfaceDescription }
-  if ($desc) {
-    powercfg /devicedisablewake $desc 2>$null | Out-Null
-    $null = Test-Exit 'Reveil (powercfg)'
+  # Cartes memorisees a la preparation (une valeur par carte) ; a defaut, la carte active.
+  $cle = Get-Item -Path $mem -ErrorAction SilentlyContinue
+  $noms = @(if ($cle) { $cle.GetValueNames() })
+  if ($noms) {
+    foreach ($n in $noms) {
+      $desc = $cle.GetValue($n)
+      powercfg /devicedisablewake $desc 2>$null | Out-Null
+      # Carte traitee : oubliee, une nouvelle annulation ne vise que les cartes restantes.
+      if (Test-Exit "Reveil (powercfg, $desc)") { Remove-ItemProperty -Path $mem -Name $n -ErrorAction SilentlyContinue }
+    }
+  } else {
+    $desc = (Get-ActiveNic).InterfaceDescription
+    if ($desc) {
+      powercfg /devicedisablewake $desc 2>$null | Out-Null
+      $null = Test-Exit 'Reveil (powercfg)'
+    }
   }
   gpupdate /force | Out-Null
   $null = Test-Exit 'gpupdate'
@@ -86,7 +97,7 @@ if ($nic) {
   powercfg /deviceenablewake $nic.InterfaceDescription 2>$null | Out-Null
   if (Test-Exit 'Reveil (powercfg)') {
     $memo = $true
-    try { Set-Dw $mem 'WakeNic' $nic.InterfaceDescription 'String' } catch {
+    try { Set-Dw $mem "Nic-$($nic.MacAddress)" $nic.InterfaceDescription 'String' } catch {
       # Sans memo, l'annulation viserait la carte active : on retire l'autorisation.
       $raison = $_.Exception.Message
       powercfg /devicedisablewake $nic.InterfaceDescription 2>$null | Out-Null

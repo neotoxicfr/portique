@@ -52,7 +52,7 @@
   --link: #0066cc;
   --accent: #0071e3;
   --accent-icon: #0071e3;
-  --red: #d70015;
+  --red: #cc0013; /* #d70015 n'atteint que 4,2:1 sur le fond + teinte rouge ou bouton gris */
   --red-fill: #ff3b30;
   --green: #34c759;
   --orange: #ff9500;

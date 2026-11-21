@@ -480,7 +480,15 @@ pub fn SessionPage() -> impl IntoView {
                     node_ref=handle_ref
                     class="session-handle"
                     title="Menu de session (Ctrl+Alt+Maj depuis le bureau)"
-                    on:click=move |_| menu_open.update(|o| *o = !*o)
+                    on:click=move |_| {
+                        let open = !menu_open.get_untracked();
+                        menu_open.set(open);
+                        // Refermé par la poignée, qui reste là avec le focus : le clavier revient au
+                        // bureau (sinon la frappe suivante resterait sur une commande locale).
+                        if !open && let Some(c) = canvas_ref.get_untracked() {
+                            let _ = c.focus();
+                        }
+                    }
                 >
                     "⋯"
                 </button>

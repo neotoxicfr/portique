@@ -149,8 +149,19 @@ fn click(button: Button, x: f64, y: f64) -> Vec<Action> {
 }
 
 impl Touch {
-    pub fn set_area(&mut self, left: f64, top: f64, width: f64, height: f64) {
-        self.area = (left, top, width.max(1.0), height.max(1.0));
+    /// Canevas non transformé (px CSS). Une autre taille reborne le zoom : un déplacement valable
+    /// pour l'ancienne pourrait sortir tout le bureau de la vue. Même taille : zoom inchangé.
+    pub fn set_area(&mut self, left: f64, top: f64, width: f64, height: f64) -> Vec<Action> {
+        let (w, h) = (width.max(1.0), height.max(1.0));
+        self.area = (left, top, w, h);
+        let z = self.zoom;
+        let bounded =
+            Zoom { tx: z.tx.clamp(w * (1.0 - z.scale), 0.0), ty: z.ty.clamp(h * (1.0 - z.scale), 0.0), ..z };
+        if bounded == z {
+            return Vec::new();
+        }
+        self.zoom = bounded;
+        vec![Action::Zoom(bounded)]
     }
 
     pub fn down(&mut self, id: i32, x: f64, y: f64) -> Vec<Action> {
@@ -559,5 +570,22 @@ mod tests {
         t.moved(5, 190.0, 400.0);
         let out = t.moved(6, 210.0, 400.0);
         assert_eq!(out, vec![Action::Zoom(Zoom::default())]);
+    }
+
+    #[test]
+    fn resize_keeps_the_zoomed_desktop_in_view() {
+        let mut t = Touch::default();
+        t.set_area(0.0, 0.0, 800.0, 800.0);
+        t.zoom = Zoom { scale: 2.0, tx: -800.0, ty: -300.0 };
+        // Même taille : zoom conservé.
+        assert!(t.set_area(0.0, 0.0, 800.0, 800.0).is_empty());
+        // Fenêtre réduite à 400 px : bord droit ramené au bord de la vue, hauteur inchangée.
+        let z = Zoom { scale: 2.0, tx: -400.0, ty: -300.0 };
+        assert_eq!(t.set_area(0.0, 0.0, 400.0, 800.0), vec![Action::Zoom(z)]);
+        assert_eq!(t.zoom, z);
+        // Un pincement repart du zoom reborné.
+        t.down(1, 150.0, 400.0);
+        t.down(2, 250.0, 400.0);
+        assert!(matches!(t.state, State::Two { zoom0, .. } if zoom0 == z));
     }
 }

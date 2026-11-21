@@ -81,8 +81,9 @@ if errorlevel 1 (
   set "ECHEC=1"
   goto :eof
 )
-rem Memorise la carte modifiee : l'annulation la retrouve meme debranchee.
-reg add "HKLM\SOFTWARE\Portique" /v WakeNic /t REG_SZ /d "%~2" /f >nul
+rem Memorise la carte modifiee, une valeur par carte (adresse MAC) : l'annulation les retrouve toutes,
+rem meme debranchees ou remplacees depuis par une autre carte.
+reg add "HKLM\SOFTWARE\Portique" /v "Nic-%~3" /t REG_SZ /d "%~2" /f >nul
 if errorlevel 1 (
   rem Sans memo, l'annulation viserait la carte active : on retire l'autorisation.
   powercfg /devicedisablewake "%~2" >nul 2>&1
@@ -109,14 +110,15 @@ if errorlevel 1 (
   echo [!] Pare-feu : echec de netsh, regles non desactivees.
   set "ECHEC=1"
 )
-rem Carte memorisee a la preparation ; a defaut, la carte active.
+rem Cartes memorisees a la preparation (une valeur par carte) ; a defaut, la carte active.
 set "NICDESC="
-for /f "tokens=2,*" %%a in ('reg query "HKLM\SOFTWARE\Portique" /v WakeNic 2^>nul') do set "NICDESC=%%b"
-if not defined NICDESC for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceDescription"`) do set "NICDESC=%%a"
-if defined NICDESC powercfg /devicedisablewake "%NICDESC%" >nul 2>&1
-if defined NICDESC if errorlevel 1 (
-  echo [!] Reveil : powercfg n'a pas pu retirer l'autorisation de la carte.
-  set "ECHEC=1"
+for /f "tokens=1,2,*" %%a in ('reg query "HKLM\SOFTWARE\Portique" 2^>nul ^| findstr /c:"REG_SZ"') do (
+  set "NICDESC=%%c"
+  call :sans_reveil "%%c" "%%a"
+)
+if not defined NICDESC for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceDescription"`) do (
+  set "NICDESC=%%a"
+  call :sans_reveil "%%a" ""
 )
 gpupdate /force >nul
 if errorlevel 1 (
@@ -133,3 +135,15 @@ if defined ECHEC (
 echo Annule : Bureau a distance ferme, strategies retirees, pare-feu et reveil restaures.
 pause
 exit /b 0
+
+:sans_reveil
+rem %~1 description de la carte, %~2 nom de sa valeur memorisee (vide : carte active, rien a oublier).
+powercfg /devicedisablewake "%~1" >nul 2>&1
+if errorlevel 1 (
+  echo [!] Reveil : powercfg n'a pas pu retirer l'autorisation de la carte "%~1".
+  set "ECHEC=1"
+  goto :eof
+)
+rem Carte traitee : oubliee, une nouvelle annulation ne vise que les cartes restantes.
+if not "%~2"=="" reg delete "HKLM\SOFTWARE\Portique" /v "%~2" /f >nul 2>&1
+goto :eof

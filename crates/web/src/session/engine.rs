@@ -6,7 +6,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
 };
 
@@ -95,9 +95,10 @@ struct Inner {
     /// Taille voulue (fenêtre) et retour forcé à un écran pas encore envoyé : appliqués dès que
     /// le contrôle d'affichage devient prêt (voir `single_layout`).
     desired: Option<((u32, u32), bool)>,
-    /// Dernière taille à un écran envoyée et pas encore confirmée par un Reset Graphics : c'est
-    /// elle que le bureau prendra, une nouvelle demande s'y compare (voir `single_layout`).
-    size_sent: Option<(u32, u32)>,
+    /// Tailles à un écran envoyées et pas encore confirmées par un Reset Graphics, la plus ancienne
+    /// d'abord : le bureau prendra la dernière, une nouvelle demande s'y compare (voir
+    /// `single_layout` et `size_confirmed`).
+    size_sent: VecDeque<(u32, u32)>,
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
@@ -115,10 +116,6 @@ struct Inner {
     /// Écriture locale refusée (page sans focus) : retentée au prochain geste. Génération, contenu,
     /// empreinte de relecture.
     clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>, u64)>,
-    /// Génération du contenu du PC pas encore écrit localement (écriture en cours ou refusée).
-    clip_unwritten: Option<u32>,
-    /// Empreinte du presse-papier local tel qu'on l'a vu en dernier (lu, ou écrit par nous).
-    clip_local: Option<u64>,
     /// Empreinte du dernier contenu commun aux deux côtés (évite l'écho PC → navigateur → PC) :
     /// reçu du PC, ou annoncé par nous ET accepté par Windows ; effacée quand Windows accepte une
     /// autre de nos listes (remplacée ensuite, ou au contenu inconnu). Gardée quand Windows copie un
@@ -224,7 +221,7 @@ impl Engine {
             extend_wait: None,
             touch: Touch::default(),
             desired: None,
-            size_sent: None,
+            size_sent: VecDeque::new(),
             desktop: (w, h),
             cursors: vec![None; 32],
             pressed: HashSet::new(),
@@ -237,8 +234,6 @@ impl Engine {
             clip_fetch: clip::Fetch::default(),
             clip_write_gen: 0,
             clip_pending_write: None,
-            clip_unwritten: None,
-            clip_local: None,
             clip_last: None,
             clip_announces: clip::Announces::default(),
             holding: false,
@@ -427,7 +422,7 @@ impl Engine {
                     let mut i = self.inner.borrow_mut();
                     i.display_channel = Some(channel_id);
                     i.display_caps = None;
-                    i.size_sent = None;
+                    i.size_sent.clear();
                 }
             }
             Event::DvcData { channel_id, data } => {
@@ -461,7 +456,7 @@ impl Engine {
                 if i.display_channel == Some(channel_id) {
                     i.display_channel = None;
                     i.display_caps = None;
-                    i.size_sent = None;
+                    i.size_sent.clear();
                 }
             }
             Event::Pointer(p) => self.pointer(p),
@@ -644,9 +639,7 @@ impl Engine {
     fn reset_views(&self, width: u32, height: u32, monitors: &[Rect]) {
         let mut i = self.inner.borrow_mut();
         i.desktop = (width, height);
-        if i.size_sent == Some((width, height)) {
-            i.size_sent = None;
-        }
+        size_confirmed(&mut i.size_sent, (width, height));
         let expected = i.multi.clone();
         let adopted = expected.as_ref().is_some_and(|rects| {
             let bw = rects.iter().map(|r| r.x + r.w).max().unwrap_or(0);
@@ -754,7 +747,7 @@ impl Engine {
         i.views.extend(staged);
         i.multi = Some(std::iter::once(current).chain(secondary).map(|idx| rects[idx]).collect());
         // La disposition remplace toute taille à un écran encore en vol.
-        i.size_sent = None;
+        i.size_sent.clear();
         i.extend_seq = i.extend_seq.wrapping_add(1);
         let seq = i.extend_seq;
         i.extend_wait = Some(seq);
@@ -951,10 +944,9 @@ impl Engine {
             let Inner { touch, views, .. } = &mut *i;
             match kind {
                 "pointerdown" => {
-                    let c = &views[0].canvas;
-                    let (l, t) = (f64::from(c.offset_left()), f64::from(c.offset_top()));
-                    touch.set_area(l, t, f64::from(c.offset_width()), f64::from(c.offset_height()));
-                    touch.down(id, x, y)
+                    let mut out = touch_area(touch, &views[0].canvas);
+                    out.extend(touch.down(id, x, y));
+                    out
                 }
                 "pointermove" => touch.moved(id, x, y),
                 "pointerup" => touch.up(id, x, y, e.time_stamp()),
@@ -1243,7 +1235,6 @@ impl Engine {
             i.clip_last = Some(provisional);
             i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
             i.clip_pending_write = None;
-            i.clip_unwritten = Some(i.clip_write_gen);
             (i.clip_write_gen, i.clip_fetch.generation(), provisional)
         };
         let e = self.clone();
@@ -1280,11 +1271,7 @@ impl Engine {
             }
             let mut i = e.inner.borrow_mut();
             match result {
-                Ok(()) => {
-                    i.clip_unwritten = None;
-                    i.clip_local = Some(fp);
-                    i.clip_announces.written_locally();
-                }
+                Ok(()) => i.clip_announces.written_locally(fp),
                 Err(err) => {
                     web_sys::console::debug_1(
                         &format!("presse-papier local : {err} (nouvel essai au prochain geste)").into(),
@@ -1321,13 +1308,7 @@ impl Engine {
                 return Some(true);
             }
             let now = js_sys::Date::now();
-            let unwritten = i.clip_unwritten == Some(i.clip_write_gen);
-            let common = clip::common_for_read(i.clip_last, unwritten, i.clip_local, fp);
-            // Seule une lecture retenue (ni dépassée, ni écartée par une copie du PC) dit ce que contient
-            // le presse-papier local maintenant.
-            if i.clip_announces.is_current(mark) {
-                i.clip_local = Some(fp);
-            }
+            let common = i.clip_last;
             match i.clip_announces.after_read(mark, fp, common, now) {
                 clip::AfterRead::Done => return Some(true),
                 clip::AfterRead::Retry | clip::AfterRead::Stalled => return Some(false),
@@ -1466,6 +1447,13 @@ impl Engine {
 
     /// Demande au serveur une nouvelle taille de bureau (contrôle d'affichage).
     pub fn resize(&self, width: u32, height: u32) {
+        // Le canevas suit la fenêtre : le zoom tactile se reborne sur sa nouvelle taille.
+        let actions = {
+            let mut i = self.inner.borrow_mut();
+            let Inner { touch, views, .. } = &mut *i;
+            touch_area(touch, &views[0].canvas)
+        };
+        self.touch_actions(actions);
         self.send_size(width, height, false);
     }
 
@@ -1626,7 +1614,7 @@ fn release_secondary(held: &mut Held) -> Vec<Input> {
 /// égale au bureau actuel doit donc encore partir (fenêtre revenue à sa taille entre-temps).
 fn single_layout(
     desired: &mut Option<((u32, u32), bool)>,
-    sent: &mut Option<(u32, u32)>,
+    sent: &mut VecDeque<(u32, u32)>,
     caps: Option<DisplayCaps>,
     size: (u32, u32),
     force: bool,
@@ -1639,12 +1627,28 @@ fn single_layout(
     let (w, h) = caps.fit(size.0, size.1);
     let monitor = (0, 0, w, h);
     caps.check(&[monitor])?;
-    if !force && (w, h) == sent.unwrap_or(desktop) {
+    if !force && (w, h) == sent.back().copied().unwrap_or(desktop) {
         return Ok(None);
     }
     *desired = Some((size, false));
-    *sent = Some((w, h));
+    sent.push_back((w, h));
+    // Demandes jamais confirmées (taille ajustée par le PC) : seule la dernière sert de référence.
+    if sent.len() > MAX_SIZES_IN_FLIGHT {
+        sent.pop_front();
+    }
     Ok(Some(monitor))
+}
+
+/// Tailles en vol gardées au plus (voir `single_layout`).
+const MAX_SIZES_IN_FLIGHT: usize = 8;
+
+/// Reset Graphics à `size` : il répond à la plus ancienne demande en vol de cette taille (Windows
+/// les traite dans l'ordre), les précédentes sont dépassées. Les suivantes restent en vol : une
+/// demande plus récente de la même taille peut encore être contredite par un Reset intermédiaire.
+fn size_confirmed(sent: &mut VecDeque<(u32, u32)>, size: (u32, u32)) {
+    if let Some(k) = sent.iter().position(|s| *s == size) {
+        sent.drain(..=k);
+    }
 }
 
 /// Un Reset Graphics qui n'adopte pas la disposition attendue ramène-t-il à un écran ? Oui sans
@@ -1664,6 +1668,12 @@ fn drop_stale_presents(outs: Vec<Out>) -> Vec<Out> {
         .filter(|(k, o)| *k > last_reset || !matches!(o, Out::Present { .. }))
         .map(|(_, o)| o)
         .collect()
+}
+
+/// Zone du canevas principal non transformé (`offset*` ignore le zoom CSS) pour les gestes tactiles.
+fn touch_area(touch: &mut Touch, c: &HtmlCanvasElement) -> Vec<touch::Action> {
+    let (l, t) = (f64::from(c.offset_left()), f64::from(c.offset_top()));
+    touch.set_area(l, t, f64::from(c.offset_width()), f64::from(c.offset_height()))
 }
 
 /// Zoom tactile local : transformation CSS du canevas principal (le bureau distant ne change pas).
@@ -1703,7 +1713,7 @@ mod tests {
     #[test]
     fn forced_single_layout_survives_a_closed_display_channel() {
         let caps = Some(DisplayCaps { max_monitors: 2, max_area: 4 * 1920 * 1080 });
-        let (mut desired, mut sent) = (None, None);
+        let (mut desired, mut sent) = (None, VecDeque::new());
         // Retour à un écran pendant que le canal est fermé : rien ne part, le forçage est retenu.
         assert_eq!(single_layout(&mut desired, &mut sent, None, (1920, 1080), true, (1920, 1080)), Ok(None));
         // Redimensionnement ordinaire entre-temps, canal toujours fermé : toujours forcé.
@@ -1730,7 +1740,7 @@ mod tests {
     #[test]
     fn size_in_flight_is_the_reference() {
         let caps = Some(DisplayCaps { max_monitors: 1, max_area: 8192 * 8192 });
-        let (mut desired, mut sent) = (None, None);
+        let (mut desired, mut sent) = (None, VecDeque::new());
         let desktop = (1600, 900);
         // 1280×720 part ; la fenêtre revient à la taille du bureau avant que le PC ne l'applique.
         assert_eq!(
@@ -1743,10 +1753,42 @@ mod tests {
             "le bureau va passer à 1280×720 : la taille actuelle doit repartir"
         );
         // Reset à 1280×720 (pas celui de la dernière demande) : 1600×900 est toujours en vol.
+        size_confirmed(&mut sent, (1280, 720));
         assert_eq!(single_layout(&mut desired, &mut sent, caps, (1600, 900), false, (1280, 720)), Ok(None));
-        // Confirmée (`reset_views` efface `sent`) : une taille déjà appliquée reste ignorée.
-        sent = None;
+        // Confirmée : une taille déjà appliquée reste ignorée.
+        size_confirmed(&mut sent, (1600, 900));
+        assert!(sent.is_empty());
         assert_eq!(single_layout(&mut desired, &mut sent, caps, (1600, 900), false, desktop), Ok(None));
+    }
+
+    #[test]
+    fn a_reset_settles_only_its_own_size_request() {
+        let caps = Some(DisplayCaps { max_monitors: 1, max_area: 8192 * 8192 });
+        let (mut desired, mut sent) = (None, VecDeque::new());
+        let (a, b) = ((1280, 720), (1440, 900));
+        let monitor = |(w, h)| Ok(Some((0, 0, w, h)));
+        // A, B puis A partent (bureau 1600×900).
+        for size in [a, b, a] {
+            assert_eq!(single_layout(&mut desired, &mut sent, caps, size, false, (1600, 900)), monitor(size));
+        }
+        // Reset à A (1re demande) puis à B : la dernière demande, A, est encore en vol. La fenêtre
+        // revient à B, la taille du bureau à cet instant : elle repart quand même.
+        size_confirmed(&mut sent, a);
+        size_confirmed(&mut sent, b);
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, b, false, b), monitor(b));
+        size_confirmed(&mut sent, a);
+        size_confirmed(&mut sent, b);
+        assert!(sent.is_empty());
+        // Une seule demande en vol : la même taille n'est pas renvoyée.
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, a, false, b), monitor(a));
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, a, false, b), Ok(None));
+        // Demandes jamais confirmées : file bornée, la dernière reste la référence.
+        for k in 0..20 {
+            let size = (1000 + 2 * k, 700);
+            assert_eq!(single_layout(&mut desired, &mut sent, caps, size, false, b), monitor(size));
+        }
+        assert_eq!(sent.len(), MAX_SIZES_IN_FLIGHT);
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1038, 700), false, b), Ok(None));
     }
 
     #[test]

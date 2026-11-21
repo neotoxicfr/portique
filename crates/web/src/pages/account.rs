@@ -177,7 +177,8 @@ fn Totp(st: Status) -> impl IntoView {
     let setup = RwSignal::new(None::<TotpSetup>);
     // Some(true) : l'utilisateur veut activer ; Some(false) : désactiver ; None : rien en cours.
     let intent = RwSignal::new(None::<bool>);
-    let busy = RwSignal::new(false);
+    // Verrou de la session, pas de la page : il survit à un départ de Compte pendant l'envoi.
+    let busy = session.totp_busy;
     let proof = Proof::new();
     let code = RwSignal::new(String::new());
 
@@ -528,6 +529,8 @@ fn Terminal() -> impl IntoView {
     let add = move || -> bool {
         let c = draft.get_untracked().trim().to_owned();
         if c.is_empty() {
+            // Champ vidé : l'erreur visait une saisie qui n'est plus là.
+            combo_err.set(None);
             return true;
         }
         if Combo::parse(&c).is_none() {

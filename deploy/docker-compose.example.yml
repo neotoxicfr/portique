@@ -32,9 +32,13 @@ secrets:
   master_key:
     # Compose monte le fichier avec les droits de l'hôte : il doit être lisible par l'UID 10001 de l'image,
     # qui ne doit être celui d'aucun compte de l'hôte (ce compte lirait la clé et la base ; sinon userns-remap).
-    # Jamais régénérée sur une installation existante : une nouvelle clé ne déchiffrerait plus la base.
-    # (umask 077; mkdir -p secrets && { [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key; }) \
-    #   && chmod 400 secrets/master_key && sudo chown 10001 secrets/master_key
+    # Jamais régénérée sur une installation existante : une nouvelle clé ne déchiffrerait plus la base. Clé
+    # perdue avec une base en place : la préparation s'arrête, restaure la clé d'origine. Relançable (sudo).
+    # (umask 077; mkdir -p secrets
+    #  if [ ! -s secrets/master_key ]; then
+    #    sudo test -e data/portique.db && { echo "base existante : restaure secrets/master_key" >&2; exit 1; }
+    #    openssl rand -base64 32 > secrets/master_key
+    #  fi) && sudo chmod 400 secrets/master_key && sudo chown 10001 secrets/master_key
     file: ./secrets/master_key
 
 # Route Traefik (fichier dynamique, le conteneur partageant le réseau de wireguard) :

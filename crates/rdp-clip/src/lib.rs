@@ -433,13 +433,32 @@ impl Clipboard {
     }
 }
 
+/// Dimensions d'un PNG lues dans son en-tête IHDR (premier bloc, imposé par la norme), sans
+/// rien décoder.
+fn png_size(data: &[u8]) -> Option<(usize, usize)> {
+    let rest = data.strip_prefix(PNG_SIGNATURE)?;
+    if rest.get(4..8)? != b"IHDR" {
+        return None;
+    }
+    let be32 = |o: usize| Some(u32::from_be_bytes(rest.get(o..o + 4)?.try_into().ok()?) as usize);
+    Some((be32(8)?, be32(12)?))
+}
+
 /// Données du serveur → contenu local ; `None` si illisibles.
 fn decode(format: ClipFormat, data: &[u8]) -> Option<LocalData> {
     Some(match format {
         ClipFormat::Text => LocalData::Text(utf16_to_string(data)),
         ClipFormat::Html => LocalData::Html(cf_html_fragment(data)),
-        // Sans la signature PNG, l'image est illisible : l'appelant peut se rabattre sur le DIB.
-        ClipFormat::Png => LocalData::Png(data.starts_with(PNG_SIGNATURE).then(|| data.to_vec())?),
+        // Sans signature PNG ni dimensions acceptables, l'image est refusée avant que le navigateur
+        // ne la décode (quelques octets compressés peuvent annoncer des milliards de pixels) :
+        // l'appelant peut se rabattre sur le DIB, borné de même.
+        ClipFormat::Png => {
+            let (w, h) = png_size(data)?;
+            if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+                return None;
+            }
+            LocalData::Png(data.to_vec())
+        }
         ClipFormat::Dib => {
             let (width, height, rgba) = dib_to_rgba(data).ok()?;
             LocalData::Rgba { width, height, rgba }

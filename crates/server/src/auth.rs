@@ -205,8 +205,10 @@ pub async fn open_session(
             .await?
         }
     };
+    // Facteurs bons mais révoqués entre-temps : 409 distinct d'un 401, pour que la page de connexion
+    // ne parle pas de mauvais mot de passe. Il n'apprend rien à qui n'a pas déjà prouvé ces facteurs.
     if r.rows_affected() == 0 {
-        return Err(AppError::Unauthorized);
+        return Err(AppError::Conflict("réglages du compte changés pendant la connexion, recommence".into()));
     }
     let cookie = Cookie::build((SESSION_COOKIE, token))
         .path("/")
@@ -396,7 +398,7 @@ mod tests {
             .await
             .unwrap();
         let r = open(Proof::Password { hash: &hash, totp: None }).await;
-        assert!(matches!(r, Err(AppError::Unauthorized)), "ancien mot de passe");
+        assert!(matches!(r, Err(AppError::Conflict(_))), "ancien mot de passe");
         // 2FA remise à zéro par un admin pendant la connexion « mot de passe + TOTP ».
         sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
             .bind(&hash)
@@ -405,9 +407,9 @@ mod tests {
             .await
             .unwrap();
         let r = open(Proof::Password { hash: &hash, totp: Some(&[1]) }).await;
-        assert!(matches!(r, Err(AppError::Unauthorized)), "TOTP retiré");
+        assert!(matches!(r, Err(AppError::Conflict(_))), "TOTP retiré");
         // Passkey retirée après l'émission du défi.
-        assert!(matches!(open(Proof::Passkey(42)).await, Err(AppError::Unauthorized)), "passkey retirée");
+        assert!(matches!(open(Proof::Passkey(42)).await, Err(AppError::Conflict(_))), "passkey retirée");
         sqlx::query("INSERT INTO passkeys (id, user_id, name, credential) VALUES (42, ?, 'clé', '{}')")
             .bind(u.id)
             .execute(&s.db)

@@ -89,47 +89,59 @@ pub fn Home() -> impl IntoView {
             (None, Some(l)) if l.is_empty() => view! {
                 <p class="muted">"Aucune connexion. Un admin doit t'en ouvrir une."</p>
             }.into_any(),
-            (None, Some(l)) => view! {
-                <label class="search">
-                    {icon(glyph::SEARCH)}
-                    <span class="sr-only">"Rechercher une machine"</span>
-                    <input type="search" placeholder="Rechercher" autocomplete="off"
-                        prop:value=move || query.get()
-                        on:input=move |ev| query.set(event_target_value(&ev))/>
-                </label>
-                <ul class="hosts">
-                    {l.into_iter().map(|c| {
-                        let name = c.name.clone();
-                        let shown = move || {
-                            let q = query.with(|q| q.trim().to_lowercase());
-                            q.is_empty() || name.to_lowercase().contains(&q)
-                        };
-                        let (tone, glyph_d) = pastille(c.alert, c.rdp, c.ssh);
-                        let c2 = c.clone();
-                        view! {
-                            <li class="host" class:alert-host=c.alert hidden=move || !shown()>
-                                <div class="host-head">
-                                    <span class=format!("pastille {tone}")>{icon(glyph_d)}</span>
-                                    <h2 class="host-name" title=c.name.clone()>{c.name.clone()}</h2>
-                                </div>
-                                <div class="host-actions">
-                                    {slot(c.ssh, format!("Terminal de {}", c.name), format!("/ssh/{}", c.id), glyph::TERMINAL, if c.alert { "red" } else { "blue" })}
-                                    {slot(c.rdp, format!("Bureau de {}", c.name), format!("/session/{}", c.id), glyph::SCREEN, if c.alert { "red" } else { "blue" })}
-                                    {if c.can_wake {
-                                        let label = format!("Réveiller {}", c.name);
-                                        view! {
-                                            <button class="iconbtn big" aria-label=label.clone() title=label
-                                                on:click=move |_| wake(c2.clone())>{icon(glyph::POWER)}</button>
-                                        }.into_any()
-                                    } else {
-                                        view! { <span class="iconbtn big empty" aria-hidden="true"></span> }.into_any()
-                                    }}
-                                </div>
-                            </li>
-                        }
-                    }).collect_view()}
-                </ul>
-            }.into_any(),
+            (None, Some(l)) => {
+                // Recherche sans résultat : dit tel quel, sinon la grille vide ressemble à un chargement raté.
+                let names: Vec<String> = l.iter().map(|c| c.name.clone()).collect();
+                let none = move || query.with(|q| !q.trim().is_empty() && !names.iter().any(|n| matches(n, q)));
+                view! {
+                    <label class="search">
+                        {icon(glyph::SEARCH)}
+                        <span class="sr-only">"Rechercher une machine"</span>
+                        <input type="search" placeholder="Rechercher" autocomplete="off"
+                            prop:value=move || query.get()
+                            on:input=move |ev| query.set(event_target_value(&ev))/>
+                    </label>
+                    // Région annoncée toujours présente : le message y apparaît, il est lu.
+                    <div role="status">
+                        {move || none().then(|| view! { <p class="muted">"Aucune machine ne correspond à cette recherche."</p> })}
+                    </div>
+                    <ul class="hosts">
+                        {l.into_iter().map(|c| {
+                            let name = c.name.clone();
+                            let shown = move || query.with(|q| matches(&name, q));
+                            let (tone, glyph_d) = pastille(c.alert, c.rdp, c.ssh);
+                            let c2 = c.clone();
+                            view! {
+                                <li class="host" class:alert-host=c.alert hidden=move || !shown()>
+                                    <div class="host-head">
+                                        <span class=format!("pastille {tone}")>{icon(glyph_d)}</span>
+                                        <h2 class="host-name" title=c.name.clone()>{c.name.clone()}</h2>
+                                    </div>
+                                    <div class="host-actions">
+                                        {slot(c.ssh, format!("Terminal de {}", c.name), format!("/ssh/{}", c.id), glyph::TERMINAL, if c.alert { "red" } else { "blue" })}
+                                        {slot(c.rdp, format!("Bureau de {}", c.name), format!("/session/{}", c.id), glyph::SCREEN, if c.alert { "red" } else { "blue" })}
+                                        {if c.can_wake {
+                                            let label = format!("Réveiller {}", c.name);
+                                            view! {
+                                                <button class="iconbtn big" aria-label=label.clone() title=label
+                                                    on:click=move |_| wake(c2.clone())>{icon(glyph::POWER)}</button>
+                                            }.into_any()
+                                        } else {
+                                            view! { <span class="iconbtn big empty" aria-hidden="true"></span> }.into_any()
+                                        }}
+                                    </div>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }
         }}
     }
+}
+
+/// Filtre local de l'accueil : nom contenant la recherche, sans tenir compte de la casse ; recherche vide = tout.
+fn matches(name: &str, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    q.is_empty() || name.to_lowercase().contains(&q)
 }

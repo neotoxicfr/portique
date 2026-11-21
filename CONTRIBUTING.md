@@ -7,7 +7,8 @@ Merci de ton intérêt ! Ce guide tient en une page.
 - Rust stable, avec `rustfmt` et `clippy`
 - cible wasm : `rustup target add wasm32-unknown-unknown`
 - [trunk](https://trunkrs.dev) pour le front : `cargo install --locked trunk`
-- `curl` et `openssl` : `scripts/vendor-xterm.sh` télécharge xterm.js et vérifie son empreinte
+- `curl`, `openssl` et `flock` (util-linux) : `scripts/vendor-xterm.sh` télécharge xterm.js, vérifie son
+  empreinte et attend la fin d'une autre exécution en cours
 
 ```sh
 cargo test --workspace --exclude portique-web

@@ -160,6 +160,30 @@ fn full_sequence_with_local_content() {
 }
 
 #[test]
+fn png_dimensions_checked_before_decoding() {
+    let png = unhex(PNG_1X1);
+    assert_eq!(decode(ClipFormat::Png, &png), Some(LocalData::Png(png.clone())));
+    // Largeur et hauteur de l'IHDR (octets 16 à 23), le reste du fichier inchangé.
+    let sized = |w: u32, h: u32| {
+        let mut p = png.clone();
+        p[16..20].copy_from_slice(&w.to_be_bytes());
+        p[20..24].copy_from_slice(&h.to_be_bytes());
+        p
+    };
+    let max = MAX_DIM as u32;
+    assert!(decode(ClipFormat::Png, &sized(max, max)).is_some());
+    for (w, h) in [(max + 1, 1), (1, max + 1), (100_000, 100_000), (0, 1), (1, 0)] {
+        assert_eq!(decode(ClipFormat::Png, &sized(w, h)), None, "{w}×{h}");
+    }
+    // En-tête absent, tronqué ou qui n'est pas l'IHDR.
+    let mut not_ihdr = png.clone();
+    not_ihdr[12..16].copy_from_slice(b"IDAT");
+    for bad in [&png[..8], &png[..23], &not_ihdr[..]] {
+        assert_eq!(decode(ClipFormat::Png, bad), None);
+    }
+}
+
+#[test]
 fn short_names_without_server_caps() {
     let mut c = Clipboard::new();
     let ev = c.receive(&unhex(MONITOR_READY)).unwrap();

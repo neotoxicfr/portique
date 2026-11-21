@@ -74,11 +74,26 @@ pub async fn login(
         totp: user.totp_secret.as_deref(),
     };
     // Succès noté une fois la session née : une preuve révoquée entre-temps reste un échec compté.
-    let jar = auth::open_session(&state, &mut tx, jar, user.id, proof).await?;
-    tx.commit().await?;
+    let jar = match auth::open_session(&state, &mut tx, jar, user.id, proof).await {
+        Ok(jar) => jar,
+        Err(e) => return Err(refund_if_internal(ticket, e)),
+    };
+    if let Err(e) = tx.commit().await {
+        return Err(refund_if_internal(ticket, e.into()));
+    }
     ticket.succeeded();
     tracing::info!(%ip, user = user.username, "connexion");
     Ok((jar, Json(LoginResponse::Ok { me: user.me() })))
+}
+
+/// Session non écrite pour une raison interne (panne de la base), facteurs déjà vérifiés : ce n'est pas un
+/// échec, la place est rendue. Sinon une panne passagère laisserait le compte bloqué une fois la base
+/// revenue. Une preuve révoquée entre-temps (`Conflict`) reste un échec compté.
+fn refund_if_internal(ticket: crate::ratelimit::Ticket, e: AppError) -> AppError {
+    if matches!(e, AppError::Internal(_)) {
+        ticket.release();
+    }
+    e
 }
 
 pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> ApiResult<CookieJar> {
@@ -183,9 +198,14 @@ pub async fn passkey_finish(
         }
     };
 
-    let jar =
-        auth::open_session(&state, &mut *state.db.acquire().await?, jar, user.id, auth::Proof::Passkey(id))
-            .await?;
+    let opened = match state.db.acquire().await {
+        Ok(mut db) => auth::open_session(&state, &mut db, jar, user.id, auth::Proof::Passkey(id)).await,
+        Err(e) => Err(e.into()),
+    };
+    let jar = match opened {
+        Ok(jar) => jar,
+        Err(e) => return Err(refund_if_internal(ticket, e)),
+    };
     // Rendue aux clés du démarrage (le ticket les porte) : l'adresse de la fin peut différer (réseau
     // mobile, double pile).
     ticket.succeeded();
@@ -233,9 +253,16 @@ mod tests {
         .execute(&s.db)
         .await
         .unwrap();
-        assert!(login().await.is_err());
+        // Quatre échecs : la connexion qui tombe en panne prend la dernière place, et doit la rendre.
+        for _ in 1..crate::ratelimit::MAX_PER_ACCOUNT {
+            let req = LoginRequest { username: "admin".into(), password: "faux".into(), totp: None };
+            let ip = ClientIp("192.0.2.1".parse().unwrap());
+            assert!(super::login(State(s.clone()), ip, CookieJar::new(), Json(req)).await.is_err());
+        }
+        assert!(matches!(login().await, Err(crate::state::AppError::Internal(_))));
         sqlx::raw_sql("DROP TRIGGER panne").execute(&s.db).await.unwrap();
-        assert!(login().await.is_ok(), "code consommé par la connexion qui a échoué");
+        let r = login().await;
+        assert!(r.is_ok(), "code consommé ou place gardée par la connexion en panne : {:?}", r.err());
         assert!(login().await.is_err(), "code rejoué après une connexion aboutie");
     }
 }

@@ -197,8 +197,19 @@ pub struct Announces {
     /// Numéro de départ de la plus récente lecture conclue (publiée, rejointe ou sans objet) : une
     /// lecture commencée avant elle est dépassée.
     published_seq: u64,
+    /// `remote_copies` quand cette lecture a conclu : égal au compteur actuel, elle est plus récente
+    /// que la dernière copie du PC.
+    published_copies: u32,
     /// Windows a refusé la dernière liste de cette lecture conclue (rien d'autre en vol depuis).
     refused: bool,
+    /// La dernière copie du PC n'est pas encore écrite localement (récupération ou écriture en cours,
+    /// écriture refusée faute de focus, formats non pris en charge) : relire le contenu local d'avant
+    /// (`local`) n'est pas une nouvelle copie, le republier écraserait la copie du PC.
+    unwritten: bool,
+    /// Empreinte du presse-papier local de référence : lu, ou écrit par nous. Figée pendant
+    /// `unwritten`, sauf par une publication : une lecture qui ne publie pas (Windows muet) ne doit
+    /// pas faire passer une copie locale plus récente que celle du PC pour le contenu d'avant.
+    local: Option<u64>,
 }
 
 impl Announces {
@@ -232,19 +243,35 @@ impl Announces {
     }
 
     /// Le PC a copié : nos listes en vol ne valident plus rien et ne se rejoignent plus ; leurs
-    /// attentes recevront quand même leur propre verdict.
+    /// attentes recevront quand même leur propre verdict. Le contenu local d'avant est protégé dès
+    /// l'annonce, avant même la réponse de données.
     pub fn remote_changed(&mut self) {
         self.remote_copies = self.remote_copies.wrapping_add(1);
+        self.unwritten = true;
         for a in &mut self.pending {
             a.fp = None;
         }
     }
 
-    /// Copie du PC écrite localement : une lecture commencée avant a pu saisir le contenu d'avant,
-    /// qui n'est plus celui du presse-papier local. Comme après une copie sur le PC, elle n'est ni
-    /// retenue ni publiée (elle écraserait sur le PC la copie qu'on vient d'écrire).
-    pub fn written_locally(&mut self) {
+    /// Copie du PC écrite localement, d'empreinte de relecture `fp` : une lecture commencée avant a
+    /// pu saisir le contenu d'avant, qui n'est plus celui du presse-papier local. Comme après une
+    /// copie sur le PC, elle n'est ni retenue ni publiée (elle écraserait sur le PC la copie qu'on
+    /// vient d'écrire).
+    pub fn written_locally(&mut self, fp: u64) {
         self.remote_copies = self.remote_copies.wrapping_add(1);
+        self.unwritten = false;
+        self.local = Some(fp);
+    }
+
+    /// Lecture retenue d'empreinte `fp` : elle devient la référence locale, sauf pendant une copie du
+    /// PC non écrite où seule une publication la remplace.
+    fn seen(&mut self, fp: u64, published: bool) {
+        if published {
+            self.unwritten = false;
+        }
+        if !self.unwritten {
+            self.local = Some(fp);
+        }
     }
 
     /// À relever avant une lecture locale, pour `after_read`.
@@ -262,20 +289,27 @@ impl Announces {
     /// Lecture locale commencée à `mark`, d'empreinte `fp` ; `common` : empreinte commune.
     /// `Publish` compte la publication : une lecture concurrente plus ancienne sera écartée.
     pub fn after_read(&mut self, mark: Mark, fp: u64, common: Option<u64>, now: f64) -> AfterRead {
-        // Windows a copié pendant la lecture (ou sa copie a été écrite localement) : son contenu est
-        // le plus récent, le nôtre ne doit ni l'écraser ni invalider sa récupération.
-        if self.remote_copies != mark.remote_copies {
+        // Une lecture commencée APRÈS celle-ci a conclu depuis la dernière copie du PC : ce
+        // contenu-ci est plus ancien, c'est elle qui fait référence (même si Windows a copié
+        // pendant cette lecture-ci, la publication récente lui a succédé).
+        let overtaken = self.published_seq > mark.seq && self.published_copies == self.remote_copies;
+        // Windows a copié pendant la lecture (ou sa copie a été écrite localement), sans publication
+        // locale depuis : son contenu est le plus récent, le nôtre ne doit ni l'écraser ni invalider
+        // sa récupération.
+        if self.remote_copies != mark.remote_copies && !overtaken {
             return AfterRead::Done;
         }
         // Windows muet : une liste de plus resterait sans réponse, une attente aussi.
         if self.pending.len() >= MAX_PENDING {
+            if self.is_current(mark) {
+                self.seen(fp, false);
+            }
             return AfterRead::Stalled;
         }
-        // Une lecture commencée APRÈS celle-ci a déjà publié : ce contenu-ci est plus ancien. On
-        // attend plutôt l'accusé de la publication récente, si elle est encore en vol. Une lecture
-        // plus ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci.
-        // Accusé déjà reçu : un refus laisse le PC avec son ancien contenu, il faut relire.
-        if self.published_seq > mark.seq {
+        // On attend l'accusé de la publication récente, si elle est encore en vol. Une lecture plus
+        // ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci. Accusé déjà reçu :
+        // un refus laisse le PC avec son ancien contenu, il faut relire.
+        if overtaken {
             return match (self.pending.is_empty(), self.refused) {
                 (false, _) => AfterRead::Join,
                 (true, true) => AfterRead::Retry,
@@ -285,13 +319,18 @@ impl Announces {
         // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
         // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
         self.published_seq = mark.seq;
+        self.published_copies = self.remote_copies;
         self.refused = false;
-        match self.latest() {
+        // Copie du PC pas encore écrite : relire le contenu local d'avant vaut contenu commun.
+        let common = if self.unwritten && self.local == Some(fp) { Some(fp) } else { common };
+        let next = match self.latest() {
             // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : même accusé.
             Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
             None if common == Some(fp) => AfterRead::Done,
             _ => AfterRead::Publish,
-        }
+        };
+        self.seen(fp, next == AfterRead::Publish);
+        next
     }
 
     /// Réponse de Windows (`ok` : CB_RESPONSE_OK) à la plus ancienne liste en vol. Met à jour
@@ -324,14 +363,6 @@ impl Announces {
     pub fn clear(&mut self) {
         self.pending.clear();
     }
-}
-
-/// Empreinte à tenir pour commune aux deux côtés après une lecture locale d'empreinte `fp`. Tant
-/// qu'une copie du PC attend son écriture locale (`unwritten` : en cours, ou refusée faute de
-/// focus), relire le contenu local d'avant (`local`, vu en dernier) n'est pas une nouvelle copie :
-/// le republier écraserait la copie du PC. Un contenu local différent, lui, prend la main.
-pub fn common_for_read(common: Option<u64>, unwritten: bool, local: Option<u64>, fp: u64) -> Option<u64> {
-    if unwritten && local == Some(fp) { Some(fp) } else { common }
 }
 
 fn blob(bytes: &[u8], mime: &str) -> Result<Blob, String> {
@@ -370,20 +401,6 @@ async fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, St
     });
     let b: Blob = JsFuture::from(promise).await.map_err(js_err)?.unchecked_into();
     blob_bytes(&b).await
-}
-
-/// Le navigateur décode-t-il ce PNG ? Chromium refuse d'écrire une image qu'il ne décode pas, et
-/// `rdp-clip` ne vérifie que la signature.
-pub async fn png_decodes(png: &[u8]) -> bool {
-    let (Ok(b), Some(window)) = (blob(png, "image/png"), web_sys::window()) else { return false };
-    let Ok(p) = window.create_image_bitmap_with_blob(&b) else { return false };
-    match JsFuture::from(p).await {
-        Ok(bmp) => {
-            bmp.unchecked_into::<ImageBitmap>().close();
-            true
-        }
-        Err(_) => false,
-    }
 }
 
 /// Image (PNG ou autre format lisible par le navigateur) → RGBA.
@@ -486,7 +503,8 @@ pub async fn read_local() -> Option<Vec<LocalData>> {
 /// Empreinte qu'aura `items` relu après son écriture locale : le navigateur réencode l'image écrite,
 /// une relecture (`read_local`) en donne un autre PNG et ses pixels. Un PNG compte donc par ses
 /// pixels décodés, comme à la relecture. `None` si le navigateur ne décode pas ce PNG (Chromium
-/// refuse alors de l'écrire, et `rdp-clip` ne vérifie que la signature).
+/// refuse alors de l'écrire). Ses dimensions sont déjà bornées par `rdp-clip`, lues dans l'en-tête
+/// avant tout décodage : il n'est décodé qu'une fois.
 pub async fn written_fingerprint(items: &[LocalData]) -> Option<u64> {
     let Some(png) = items.iter().find_map(|d| match d {
         LocalData::Png(p) => Some(p),
@@ -501,8 +519,7 @@ pub async fn written_fingerprint(items: &[LocalData]) -> Option<u64> {
             seen.push(LocalData::Rgba { width, height, rgba });
             Some(fingerprint(&seen))
         }
-        // Trop grande pour `read_local`, qui n'en relira que le PNG ; ou illisible.
-        Err(_) => png_decodes(png).await.then(|| fingerprint(items)),
+        Err(_) => None,
     }
 }
 
@@ -662,27 +679,122 @@ mod tests {
         assert!(re.try_recv().is_err());
     }
 
+    /// Publie `fp` (lecture, liste envoyée, acceptée) : il devient commun et vu localement.
+    fn publish_accepted(a: &mut Announces, fp: u64, common: &mut Option<u64>, now: f64) {
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fp, *common, now), AfterRead::Publish);
+        a.sent(Some(fp), now, None);
+        a.answered(true, common);
+        assert_eq!(*common, Some(fp));
+    }
+
     #[test]
     fn stale_local_reread_keeps_an_unwritten_remote_copy() {
         let (fa, fb, fc) = (1, 2, 3);
         let mut a = Announces::default();
+        let mut common = None;
         // A vu localement et commun ; Windows copie B, reçu (commun = B) mais pas écrit localement.
+        publish_accepted(&mut a, fa, &mut common, 0.0);
         a.remote_changed();
-        let common = Some(fb);
+        common = Some(fb);
         // Retour du focus : le presse-papier local contient toujours A, ce n'est pas une copie.
         let m = a.mark();
-        assert_eq!(a.after_read(m, fa, common_for_read(common, true, Some(fa), fa), 0.0), AfterRead::Done);
+        assert_eq!(a.after_read(m, fa, common, 10.0), AfterRead::Done);
         // Vraie copie locale C : elle prend la main sur B.
         let m = a.mark();
-        assert_eq!(a.after_read(m, fc, common_for_read(common, true, Some(fa), fc), 0.0), AfterRead::Publish);
-        // B écrit localement (vu en dernier) : relire A est une nouvelle copie.
+        assert_eq!(a.after_read(m, fc, common, 20.0), AfterRead::Publish);
+        a.sent(Some(fc), 20.0, None);
+        a.answered(true, &mut common);
+        // Windows recopie B, écrit localement cette fois (vu en dernier) : relire A est une copie.
+        a.remote_changed();
+        common = Some(fb);
+        a.written_locally(fb);
         let m = a.mark();
-        assert_eq!(
-            a.after_read(m, fa, common_for_read(common, false, Some(fb), fa), 0.0),
-            AfterRead::Publish
-        );
+        assert_eq!(a.after_read(m, fa, common, 30.0), AfterRead::Publish);
         // Contenu local jamais vu : rien ne le distingue d'une copie, comme avant.
-        assert_eq!(common_for_read(common, true, None, fa), common);
+        let mut a = Announces::default();
+        a.remote_changed();
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fa, Some(fb), 0.0), AfterRead::Publish);
+    }
+
+    #[test]
+    fn remote_copy_is_protected_from_its_announcement() {
+        let (fx, fa, fc) = (1, 2, 4);
+        let mut a = Announces::default();
+        let mut common = None;
+        // X vu localement et commun. Windows copie A (reçu, écriture locale refusée), puis B : la
+        // récupération de B est en cours, aucune donnée encore reçue.
+        publish_accepted(&mut a, fx, &mut common, 0.0);
+        a.remote_changed();
+        common = Some(fa);
+        a.remote_changed();
+        // Retour du focus : X relu avant la réponse de B, il n'écrase pas B.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fx, common, 10.0), AfterRead::Done);
+        // Une copie locale distincte prend toujours la main.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fc, common, 20.0), AfterRead::Publish);
+    }
+
+    #[test]
+    fn reads_while_stalled_keep_the_reference_from_before_the_remote_copy() {
+        let (fx, fb, fc) = (1, 2, 3);
+        let mut a = Announces::default();
+        let mut common = None;
+        // X vu localement ; Windows muet : X réannoncé (délai dépassé) jusqu'au plafond.
+        for k in 0..MAX_PENDING {
+            let m = a.mark();
+            let now = k as f64 * 3000.0;
+            assert_eq!(a.after_read(m, fx, common, now), AfterRead::Publish);
+            a.sent(Some(fx), now, None);
+        }
+        // Windows copie B, écriture locale refusée ; l'utilisateur copie C dans le navigateur.
+        a.remote_changed();
+        common = Some(fb);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fc, common, 30_000.0), AfterRead::Stalled);
+        // Un accusé libère une place : relire X préserve encore B, relire C publie C.
+        a.answered(true, &mut common);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fx, common, 31_000.0), AfterRead::Done);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fc, common, 32_000.0), AfterRead::Publish);
+    }
+
+    #[test]
+    fn local_publication_after_a_remote_copy_is_awaited() {
+        let mut a = Announces::default();
+        let mut common = None;
+        // Ctrl+V : lecture de A (1) commencée. Windows copie C ; au retour du focus, une copie
+        // locale B (2) est lue et annoncée.
+        let ma = a.mark();
+        a.remote_changed();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 2, common, 0.0), AfterRead::Publish);
+        a.sent(Some(2), 0.0, None);
+        // A se termine : B attend encore son accusé, Ctrl+V l'attend aussi, sans republier A.
+        assert_eq!(a.after_read(ma, 1, common, 10.0), AfterRead::Join);
+        // B refusée : il reste à relire.
+        a.answered(false, &mut common);
+        assert_eq!(a.after_read(ma, 1, common, 20.0), AfterRead::Retry);
+        // Même course avec une nouvelle copie locale (3), acceptée : plus rien à attendre.
+        let ma = a.mark();
+        a.remote_changed();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 3, common, 30.0), AfterRead::Publish);
+        a.sent(Some(3), 30.0, None);
+        a.answered(true, &mut common);
+        assert_eq!(a.after_read(ma, 1, common, 40.0), AfterRead::Done);
+        // Windows copie D APRÈS la publication d'une copie locale (4) : sa copie reste la plus
+        // récente, la lecture dépassée conclut sans attendre l'accusé de 4.
+        let ma = a.mark();
+        let mc = a.mark();
+        assert_eq!(a.after_read(mc, 4, common, 50.0), AfterRead::Publish);
+        a.sent(Some(4), 50.0, None);
+        a.remote_changed();
+        common = Some(5);
+        assert_eq!(a.after_read(ma, 1, common, 60.0), AfterRead::Done);
     }
 
     #[test]
@@ -730,17 +842,14 @@ mod tests {
         // A vu localement ; Windows copie B ; une lecture part, puis B est écrit localement.
         a.remote_changed();
         let m = a.mark();
-        a.written_locally();
+        a.written_locally(fb);
         // Elle rend A, que le presse-papier local ne contient plus : ni retenue, ni publiée.
         assert!(!a.is_current(m));
-        assert_eq!(a.after_read(m, fa, common_for_read(Some(fb), false, Some(fb), fa), 0.0), AfterRead::Done);
+        assert_eq!(a.after_read(m, fa, Some(fb), 0.0), AfterRead::Done);
         // Commencée après l'écriture, une lecture de A est une vraie copie locale.
         let m = a.mark();
         assert!(a.is_current(m));
-        assert_eq!(
-            a.after_read(m, fa, common_for_read(Some(fb), false, Some(fb), fa), 0.0),
-            AfterRead::Publish
-        );
+        assert_eq!(a.after_read(m, fa, Some(fb), 0.0), AfterRead::Publish);
     }
 
     #[test]

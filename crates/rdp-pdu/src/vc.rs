@@ -7,6 +7,8 @@ use crate::{Error, cursor::Reader};
 pub const CHANNEL_FLAG_FIRST: u32 = 0x01;
 pub const CHANNEL_FLAG_LAST: u32 = 0x02;
 pub const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x10;
+pub const CHANNEL_FLAG_SUSPEND: u32 = 0x20;
+pub const CHANNEL_FLAG_RESUME: u32 = 0x40;
 /// Taille des morceaux annoncée dans la capacité Virtual Channel.
 pub const CHUNK_SIZE: usize = 1600;
 
@@ -57,6 +59,13 @@ impl ChannelReassembler {
         }
         if total > MAX_CHANNEL_MESSAGE {
             return Err(Error::Invalid("message de canal trop grand"));
+        }
+        // SUSPEND / RESUME (serveur → client) : notification de contrôle, pas un fragment de
+        // données ; le message en cours de réassemblage n'est pas touché.
+        if flags & (CHANNEL_FLAG_SUSPEND | CHANNEL_FLAG_RESUME) != 0
+            && flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST) == 0
+        {
+            return Ok(None);
         }
         if flags & CHANNEL_FLAG_FIRST != 0 {
             self.buf.clear();
@@ -286,6 +295,27 @@ mod tests {
         assert!(r.feed(&header(2, CHANNEL_FLAG_LAST, &[3, 4])).is_err());
         // Message vide en un morceau.
         assert_eq!(r.feed(&header(0, whole, &[])).unwrap(), Some(Vec::new()));
+        // Fragment orphelin (ni FIRST ni réassemblage en cours) : toujours refusé.
+        assert!(r.feed(&header(2, 0, &[1, 2])).is_err());
+    }
+
+    #[test]
+    fn suspend_and_resume_are_notifications() {
+        let header = |total: u32, flags: u32, data: &[u8]| {
+            let mut v = total.to_le_bytes().to_vec();
+            v.extend(flags.to_le_bytes());
+            v.extend_from_slice(data);
+            v
+        };
+        let mut r = ChannelReassembler::default();
+        // Sans message en cours.
+        assert_eq!(r.feed(&header(0, CHANNEL_FLAG_SUSPEND, &[])).unwrap(), None);
+        assert_eq!(r.feed(&header(0, CHANNEL_FLAG_RESUME, &[])).unwrap(), None);
+        // Pendant un message : le réassemblage continue comme si de rien n'était.
+        assert_eq!(r.feed(&header(4, CHANNEL_FLAG_FIRST, &[1, 2])).unwrap(), None);
+        assert_eq!(r.feed(&header(0, CHANNEL_FLAG_SUSPEND, &[])).unwrap(), None);
+        assert_eq!(r.feed(&header(0, CHANNEL_FLAG_RESUME, &[])).unwrap(), None);
+        assert_eq!(r.feed(&header(4, CHANNEL_FLAG_LAST, &[3, 4])).unwrap(), Some(alloc::vec![1, 2, 3, 4]));
     }
 
     #[test]

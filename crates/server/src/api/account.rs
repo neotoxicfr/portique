@@ -142,18 +142,27 @@ pub async fn totp_confirm(
     let step = totp::verify(&secret, &u.username, &req.code, 0)?
         .ok_or_else(|| bad("code invalide, vérifie l'heure du téléphone"))?;
     // N'active que la graine vérifiée : effacée entre-temps (remise à zéro de la 2FA par un admin) ou
-    // remplacée par une autre configuration, elle ne doit pas revenir.
+    // remplacée par une autre configuration, elle ne doit pas revenir. Une passkey ajoutée depuis le contrôle
+    // exige, elle aussi, une session ouverte avec un second facteur.
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
     let r = sqlx::query(
-        "UPDATE users SET totp_secret = ?, totp_pending = NULL, totp_last = ?
-         WHERE id = ? AND totp_secret IS NULL AND totp_pending = ?",
+        "UPDATE users SET totp_secret = ?1, totp_pending = NULL, totp_last = ?2
+         WHERE id = ?3 AND totp_secret IS NULL AND totp_pending = ?4
+           AND (?5 OR NOT EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?3)
+                OR EXISTS (SELECT 1 FROM sessions
+                           WHERE token_hash = ?6 AND user_id = ?3 AND mfa AND expires_at >= unixepoch()))",
     )
     .bind(state.vault.seal(&format!("totp:{}", u.id), &secret))
     .bind(step)
     .bind(u.id)
     .bind(&pending)
+    .bind(state.cfg.auth_mode == AuthMode::Proxy)
+    .bind(token)
     .execute(&state.db)
     .await?;
     if r.rows_affected() == 0 {
+        // Refus dû à une passkey apparue entre-temps : dire pourquoi.
+        second_factor_gate(&state, &u, &jar).await?;
         return Err(bad("aucune configuration TOTP en cours"));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -234,26 +243,40 @@ pub async fn passkey_register_finish(
         .map(|n| n.trim().chars().take(64).collect::<String>())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Passkey".into());
-    // La session qui a passé les contrôles doit exister encore, et n'avoir pas expiré depuis : une remise à
-    // zéro de la 2FA ou un mot de passe changé par un admin entre-temps l'a supprimée, la passkey ne doit
-    // pas survivre à ce ménage.
     let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
+    let credential = serde_json::to_string(&key).map_err(anyhow::Error::from)?;
+    if !store_passkey(&state, u.id, &name, &credential, token.as_deref()).await? {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(StatusCode::CREATED)
+}
+
+/// Enregistre la passkey si la session qui a passé les contrôles existe encore et n'a pas expiré (une remise
+/// à zéro de la 2FA ou un mot de passe changé par un admin l'a supprimée : la passkey ne doit pas survivre à
+/// ce ménage), et si elle a été ouverte avec un second facteur dès que le compte en a un au moment de
+/// l'écriture : un TOTP ou une passkey ajoutés pendant la cérémonie comptent.
+async fn store_passkey(
+    state: &AppState,
+    user_id: i64,
+    name: &str,
+    credential: &str,
+    token: Option<&[u8]>,
+) -> ApiResult<bool> {
     let r = sqlx::query(
         "INSERT INTO passkeys (user_id, name, credential) SELECT ?1, ?2, ?3
-         WHERE ?4 OR EXISTS (SELECT 1 FROM sessions
-                           WHERE token_hash = ?5 AND user_id = ?1 AND expires_at >= unixepoch())",
+         WHERE ?4 OR EXISTS (SELECT 1 FROM sessions s
+                             WHERE s.token_hash = ?5 AND s.user_id = ?1 AND s.expires_at >= unixepoch()
+                               AND (s.mfa OR NOT (EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?1)
+                                    OR EXISTS (SELECT 1 FROM users WHERE id = ?1 AND totp_secret IS NOT NULL))))",
     )
-    .bind(u.id)
+    .bind(user_id)
     .bind(name)
-    .bind(serde_json::to_string(&key).map_err(anyhow::Error::from)?)
+    .bind(credential)
     .bind(state.cfg.auth_mode == AuthMode::Proxy)
     .bind(token)
     .execute(&state.db)
     .await?;
-    if r.rows_affected() == 0 {
-        return Err(AppError::Unauthorized);
-    }
-    Ok(StatusCode::CREATED)
+    Ok(r.rows_affected() == 1)
 }
 
 pub async fn passkey_delete(
@@ -475,5 +498,78 @@ mod tests {
             "{verdict:?}"
         );
         assert!(now.totp_secret.is_none(), "graine réactivée après la remise à zéro");
+    }
+
+    /// Un facteur apparu pendant la cérémonie (TOTP activé, autre passkey) : l'écriture de la passkey exige
+    /// alors une session ouverte avec un second facteur ; un compte toujours sans facteur garde l'inscription.
+    #[tokio::test]
+    async fn passkey_needs_mfa_session_once_account_has_a_factor() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES
+               (x'01', 1, unixepoch() + 60, 0), (x'02', 1, unixepoch() + 60, 1);",
+        )
+        .execute(&s.db)
+        .await
+        .unwrap();
+        let store = |token: &'static [u8]| super::store_passkey(&s, u.id, "Passkey", "{}", Some(token));
+        assert!(store(b"\x01").await.unwrap(), "compte sans facteur : session au mot de passe seul acceptée");
+        assert!(!store(b"\x01").await.unwrap(), "passkey apparue : session sans facteur refusée");
+        assert!(store(b"\x02").await.unwrap());
+        sqlx::query("DELETE FROM passkeys").execute(&s.db).await.unwrap();
+        sqlx::query("UPDATE users SET totp_secret = x'01' WHERE id = ?")
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        assert!(!store(b"\x01").await.unwrap(), "TOTP apparu : session sans facteur refusée");
+        assert!(store(b"\x02").await.unwrap());
+    }
+
+    /// Une passkey enregistrée pendant qu'une confirmation TOTP est en vol (contrôle passé) : la confirmation
+    /// d'une session sans facteur n'active pas le TOTP. Base sur disque : l'inscription tient le verrou
+    /// d'écriture, invisible du contrôle, puis valide pendant que la confirmation attend ce verrou. Machine
+    /// trop lente (contrôle après la validation) : le test passe sans rien prouver, il n'échoue pas à tort.
+    #[tokio::test]
+    async fn passkey_added_meanwhile_blocks_password_only_totp_confirm() {
+        let path = std::env::temp_dir().join(format!("portique-totp-pk-{}.db", std::process::id()));
+        let db = crate::open_db(&format!("sqlite://{}", path.display())).await.unwrap();
+        let s = crate::state::AppState { db, ..crate::api::ssh::tests::state("builtin").await };
+        crate::bootstrap_admin(&s).await.unwrap();
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        sqlx::query("UPDATE users SET totp_pending = ? WHERE id = ?")
+            .bind(s.vault.seal(&format!("totp-pending:{}", u.id), &secret))
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        let mut register = s.db.begin().await.unwrap();
+        sqlx::query("INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'Passkey', '{}')")
+            .bind(u.id)
+            .execute(&mut *register)
+            .await
+            .unwrap();
+        let confirm = tokio::spawn(super::totp_confirm(
+            State(s.clone()),
+            CurrentUser(u.clone()),
+            CookieJar::new(),
+            Json(TotpConfirm { code }),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        register.commit().await.unwrap();
+        let verdict = confirm.await.unwrap();
+        let now = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        s.db.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        assert!(
+            matches!(&verdict, Err(AppError::BadRequest(m)) if m.starts_with("reconnecte-toi")),
+            "{verdict:?}"
+        );
+        assert!(now.totp_secret.is_none(), "TOTP activé par une session sans facteur");
     }
 }

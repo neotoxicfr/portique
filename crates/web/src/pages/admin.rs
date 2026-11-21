@@ -282,6 +282,8 @@ struct Form {
     port: RwSignal<String>,
     username: RwSignal<String>,
     domain: RwSignal<String>,
+    /// Port, utilisateur et domaine RDP tels qu'enregistrés : renvoyés tant que le RDP est désactivé.
+    rdp_saved: RwSignal<(String, String, String)>,
     password: RwSignal<String>,
     wol_mac: RwSignal<String>,
     wol_target: RwSignal<String>,
@@ -336,6 +338,11 @@ impl Form {
         self.port.set(c.map(|c| c.port.to_string()).unwrap_or_default());
         self.username.set(s(c.map(|c| c.username.as_str())));
         self.domain.set(s(c.map(|c| c.domain.as_str())));
+        self.rdp_saved.set((
+            self.port.get_untracked(),
+            self.username.get_untracked(),
+            self.domain.get_untracked(),
+        ));
         self.password.set(String::new());
         self.wol_mac.set(s(c.and_then(|c| c.wol_mac.as_deref())));
         self.wol_target.set(s(c.and_then(|c| c.wol_target.as_deref())));
@@ -372,15 +379,23 @@ impl Form {
         let opt = |s: RwSignal<String>| Some(s.get_untracked()).filter(|v| !v.trim().is_empty());
         let wol = self.wol.get_untracked();
         let by_command = wol && self.wol_by_command.get_untracked();
+        let rdp = self.rdp.get_untracked();
+        // RDP désactivé : ses champs, masqués, repartent tels qu'enregistrés. Un brouillon invalide ne fait pas
+        // refuser le formulaire, et la configuration reste pour une réactivation.
+        let (port, username, domain) = if rdp {
+            (self.port.get_untracked(), self.username.get_untracked(), self.domain.get_untracked())
+        } else {
+            self.rdp_saved.get_untracked()
+        };
         ConnectionInput {
             name: self.name.get_untracked(),
-            rdp: self.rdp.get_untracked(),
+            rdp,
             host: self.host.get_untracked(),
-            port: self.port.get_untracked().trim().parse().ok(),
-            username: self.username.get_untracked(),
-            domain: self.domain.get_untracked(),
-            // Champ vide en modification = garder l'ancien mot de passe.
-            password: opt(self.password),
+            port: port.trim().parse().ok(),
+            username,
+            domain,
+            // Champ vide en modification (ou RDP désactivé) = garder l'ancien mot de passe.
+            password: opt(self.password).filter(|_| rdp),
             wol_mac: opt(self.wol_mac).filter(|_| wol),
             // Champ masqué en mode commande : sa valeur ne doit pas faire refuser le formulaire.
             wol_target: opt(self.wol_target).filter(|_| wol && !by_command),
@@ -471,6 +486,9 @@ fn Editor(
     // machine rouverte pendant l'écriture pourrait sinon repartir, sur l'ancien instantané, dans un second
     // envoi que le serveur appliquerait peut-être avant le premier.
     let writes = RwSignal::new(Vec::<i64>::new());
+    // Machines restées verrouillées faute de relecture, avec l'erreur de celle-ci : affichée seulement quand la
+    // machine est sélectionnée, avec « Relire ».
+    let stale = RwSignal::new(Vec::<(i64, String)>::new());
     let locked = move || f.busy.get() || f.editing.get().is_some_and(|id| writes.with(|w| w.contains(&id)));
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();
@@ -512,26 +530,13 @@ fn Editor(
             if let (Err(_), Some(id)) = (&r, target)
                 && !same
                 && f.editing.try_get_untracked() == Some(Some(id))
+                && let Err(e) = reread(id, conns, f, open).await
             {
-                match api::get::<Vec<ConnectionAdmin>>("/api/admin/connections").await {
-                    Ok(list) => {
-                        // L'état relu devient l'instantané de la liste AVANT de lever le verrou : rouverte plus
-                        // tard, la machine repart de lui et non de l'ancien.
-                        if let Some(c) = list.iter().find(|c| c.id == id) {
-                            conns.update(|l| match l.iter_mut().find(|x| x.id == id) {
-                                Some(x) => *x = c.clone(),
-                                None => l.push(c.clone()),
-                            });
-                            if f.editing.try_get_untracked() == Some(Some(id)) {
-                                f.fill(Some(c));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        keep_lock = true;
-                        f.err.set(Some(format!("état de la machine à relire (recharge la page) : {e}")));
-                    }
-                }
+                keep_lock = true;
+                stale.update(|s| {
+                    s.retain(|(x, _)| *x != id);
+                    s.push((id, e));
+                });
             }
             if let Some(id) = target
                 && !keep_lock
@@ -586,6 +591,27 @@ fn Editor(
         });
     };
 
+    // Nouvelle relecture d'une machine restée verrouillée.
+    let retry = move |id: i64| {
+        spawn_local(async move {
+            match reread(id, conns, f, open).await {
+                Ok(()) => {
+                    stale.update(|s| s.retain(|(x, _)| *x != id));
+                    writes.update(|w| w.retain(|x| *x != id));
+                }
+                Err(e) => stale.update(|s| {
+                    if let Some(x) = s.iter_mut().find(|(x, _)| *x == id) {
+                        x.1 = e;
+                    }
+                }),
+            }
+        });
+    };
+    let stale_err = move || {
+        let id = f.editing.get()?;
+        stale.with(|s| s.iter().find(|(x, _)| *x == id).map(|(_, e)| (id, e.clone())))
+    };
+
     let non_admins = move || users.get().into_iter().filter(|u| !u.is_admin).collect::<Vec<_>>();
     // Hôtes SSH proposables comme rebond ou comme relais de réveil (jamais la machine elle-même).
     let ssh_hosts = move || {
@@ -617,6 +643,13 @@ fn Editor(
     view! {
         <Show when=move || open.get()>
             <form on:submit=save>
+                // Hors du fieldset figé : « Relire » reste cliquable.
+                {move || stale_err().map(|(id, e)| view! {
+                    <div class="banner error" role="alert">
+                        <span>{format!("État de la machine à relire : {}", sentence(&e))}</span>
+                        <button type="button" on:click=move |_| retry(id)>"Relire"</button>
+                    </div>
+                })}
                 <fieldset class="editor" disabled=locked>
                     <div class="group">
                         <label class="line"><span class="line-label">"Nom"</span>
@@ -791,6 +824,42 @@ fn Editor(
     }
 }
 
+/// Relit l'état serveur de la machine `id` après une écriture à l'issue inconnue, bornée dans le temps. Réussie,
+/// elle remplace l'instantané de la liste (et le formulaire s'il montre encore la machine) AVANT que l'appelant
+/// lève le verrou : rouverte plus tard, la machine repart de l'état relu. Machine supprimée entre-temps : retirée,
+/// et son éditeur fermé (un nouvel envoi recevrait 404). Erreur : le verrou doit rester.
+async fn reread(
+    id: i64,
+    conns: RwSignal<Vec<ConnectionAdmin>>,
+    f: Form,
+    open: RwSignal<bool>,
+) -> Result<(), String> {
+    let list = match crate::within(15_000, api::get::<Vec<ConnectionAdmin>>("/api/admin/connections")).await {
+        Some(Ok(l)) => l,
+        Some(Err(e)) => return Err(e.to_string()),
+        None => return Err("le serveur ne répond pas".into()),
+    };
+    let shown = f.editing.try_get_untracked() == Some(Some(id));
+    match list.into_iter().find(|c| c.id == id) {
+        Some(c) => {
+            conns.update(|l| match l.iter_mut().find(|x| x.id == id) {
+                Some(x) => *x = c.clone(),
+                None => l.push(c.clone()),
+            });
+            if shown {
+                f.fill(Some(&c));
+            }
+        }
+        None => {
+            conns.update(|l| l.retain(|x| x.id != id));
+            if shown {
+                open.set(false);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copie dans le presse-papier ; faux s'il est indisponible (hors HTTPS) ou refusé.
 async fn copy_text(text: &str) -> bool {
     let nav = window().navigator();
@@ -883,7 +952,7 @@ fn ServiceKeyPanel() -> impl IntoView {
 mod tests {
     use leptos::prelude::Set;
 
-    use portique_proto::UserInput;
+    use portique_proto::{ConnectionAdmin, UserInput};
 
     use super::{Form, restriction, sent_draft};
 
@@ -916,6 +985,43 @@ mod tests {
         let i = f.input();
         assert_eq!(i.wol_target.as_deref(), Some("pas une cible"));
         assert!(i.wol_command.is_none());
+    }
+
+    #[test]
+    fn hidden_rdp_fields_are_sent_as_saved() {
+        let c = ConnectionAdmin {
+            id: 7,
+            name: "Bureau".into(),
+            host: "192.0.2.11".into(),
+            rdp: true,
+            port: 3390,
+            username: "alice".into(),
+            domain: "MAISON".into(),
+            has_password: true,
+            wol_mac: None,
+            wol_target: None,
+            allowed_users: vec![],
+            cert_fingerprint: None,
+            wol_command: None,
+            ssh: None,
+        };
+        let f = Form::default();
+        f.fill(Some(&c));
+        f.ssh.set(true);
+        f.ssh_user.set("alice".into());
+        // Brouillon RDP invalide, puis RDP désactivé : il ne part pas, la configuration enregistrée reste.
+        f.port.set("0".into());
+        f.domain.set("d".repeat(256));
+        f.password.set("brouillon".into());
+        f.rdp.set(false);
+        let i = f.input();
+        assert_eq!((i.port, i.username.as_str(), i.domain.as_str()), (Some(3390), "alice", "MAISON"));
+        assert_eq!(i.password, None);
+        // RDP actif : le brouillon part tel quel, le serveur garde sa limite.
+        f.rdp.set(true);
+        let i = f.input();
+        assert_eq!((i.port, i.domain.len()), (Some(0), 256));
+        assert_eq!(i.password.as_deref(), Some("brouillon"));
     }
 
     #[test]

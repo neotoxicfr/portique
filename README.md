@@ -89,17 +89,20 @@ navigateur côté client, ordinateur ou téléphone.
 ```sh
 mkdir -p portique && cd portique
 (umask 077; mkdir -p secrets data                   # rien de lisible par un autre compte
- [ -s secrets/master_key ] ||                       # jamais régénérée : la base en dépend
+ if [ ! -s secrets/master_key ]; then               # jamais régénérée : la base en dépend
+   sudo test -e data/portique.db && { echo "base existante : restaure secrets/master_key" >&2; exit 1; }
    openssl rand -base64 32 > secrets/master_key     # chiffre les identifiants en base
+ fi
  [ -s secrets/admin_password ] ||
-   openssl rand -base64 18 > secrets/admin_password) # mot de passe du premier compte admin
-chmod 700 secrets data                              # aussi si les dossiers existaient déjà
-chmod 400 secrets/* && cat secrets/admin_password        # à noter : il sert à la première connexion
+   openssl rand -base64 18 > secrets/admin_password) && # mot de passe du premier compte admin
+sudo chmod 700 secrets data &&                      # aussi si les dossiers existaient déjà
+sudo chmod 400 secrets/* && sudo cat secrets/admin_password && # à noter : il sert à la première connexion
 sudo chown 10001:10001 data secrets/*               # le conteneur tourne sous l'UID 10001
 ```
 
-Sur une installation existante, ces commandes gardent les secrets en place : une nouvelle clé ne déchiffrerait
-plus les identifiants enregistrés, et `admin_password` ne sert qu'au premier démarrage (base sans admin), le
+Sur une installation existante, ces commandes gardent les secrets en place (et se relancent sans erreur) : une
+nouvelle clé ne déchiffrerait plus les identifiants enregistrés, d'où l'arrêt si la clé manque alors que la base
+existe (restaure-la d'une sauvegarde) ; `admin_password` ne sert qu'au premier démarrage (base sans admin), le
 modifier ensuite ne change rien au compte. Mot de passe admin perdu : un autre admin le remet dans **Admin**.
 Sinon, conteneur arrêté, retire les droits admin, puis remets à zéro la double authentification du compte
 `admin` (TOTP ou passkey perdus) et ferme ses sessions (un cookie volé ne doit pas retrouver le rôle admin),
@@ -249,8 +252,8 @@ séquence de connexion et les comportements mesurés sur Windows : [`docs/rdp-co
 
 ## Développer
 
-Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl` et `openssl`
-(xterm.js est téléchargé et vérifié au build).
+Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl`, `openssl` et
+`flock` (xterm.js est téléchargé et vérifié au build ; détail dans [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ```sh
 ./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
@@ -263,7 +266,9 @@ PORTIQUE_ADMIN_PASSWORD=change-me-please cargo run -p portique-server
 ```
 
 Les images amd64 et arm64 se construisent en natif, sans émulation : runners GitHub des deux architectures pour
-les releases, `scripts/build-image.sh` pour l'image `dev`. Une version se publie par `scripts/release.sh X.Y.Z` :
+les releases, `scripts/build-image.sh` pour l'image `dev`. Une version se publie depuis `main` : version de
+`Cargo.toml` et entrée `## [vX.Y.Z]` de `CHANGELOG.md` à jour, notes rédigées à la main dans un fichier (par
+défaut `.audit/release-vX.Y.Z.md`, ignoré par Git), puis `scripts/release.sh X.Y.Z [chemin/notes.md]` :
 contrôles, tag poussé, release créée par le workflow, puis notes posées dessus. Les contributions sont
 bienvenues : [CONTRIBUTING.md](CONTRIBUTING.md), [code de conduite](CODE_OF_CONDUCT.md).
 

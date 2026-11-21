@@ -11,6 +11,7 @@ const CHECK: &str = r#"<path d="M5 12l5 5 9-10"/>"#;
 const RESET: &str = r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#;
 const STAR: &str = r#"<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>"#;
 const SHIELD_OK: &str = r#"<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/>"#;
+const INFO: &str = r#"<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.5"/>"#;
 const SHIELD_NO: &str =
     r#"<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M12 9v4M12 16v.5"/>"#;
 
@@ -228,6 +229,17 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
                                 .into_iter().flatten().collect::<Vec<_>>().join(" + "),
                         };
                         let has_2fa = u.totp_enabled || u.passkeys > 0;
+                        // Mode proxy : la connexion passe par le proxy d'authentification, qui seul sait s'il exige un
+                        // second facteur. Une information, pas une alerte.
+                        let proxy = session.is_proxy();
+                        let (mfa_class, mfa_icon, twofa) = if proxy {
+                            ("mfa info", INFO, "Connexion gérée par le proxy d'authentification : la double authentification \
+                                se règle dans le proxy, Portique ne peut pas savoir si elle y est exigée".to_string())
+                        } else if has_2fa {
+                            ("mfa on", SHIELD_OK, twofa)
+                        } else {
+                            ("mfa", SHIELD_NO, twofa)
+                        };
                         let editable = !is_me && !u.external;
                         let (u_toggle, u_reset, u_del) = (u.clone(), u.clone(), u.clone());
                         let toggle_label = if u.is_admin {
@@ -242,8 +254,8 @@ fn Users(users: RwSignal<Vec<UserAdmin>>, reload: impl Fn() + Copy + Send + Sync
                                 <span class="avatar" aria-hidden="true">{initial}</span>
                                 <span class="name">{u.username.clone()} {u.external.then_some(view! { <span class="badge">" proxy"</span> })}</span>
                                 <span class="role">{if u.is_admin { "admin" } else { "utilisateur" }}</span>
-                                <span class=if has_2fa { "mfa on" } else { "mfa" } role="img" aria-label=twofa.clone() title=twofa>
-                                    {icon(if has_2fa { SHIELD_OK } else { SHIELD_NO })}
+                                <span class=mfa_class role="img" aria-label=twofa.clone() title=twofa>
+                                    {icon(mfa_icon)}
                                 </span>
                                 {editable.then(|| view! {
                                     <button type="button" class="iconbtn ghost" aria-label=toggle_label.clone() title=toggle_label
@@ -411,7 +423,7 @@ struct Hop {
     user: RwSignal<String>,
     password: RwSignal<String>,
     has_password: RwSignal<bool>,
-    /// Hôte connu par lequel passe l'hôte saisi ; vide = aucun.
+    /// « Accès à l'hôte » : hôte connu par lequel on joint l'hôte saisi ; vide = direct.
     via: RwSignal<String>,
     hostkey: RwSignal<Option<String>>,
     pending: RwSignal<Option<String>>,
@@ -483,11 +495,27 @@ impl Hop {
     /// pas encore enregistrée : la sélection retombe sur `none`, visible. Le « par » d'un hôte saisi reste : il peut
     /// désigner la copie cachée laissée par une suppression (absente de la liste), gardée si elle revient inchangée.
     fn reconcile(&self, ids: &[String], saved: bool, server: Option<&HopAdmin>, none: &str) {
+        // Vue du serveur pas encore cohérente avec la liste (hôte connu qu'elle ne contient pas) : on attend.
+        if matches!(server, Some(HopAdmin::Known { id }) if !ids.contains(&id.to_string())) {
+            return;
+        }
         if self.sel.with(|v| v != "host" && !v.is_empty() && !ids.contains(v)) {
             if saved {
                 self.fill(server, none);
-            } else {
+            } else if self.sel.with(|v| v != none) {
                 self.sel.set(none.to_owned());
+            }
+            return;
+        }
+        // Hôte saisi dont l'accès passait par un hôte connu supprimé : le serveur l'a remplacé par sa copie cachée ;
+        // seul ce champ est repris, le reste du brouillon reste tel quel.
+        if self.sel.with(|v| v == "host")
+            && self.via.with(|v| !v.is_empty() && !ids.contains(v))
+            && let Some(HopAdmin::Host { via_id, .. }) = server
+        {
+            let fresh = via_id.map(|v| v.to_string()).unwrap_or_default();
+            if self.via.with(|v| *v != fresh) {
+                self.via.set(fresh);
             }
         }
     }
@@ -507,22 +535,23 @@ fn unavailable(conns: RwSignal<Vec<ConnectionAdmin>>, sel: RwSignal<String>) -> 
     })
 }
 
-/// Un menu d'hôtes connus (avec « Aucun » en tête si `none`), partagé par « Rebond » et « Par ».
+/// Un menu d'hôtes connus, partagé par « Rebond » et « Accès à l'hôte » (`prefix` : « par » devant le nom).
 fn known_options(
     conns: RwSignal<Vec<ConnectionAdmin>>,
     editing: RwSignal<Option<i64>>,
     sel: RwSignal<String>,
+    prefix: &'static str,
 ) -> impl IntoView {
     view! {
         {move || unavailable(conns, sel).map(|(v, name)| view! {
-            <option value=v disabled prop:selected=true>{format!("{name} (SSH désactivé)")}</option>
+            <option value=v disabled prop:selected=true>{format!("{prefix}{name} (SSH désactivé)")}</option>
         })}
         // Options recréées à chaque rechargement : chacune reprend sa sélection, sinon le navigateur retombe sur
         // la première sans que la valeur change.
         {move || ssh_hosts(conns, editing).into_iter()
             .map(|c| {
                 let v = c.id.to_string();
-                view! { <option value=v.clone() prop:selected=move || sel.with(|j| *j == v)>{c.name}</option> }
+                view! { <option value=v.clone() prop:selected=move || sel.with(|j| *j == v)>{format!("{prefix}{}", c.name)}</option> }
             })
             .collect_view()}
     }
@@ -542,7 +571,7 @@ fn HopFields(
             <select prop:value=move || hop.sel.get() on:change=input(hop.sel)>
                 {none.then(|| view! { <option value="" prop:selected=move || hop.sel.with(String::is_empty)>"Aucun"</option> })}
                 <option value="host" prop:selected=move || hop.sel.with(|s| s == "host")>"Hôte"</option>
-                {known_options(conns, editing, hop.sel)}
+                {known_options(conns, editing, hop.sel, "")}
             </select></label>
         <Show when=move || hop.sel.with(|s| s == "host")>
             <label class="line"><span class="line-label">"Adresse"</span>
@@ -555,17 +584,17 @@ fn HopFields(
                 <input type="password" autocomplete="new-password"
                     placeholder=move || if hop.has_password.get() { "inchangé" } else { "facultatif : clé du service" }
                     prop:value=move || hop.password.get() on:input=input(hop.password)/></label>
-            <label class="line"><span class="line-label">"Par"</span>
+            <label class="line"><span class="line-label">"Accès à l'hôte"</span>
                 <select prop:value=move || hop.via.get() on:change=input(hop.via)>
-                    <option value="" prop:selected=move || hop.via.with(String::is_empty)>"Aucun"</option>
+                    <option value="" prop:selected=move || hop.via.with(String::is_empty)>"direct"</option>
                     {move || {
                         let v = hop.via.get();
                         let listed = conns.with(|l| l.iter().any(|c| c.id.to_string() == v));
                         (!v.is_empty() && !listed).then(|| view! {
-                            <option value=v disabled prop:selected=true>"rebond conservé"</option>
+                            <option value=v disabled prop:selected=true>"par la copie d'un hôte supprimé"</option>
                         })
                     }}
-                    {known_options(conns, editing, hop.via)}
+                    {known_options(conns, editing, hop.via, "par ")}
                 </select></label>
             {move || hop.hostkey.get().map(|k| view! {
                 <div class="line col"><span>"Clé approuvée"</span><span class="val">{k}</span></div>
@@ -1224,6 +1253,20 @@ mod tests {
         h.sel.set("7".into());
         h.reconcile(&["9".to_owned()], false, None, "host");
         assert_eq!(h.sel.get_untracked(), "host");
+        // Accès de l'hôte saisi par un hôte connu supprimé : seul `via` reprend la copie cachée du serveur.
+        h.fill(Some(&host_hop()), "");
+        h.user.set("brouillon".into());
+        let mut server = host_hop();
+        if let HopAdmin::Host { via_id, .. } = &mut server {
+            *via_id = Some(12);
+        }
+        h.reconcile(&["9".to_owned()], true, Some(&server), "");
+        assert_eq!(h.via.get_untracked(), "12");
+        assert_eq!(h.user.get_untracked(), "brouillon", "le reste du brouillon est gardé");
+        // Vue du serveur pas encore à jour (hôte connu absent de la liste) : rien ne bouge.
+        h.sel.set("7".into());
+        h.reconcile(&["9".to_owned()], true, Some(&HopAdmin::Known { id: 7 }), "");
+        assert_eq!(h.sel.get_untracked(), "7");
     }
 
     #[test]

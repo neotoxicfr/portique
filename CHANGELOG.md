@@ -8,11 +8,14 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 
 - Réveil en mode « Direct » (paquet UDP, sans hôte SSH) ou « Rebond ». En mode Rebond comme pour le terminal SSH,
   la machine passe par un hôte connu de la liste ou par un « Hôte » saisi pour elle seule (adresse, port, compte,
-  mot de passe facultatif, clé d'hôte à approuver ou à oublier). Un hôte saisi peut lui-même passer par un hôte
-  connu.
+  mot de passe facultatif, clé d'hôte à approuver ou à oublier) ; « Accès à l'hôte » permet de joindre cet hôte
+  saisi par un hôte connu.
 - Supprimer un hôte connu ne coupe plus les machines qui passaient par lui : chacune reçoit un hôte saisi qui en
-  reprend l'adresse, le compte, le mot de passe et la clé, et garde son propre rebond.
+  reprend l'adresse, le compte, le mot de passe et la clé, et l'accès par son propre rebond. Un rebond SSH inactif
+  (SSH coupé sur la machine) n'est pas copié : sa référence est retirée.
 - `publish-dev.sh` redéploie aussi les autres déploiements qui suivent `:dev` (`DEPLOY_OTHERS`).
+- Admin en mode proxy : la colonne de double authentification des comptes montre une information bleue (elle se
+  règle dans le proxy, que Portique ne voit pas) au lieu d'une alerte orange.
 
 ### Modifié
 

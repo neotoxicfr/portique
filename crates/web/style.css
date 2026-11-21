@@ -154,8 +154,11 @@ a { color: var(--link); text-decoration: none; }
 /* Focus visible : anneau bleu translucide sur tout élément interactif. Un contour et non une ombre : les ombres
    décoratives (bouton plein, segment actif, touche) ne peuvent pas l'effacer. */
 :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
-/* Ligne cliquable : le groupe rogne ce qui dépasse, l'anneau passe à l'intérieur. */
-:is(a, button).line:focus-visible { outline-offset: -3px; }
+/* Ligne cliquable : le groupe rogne ce qui dépasse, l'anneau passe à l'intérieur, arrondi comme le groupe (sinon
+   ses coins sont coupés sur la première et la dernière ligne). */
+:is(a, button).line:focus-visible { outline-offset: -3px; border-radius: 16px; }
+/* Bouton icône dans une ligne : l'anneau extérieur touchait le bord du groupe sur la dernière ligne ; il passe dedans. */
+.line .iconbtn:focus-visible { outline-offset: -3px; }
 /* Couleurs forcées : ombres et fonds sont neutralisés, les indicateurs passent par le contour. */
 @media (forced-colors: active) {
   :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
@@ -290,9 +293,10 @@ a.line, button.line {
 }
 .line.danger { color: var(--red); }
 .line:focus-within:has(input:focus-visible, select:focus-visible, textarea:focus-visible) { background: var(--fill); }
-/* Le fond teinté seul ne se voit presque pas : l'anneau de focus, tracé dedans (le groupe rogne ce qui dépasse).
+/* Le fond teinté seul ne se voit presque pas : l'anneau de focus, tracé dedans (le groupe rogne ce qui dépasse) et
+   arrondi comme le groupe, pour que ses coins ne soient pas coupés sur la première et la dernière ligne.
    L'interrupteur a le sien. */
-.line:has(input:not([role="switch"]):focus-visible, select:focus-visible, textarea:focus-visible) { box-shadow: inset 0 0 0 3px var(--focus); }
+.line:has(input:not([role="switch"]):focus-visible, select:focus-visible, textarea:focus-visible) { box-shadow: inset 0 0 0 3px var(--focus); border-radius: 16px; }
 /* Contour transparent plutôt qu'absent : les couleurs forcées le rendent visible. */
 .line input:focus-visible, .line select:focus-visible, .line textarea:focus-visible { outline-color: transparent; }
 

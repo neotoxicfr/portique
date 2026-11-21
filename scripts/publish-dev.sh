@@ -18,6 +18,11 @@ quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 ssh "$DOCKER_SSH" "cd $(quote "$REMOTE_DIR") && ARM_HOST=$(quote "$ARM_HOST") scripts/build-image.sh dev-$sha dev"
 
 # Déploiement qui suit :dev (facultatif) : mis à jour dès la publication, sans attendre une mise à jour planifiée.
+up="docker compose pull -q && docker compose up -d"
 if [[ -n ${DEPLOY_DIR:-} ]]; then
-  ssh "$DOCKER_SSH" "cd $(quote "$DEPLOY_DIR") && docker compose pull -q && docker compose up -d"
+  ssh "$DOCKER_SSH" "cd $(quote "$DEPLOY_DIR") && $up"
 fi
+# Autres déploiements (facultatif), joints en SSH DEPUIS l'hôte Docker : « hôte:dossier » séparés par des espaces.
+for d in ${DEPLOY_OTHERS:-}; do
+  ssh "$DOCKER_SSH" "ssh $(quote "${d%%:*}") $(quote "cd $(quote "${d#*:}") && $up")"
+done

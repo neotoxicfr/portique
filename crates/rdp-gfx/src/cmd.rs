@@ -305,6 +305,10 @@ impl Gfx {
                             p.copy_from_slice(&px);
                         }
                     }
+                    // Écrit hors H.264 : une vue auxiliaire seule ne doit pas y ramener l'ancienne luma.
+                    if let Some(planes) = s.p444.as_mut() {
+                        planes.invalidate(rect);
+                    }
                     touched.push(rect);
                 }
                 for t in touched {
@@ -382,6 +386,9 @@ impl Gfx {
                 let rects = self.progressive.decode(sid as u32, data, &mut s.rgba, w, h)?;
                 for (x, y, rw, rh) in rects {
                     if let Some(rect) = (Rect { x, y, w: rw, h: rh }).clip(w, h) {
+                        if let Some(planes) = self.surfaces.get_mut(&sid).and_then(|s| s.p444.as_mut()) {
+                            planes.invalidate(rect);
+                        }
                         self.touch(sid, rect, origin);
                     }
                 }
@@ -397,6 +404,10 @@ impl Gfx {
         let Some(dst) = (Rect { x, y, w, h }).clip(s.width, s.height) else { return Ok(()) };
         let sw = s.width;
         blit(pixels, w, 0, 0, &mut s.rgba, sw, dst.x, dst.y, dst.w, dst.h);
+        // Codecs hors H.264, copie de surface ou du cache : la luma 4:4:4 de la zone n'est plus la bonne.
+        if let Some(planes) = s.p444.as_mut() {
+            planes.invalidate(dst);
+        }
         let origin = s.origin;
         self.touch(sid, dst, origin);
         Ok(())
@@ -758,6 +769,42 @@ mod tests {
         assert!(g.waiting_for_avc());
         g.submit_rgba(&rgba(&main)).unwrap();
         assert_eq!(px(&g, 1, 1), crate::yuv::to_rgb(128, 144, 128));
+    }
+
+    #[test]
+    fn non_h264_writes_stale_the_444_luma() {
+        let mut g = Gfx::new();
+        let create = pdu(
+            id::CREATE_SURFACE,
+            &le(&[&0u16.to_le_bytes(), &16u16.to_le_bytes(), &16u16.to_le_bytes(), &[0x20]]),
+        );
+        g.process(&wrap(&[create])).unwrap();
+        let full = Rect { x: 0, y: 0, w: 16, h: 16 };
+        fn rgba(d: &[u8]) -> crate::Rgba<'_> {
+            crate::Rgba { width: 16, height: 16, data: d, stride: 64 }
+        }
+        let main = crate::yuv::to_rgb(128, 144, 128).repeat(256);
+        let aux: Vec<u8> = (0..256)
+            .flat_map(|i| if (i / 16) % 16 < 8 { [160, 160, 160, 255] } else { [128, 128, 128, 255] })
+            .collect();
+        g.rgb = crate::Rgb444::Proven;
+        g.pending_avc = Some(PendingAvc { surface: 0, rects: vec![full], aux: Some((vec![full], false)) });
+        g.submit_avc444_rgba(Some(&rgba(&main)), Some(&rgba(&aux))).unwrap();
+        // Remplissage uni rouge de toute la surface, hors H.264.
+        let fill = pdu(
+            id::SOLID_FILL,
+            &le(&[
+                &0u16.to_le_bytes(),
+                &[0, 0, 0xFF, 0xFF],
+                &1u16.to_le_bytes(),
+                &[0, 0, 0, 0, 16, 0, 16, 0],
+            ]),
+        );
+        g.process(&wrap(&[fill])).unwrap();
+        // Vue auxiliaire seule : la zone n'a plus de luma à jour, le rouge reste.
+        g.pending_avc = Some(PendingAvc { surface: 0, rects: vec![], aux: Some((vec![full], false)) });
+        let _ = g.submit_avc444_rgba(None, Some(&rgba(&aux)));
+        assert_eq!(g.surfaces[&0].rgba[(16 + 1) * 4..][..4], [0xFF, 0, 0, 0xFF]);
     }
 
     #[test]

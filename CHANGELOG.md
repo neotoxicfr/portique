@@ -41,6 +41,9 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
   (migrations 0007 et 0008 : sauvegarder `/data` avant la mise à jour).
 - Une confirmation TOTP ou une passkey inscrite pendant une remise à zéro de la 2FA ne la réactive plus ; le
   compteur de signature d'une passkey ne recule plus ; les identifiants comptent sans casse pour la limitation.
+- Activer ou couper le TOTP et supprimer une passkey exigent une session encore ouverte au moment de l'écriture :
+  déconnecter tout le monde (changement de mot de passe) arrête aussi une configuration TOTP lancée par un tiers.
+  Une preuve de connexion révoquée en cours de route répond 409 avec son propre message, plus « mauvais mot de passe ».
 - NTLM exige 128 bits, signature et chiffrement ; Argon2 hors des workers de requêtes ; attentes SSH et WoL
   bornées.
 
@@ -53,7 +56,10 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 - Session : refus durable (accès, identifiants, certificat changé) sans reconnexion en boucle, échec passager
   toujours reconnecté ; boutons relâchés à l'annulation d'un geste et suivis par fenêtre ; dispositions
   multi-écran validées avant d'ouvrir les fenêtres, extension annulée si Windows ne la confirme pas ; bureau,
-  clavier et menu inactifs derrière une alerte.
+  clavier et menu inactifs derrière une alerte, de même pour le terminal SSH ; trafic des canaux retenu pendant
+  une suspension (SUSPEND/RESUME) ; le bureau suit encore la fenêtre quand le PC ignore des demandes de taille.
+- PWA : ouvrir un fichier (icône…) ne remplace plus la page hors ligne. Préparation du PC : un nouvel essai après
+  une annulation ratée ne touche plus au réveil d'une autre carte réseau.
 
 ## [v0.3.0] - 2026-11-20
 

@@ -448,7 +448,7 @@ async fn ssh_hosts_jumps_and_terminal_prefs() {
     let wol = |via: i64| {
         json!({"name": "PC", "host": "192.0.2.50", "username": "alice", "wol_mac": "00:11:22:33:44:55",
         "ssh": {"user": "alice", "port": 2201, "jump_id": gw_id},
-        "wol_command": {"via_id": via, "command": "/tool wol interface=ether1 mac={mac}"}})
+        "wol_command": {"via_id": via, "command": "wakeonlan {mac}"}})
     };
     for bad in [pc_id, rdp_only] {
         let r =

@@ -62,9 +62,6 @@ pub fn validate_command(template: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Commande par défaut pour un routeur MikroTik (RouterOS).
-pub const MIKROTIK_COMMAND: &str = "/tool wol interface=ether1 mac={mac}";
-
 /// Clé d'hôte SSH jamais approuvée : la connexion s'est arrêtée avant l'authentification.
 #[derive(Debug)]
 pub struct UnapprovedHostKey(pub String);
@@ -107,7 +104,7 @@ pub async fn ssh_command(
             &mut self,
             key: &russh::keys::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
-            // Clé d'hôte simple attendue (RouterOS, OpenSSH) ; un certificat SSH n'est pas géré.
+            // Clé d'hôte simple attendue ; un certificat SSH n'est pas géré.
             let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = key else { return Ok(false) };
             let fp = key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
             let ok = self.pinned.as_deref() == Some(fp.as_str());
@@ -204,12 +201,8 @@ pub async fn run_wake_command<H: russh::client::Handler>(
         // Accepté comme avant (RFC 4254 : « SHOULD ») ; tracé pour vérifier ce que fait l'hôte réel.
         tracing::warn!("commande de réveil terminée sans code de sortie");
     }
-    // Code de sortie non nul, ou erreur RouterOS écrite dans la sortie : RouterOS répond 0 même quand
-    // la commande échoue.
-    let failed = ["failure:", "bad command", "syntax error", "expected end of command"]
-        .iter()
-        .any(|m| text.contains(m));
-    anyhow::ensure!(status.unwrap_or(0) == 0 && !failed, "la commande a échoué : {text}");
+    // Le code de sortie fait foi ; la sortie de l'hôte accompagne l'échec.
+    anyhow::ensure!(status.unwrap_or(0) == 0, "la commande a échoué : {text}");
     Ok(())
 }
 
@@ -237,8 +230,8 @@ mod tests {
 
     #[test]
     fn command_template() {
-        assert!(validate_command(MIKROTIK_COMMAND).is_ok());
-        assert!(validate_command("/tool wol interface=ether1").is_err(), "{{mac}} obligatoire");
+        assert!(validate_command("wakeonlan {mac}").is_ok());
+        assert!(validate_command("wakeonlan").is_err(), "{{mac}} obligatoire");
         assert!(validate_command("a {mac}\n/system reboot").is_err(), "une seule ligne");
         assert!(validate_command("").is_err());
     }

@@ -105,7 +105,7 @@ impl client::Handler for Check {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
-        // Clé d'hôte simple (OpenSSH, RouterOS) ; un certificat SSH n'est pas géré.
+        // Clé d'hôte simple ; un certificat SSH n'est pas géré.
         let PublicKeyOrCertificate::PublicKey { key, .. } = key else { return Ok(false) };
         let fp = key.fingerprint(HashAlg::Sha256).to_string();
         let ok = self.expected.as_deref() == Some(fp.as_str());

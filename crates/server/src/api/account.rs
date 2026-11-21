@@ -142,28 +142,38 @@ pub async fn totp_confirm(
     let step = totp::verify(&secret, &u.username, &req.code, 0)?
         .ok_or_else(|| bad("code invalide, vérifie l'heure du téléphone"))?;
     // N'active que la graine vérifiée : effacée entre-temps (remise à zéro de la 2FA par un admin) ou
-    // remplacée par une autre configuration, elle ne doit pas revenir. Une passkey ajoutée depuis le contrôle
-    // exige, elle aussi, une session ouverte avec un second facteur.
+    // remplacée par une autre configuration, elle ne doit pas revenir. La session doit exister encore : un
+    // mot de passe changé l'a coupée, la graine qu'un intrus y a préparée ne s'active pas après coup. Une
+    // passkey ajoutée depuis le contrôle exige en plus une session ouverte avec un second facteur.
     let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
     let r = sqlx::query(
         "UPDATE users SET totp_secret = ?1, totp_pending = NULL, totp_last = ?2
          WHERE id = ?3 AND totp_secret IS NULL AND totp_pending = ?4
-           AND (?5 OR NOT EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?3)
-                OR EXISTS (SELECT 1 FROM sessions
-                           WHERE token_hash = ?6 AND user_id = ?3 AND mfa AND expires_at >= unixepoch()))",
+           AND (?5 OR EXISTS (SELECT 1 FROM sessions s
+                              WHERE s.token_hash = ?6 AND s.user_id = ?3 AND s.expires_at >= unixepoch()
+                                AND (s.mfa OR NOT EXISTS (SELECT 1 FROM passkeys WHERE user_id = ?3))))",
     )
     .bind(state.vault.seal(&format!("totp:{}", u.id), &secret))
     .bind(step)
     .bind(u.id)
     .bind(&pending)
     .bind(state.cfg.auth_mode == AuthMode::Proxy)
-    .bind(token)
+    .bind(token.as_deref())
     .execute(&state.db)
     .await?;
     if r.rows_affected() == 0 {
-        // Refus dû à une passkey apparue entre-temps : dire pourquoi.
+        // Dire pourquoi : passkey apparue entre-temps, session coupée, ou graine changée.
         second_factor_gate(&state, &u, &jar).await?;
-        return Err(bad("aucune configuration TOTP en cours"));
+        let alive: bool = sqlx::query_scalar(
+            "SELECT ?1 OR EXISTS (SELECT 1 FROM sessions
+                                  WHERE token_hash = ?2 AND user_id = ?3 AND expires_at >= unixepoch())",
+        )
+        .bind(state.cfg.auth_mode == AuthMode::Proxy)
+        .bind(token.as_deref())
+        .bind(u.id)
+        .fetch_one(&state.db)
+        .await?;
+        return Err(if alive { bad("aucune configuration TOTP en cours") } else { AppError::Unauthorized });
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -180,10 +190,22 @@ pub async fn totp_disable(
     }
     reauth(&state, ip, &u, &proof).await?;
     second_factor_gate(&state, &u, &jar).await?;
-    sqlx::query("UPDATE users SET totp_secret = NULL, totp_last = 0 WHERE id = ?")
-        .bind(u.id)
-        .execute(&state.db)
-        .await?;
+    // La session à second facteur qui a passé le contrôle doit exister encore : coupée entre-temps (mot de
+    // passe changé, 2FA remise à zéro), elle ne retire plus rien.
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
+    let r = sqlx::query(
+        "UPDATE users SET totp_secret = NULL, totp_last = 0
+         WHERE id = ?1 AND (?2 OR EXISTS (SELECT 1 FROM sessions WHERE token_hash = ?3 AND user_id = ?1
+                                          AND mfa AND expires_at >= unixepoch()))",
+    )
+    .bind(u.id)
+    .bind(state.cfg.auth_mode == AuthMode::Proxy)
+    .bind(token)
+    .execute(&state.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::Unauthorized);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -287,12 +309,26 @@ pub async fn passkey_delete(
 ) -> ApiResult<StatusCode> {
     // Retirer la dernière passkey rendrait le compte « sans facteur », donc libre d'enrôlement.
     second_factor_gate(&state, &u, &jar).await?;
-    let r = sqlx::query("DELETE FROM passkeys WHERE id = ? AND user_id = ?")
-        .bind(id)
-        .bind(u.id)
-        .execute(&state.db)
-        .await?;
-    if r.rows_affected() == 0 { Err(AppError::NotFound) } else { Ok(StatusCode::NO_CONTENT) }
+    // Le compte a un facteur (cette passkey) : session à second facteur, encore ouverte au moment d'écrire.
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| crate::crypto::token_hash(c.value()));
+    let r = sqlx::query(
+        "DELETE FROM passkeys WHERE id = ?1 AND user_id = ?2
+           AND (?3 OR EXISTS (SELECT 1 FROM sessions WHERE token_hash = ?4 AND user_id = ?2
+                              AND mfa AND expires_at >= unixepoch()))",
+    )
+    .bind(id)
+    .bind(u.id)
+    .bind(state.cfg.auth_mode == AuthMode::Proxy)
+    .bind(token.as_deref())
+    .execute(&state.db)
+    .await?;
+    if r.rows_affected() == 1 {
+        Ok(StatusCode::NO_CONTENT)
+    } else if crate::api::ssh::session_has_mfa(&state, &u, token.as_deref()).await? {
+        Err(AppError::NotFound)
+    } else {
+        Err(AppError::Unauthorized)
+    }
 }
 
 /// Préférences de terminal du compte, valeurs par défaut comprises.
@@ -349,14 +385,31 @@ pub async fn terminal_set(
 
 #[cfg(test)]
 mod tests {
-    use axum::{Json, extract::State};
-    use axum_extra::extract::CookieJar;
+    use axum::{
+        Json,
+        extract::{Path, State},
+    };
+    use axum_extra::extract::{CookieJar, cookie::Cookie};
     use portique_proto::{ChangePassword, ReAuth, TotpConfirm};
 
     use crate::{
         auth::{self, ClientIp, CurrentUser, user_by_name},
-        state::AppError,
+        state::{AppError, AppState},
     };
+
+    /// Session ouverte pour `user_id`, avec ou sans second facteur, et le cookie qui la porte.
+    async fn session(s: &AppState, user_id: i64, token: &'static str, mfa: bool) -> CookieJar {
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at, mfa) VALUES (?, ?, unixepoch() + 60, ?)",
+        )
+        .bind(crate::crypto::token_hash(token))
+        .bind(user_id)
+        .bind(mfa)
+        .execute(&s.db)
+        .await
+        .unwrap();
+        CookieJar::new().add(Cookie::new(auth::SESSION_COOKIE, token))
+    }
 
     /// Un admin remet le mot de passe pendant que l'ancien détenteur change le sien (requête déjà
     /// authentifiée, hash vérifié) : l'écriture de ce dernier ne passe plus, celle de l'admin reste.
@@ -453,6 +506,7 @@ mod tests {
         crate::bootstrap_admin(&s).await.unwrap();
         let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
         let seal = |secret: &[u8]| s.vault.seal(&format!("totp-pending:{}", u.id), secret);
+        let jar = session(&s, u.id, "t", false).await;
         let mut verdict = None;
         for wait in [100, 400, 1600] {
             let read = crate::totp::new_secret();
@@ -474,7 +528,7 @@ mod tests {
             let confirm = tokio::spawn(super::totp_confirm(
                 State(s.clone()),
                 CurrentUser(u.clone()),
-                CookieJar::new(),
+                jar.clone(),
                 Json(TotpConfirm { code }),
             ));
             tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
@@ -546,6 +600,7 @@ mod tests {
             .await
             .unwrap();
         let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        let jar = session(&s, u.id, "t", false).await;
         let mut register = s.db.begin().await.unwrap();
         sqlx::query("INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'Passkey', '{}')")
             .bind(u.id)
@@ -555,7 +610,7 @@ mod tests {
         let confirm = tokio::spawn(super::totp_confirm(
             State(s.clone()),
             CurrentUser(u.clone()),
-            CookieJar::new(),
+            jar,
             Json(TotpConfirm { code }),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -571,5 +626,86 @@ mod tests {
             "{verdict:?}"
         );
         assert!(now.totp_secret.is_none(), "TOTP activé par une session sans facteur");
+    }
+
+    /// Un intrus prépare une graine depuis sa session, puis le titulaire change son mot de passe (sessions
+    /// coupées) : la confirmation n'active plus cette graine. Session ouverte sans facteur : la première
+    /// activation passe toujours.
+    #[tokio::test]
+    async fn totp_confirm_needs_a_live_session() {
+        let s = crate::api::ssh::tests::state("builtin").await;
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let secret = crate::totp::new_secret();
+        sqlx::query("UPDATE users SET totp_pending = ? WHERE id = ?")
+            .bind(s.vault.seal(&format!("totp-pending:{}", u.id), &secret))
+            .bind(u.id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let code = crate::totp::build(&secret, &u.username).unwrap().generate_current().to_string();
+        let confirm = |jar: CookieJar| {
+            super::totp_confirm(
+                State(s.clone()),
+                CurrentUser(u.clone()),
+                jar,
+                Json(TotpConfirm { code: code.clone() }),
+            )
+        };
+        let intruder = session(&s, u.id, "intrus", false).await;
+        sqlx::query("DELETE FROM sessions").execute(&s.db).await.unwrap();
+        let r = confirm(intruder).await;
+        assert!(matches!(r, Err(AppError::Unauthorized)), "{r:?}");
+        assert!(
+            user_by_name(&s.db, "admin").await.unwrap().unwrap().totp_secret.is_none(),
+            "graine de l'intrus activée"
+        );
+        let r = confirm(session(&s, u.id, "titulaire", false).await).await;
+        assert!(r.is_ok(), "première activation refusée : {r:?}");
+        assert!(user_by_name(&s.db, "admin").await.unwrap().unwrap().totp_secret.is_some());
+    }
+
+    /// Session à second facteur coupée entre le contrôle et la suppression d'une passkey : la passkey reste.
+    /// Base sur disque : la coupure tient le verrou d'écriture, invisible du contrôle, puis valide pendant
+    /// que la suppression attend ce verrou. Contrôle trop tardif (il voit déjà la coupure) : on recommence en
+    /// attendant plus longtemps.
+    #[tokio::test]
+    async fn passkey_delete_needs_the_session_still_open() {
+        let path = std::env::temp_dir().join(format!("portique-pk-del-{}.db", std::process::id()));
+        let db = crate::open_db(&format!("sqlite://{}", path.display())).await.unwrap();
+        let s = crate::state::AppState { db, ..crate::api::ssh::tests::state("builtin").await };
+        crate::bootstrap_admin(&s).await.unwrap();
+        let u = user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO passkeys (user_id, name, credential) VALUES (?, 'Passkey', '{}') RETURNING id",
+        )
+        .bind(u.id)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        let mut verdict = None;
+        for wait in [100, 400, 1600] {
+            let jar = session(&s, u.id, "t", true).await;
+            let mut cut = s.db.begin().await.unwrap();
+            sqlx::query("DELETE FROM sessions").execute(&mut *cut).await.unwrap();
+            let delete =
+                tokio::spawn(super::passkey_delete(State(s.clone()), CurrentUser(u.clone()), jar, Path(id)));
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            cut.commit().await.unwrap();
+            match delete.await.unwrap() {
+                Err(AppError::BadRequest(m)) if m.starts_with("reconnecte-toi") => continue,
+                r => {
+                    verdict = Some(r);
+                    break;
+                }
+            }
+        }
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM passkeys").fetch_one(&s.db).await.unwrap();
+        s.db.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        let verdict = verdict.expect("le contrôle n'a jamais précédé la coupure");
+        assert!(matches!(verdict, Err(AppError::Unauthorized)), "{verdict:?}");
+        assert_eq!(left, 1, "passkey supprimée par une session coupée");
     }
 }

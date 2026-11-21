@@ -252,7 +252,8 @@ fn Shell(children: Children) -> impl IntoView {
             // navigateur appliquerait au cookie d'une reconnexion faite entre-temps.
             let abort = web_sys::AbortController::new().ok();
             let signal = abort.as_ref().map(web_sys::AbortController::signal);
-            let result = within(15_000, logout_request(signal.as_ref())).await;
+            let request = api::send_empty_abortable::<()>("POST", "/api/auth/logout", None, signal.as_ref());
+            let result = within(15_000, request).await;
             if result.is_none()
                 && let Some(a) = &abort
             {
@@ -303,28 +304,6 @@ fn Shell(children: Children) -> impl IntoView {
             <a href="/setup/" rel="external">"Préparer un PC"</a>
         </footer>
     }
-}
-
-/// POST de déconnexion, annulable par `signal` (`api::send_empty` n'en prend pas).
-async fn logout_request(signal: Option<&web_sys::AbortSignal>) -> api::Result<()> {
-    let res = gloo_net::http::Request::post("/api/auth/logout")
-        .header("x-portique", "1")
-        .abort_signal(signal)
-        .send()
-        .await
-        .map_err(|e| api::Error::Message(format!("réseau : {e}")))?;
-    if res.ok() {
-        return Ok(());
-    }
-    if res.status() == 401 {
-        return Err(api::Error::Unauthorized);
-    }
-    let msg = res
-        .json::<portique_proto::ApiError>()
-        .await
-        .map(|e| e.error)
-        .unwrap_or_else(|_| format!("erreur HTTP {}", res.status()));
-    Err(api::Error::Message(msg))
 }
 
 #[cfg(test)]

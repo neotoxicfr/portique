@@ -208,7 +208,10 @@ fn Totp(st: Status) -> impl IntoView {
         let body = proof.take();
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &body).await {
+            // Bornée : le verrou de session doit retomber même si le serveur ne répond jamais. Au délai, la
+            // requête a pu aboutir quand même : un nouvel essai refait une graine, la confirmation dira si le QR
+            // affiché n'est plus le bon.
+            match api::bounded(api::send::<_, TotpSetup>("POST", "/api/account/totp/setup", &body)).await {
                 Ok(s) => {
                     setup.set(Some(s));
                     st.set(None);
@@ -232,7 +235,7 @@ fn Totp(st: Status) -> impl IntoView {
         code.set(String::new());
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::send_empty("POST", "/api/account/totp/confirm", Some(&body)).await {
+            match api::bounded(api::send_empty("POST", "/api/account/totp/confirm", Some(&body))).await {
                 Ok(()) => {
                     session.set_totp(epoch, true);
                     reset();
@@ -255,7 +258,7 @@ fn Totp(st: Status) -> impl IntoView {
         let body = proof.take();
         let epoch = session.epoch.get_untracked();
         spawn_local(async move {
-            match api::send_empty("POST", "/api/account/totp/disable", Some(&body)).await {
+            match api::bounded(api::send_empty("POST", "/api/account/totp/disable", Some(&body))).await {
                 Ok(()) => {
                     session.set_totp(epoch, false);
                     reset();

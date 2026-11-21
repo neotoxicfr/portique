@@ -49,6 +49,23 @@ pub struct ChannelReassembler {
 /// Plafond d'un message de canal statique (le presse-papier peut porter une image).
 const MAX_CHANNEL_MESSAGE: usize = 64 * 1024 * 1024;
 
+/// Notification de contrôle (serveur → client) portée par un morceau reçu : `Some(true)` pour
+/// SUSPEND, `Some(false)` pour RESUME, `None` pour un fragment de données. Une notification ne porte
+/// ni FIRST ni LAST : elle ne touche pas au message en cours de réassemblage.
+pub fn suspension(pdu: &[u8]) -> Option<bool> {
+    let flags = u32::from_le_bytes(pdu.get(4..8)?.try_into().ok()?);
+    if flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST) != 0 {
+        return None;
+    }
+    if flags & CHANNEL_FLAG_SUSPEND != 0 {
+        Some(true)
+    } else if flags & CHANNEL_FLAG_RESUME != 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 impl ChannelReassembler {
     pub fn feed(&mut self, pdu: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let mut r = Reader::new(pdu);
@@ -60,11 +77,8 @@ impl ChannelReassembler {
         if total > MAX_CHANNEL_MESSAGE {
             return Err(Error::Invalid("message de canal trop grand"));
         }
-        // SUSPEND / RESUME (serveur → client) : notification de contrôle, pas un fragment de
-        // données ; le message en cours de réassemblage n'est pas touché.
-        if flags & (CHANNEL_FLAG_SUSPEND | CHANNEL_FLAG_RESUME) != 0
-            && flags & (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST) == 0
-        {
+        // SUSPEND / RESUME : rien à réassembler (la session applique la suspension, `suspension`).
+        if suspension(pdu).is_some() {
             return Ok(None);
         }
         if flags & CHANNEL_FLAG_FIRST != 0 {
@@ -316,6 +330,13 @@ mod tests {
         assert_eq!(r.feed(&header(0, CHANNEL_FLAG_SUSPEND, &[])).unwrap(), None);
         assert_eq!(r.feed(&header(0, CHANNEL_FLAG_RESUME, &[])).unwrap(), None);
         assert_eq!(r.feed(&header(4, CHANNEL_FLAG_LAST, &[3, 4])).unwrap(), Some(alloc::vec![1, 2, 3, 4]));
+        assert_eq!(suspension(&header(0, CHANNEL_FLAG_SUSPEND, &[])), Some(true));
+        assert_eq!(
+            suspension(&header(0, CHANNEL_FLAG_RESUME | CHANNEL_FLAG_SHOW_PROTOCOL, &[])),
+            Some(false)
+        );
+        assert_eq!(suspension(&header(4, CHANNEL_FLAG_FIRST, &[1])), None);
+        assert_eq!(suspension(&[0; 7]), None, "en-tête tronqué");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::cell::RefCell;
 
 use rdp_pdu::{
     fastpath::{self, Input, PointerUpdate},
@@ -114,7 +115,23 @@ pub struct Session {
     static_reassembly: BTreeMap<u16, vc::ChannelReassembler>,
     dvcs: BTreeMap<u32, (String, vc::DvcReassembler)>,
     desktop: (u16, u16),
+    /// Trafic des canaux suspendu par le serveur (CHANNEL_FLAG_SUSPEND, MS-RDPBCGR 2.2.6.1.1) jusqu'à
+    /// RESUME. `static_send` et `dvc_send` restent `&self` pour l'appelant : leurs trames sont retenues ici,
+    /// puis rendues dans l'ordre par `feed` à la reprise.
+    suspended: bool,
+    held: RefCell<Held>,
 }
+
+/// Émissions retenues pendant une suspension, bornées à `MAX_HELD` octets ; au-delà, un message est
+/// abandonné en entier (jamais à moitié) et compté.
+#[derive(Default)]
+struct Held {
+    frames: Vec<Vec<u8>>,
+    bytes: usize,
+    dropped: usize,
+}
+
+const MAX_HELD: usize = 64 * 1024 * 1024;
 
 const STATIC_CHANNELS: [&str; 2] = [CLIPRDR, DRDYNVC];
 
@@ -135,6 +152,8 @@ impl Session {
             static_reassembly: BTreeMap::new(),
             dvcs: BTreeMap::new(),
             desktop,
+            suspended: false,
+            held: RefCell::default(),
         }
     }
 
@@ -363,6 +382,21 @@ impl Session {
 
     fn static_channel(&mut self, channel: u16, data: &[u8], ev: &mut Vec<Event>) -> Result<(), Error> {
         let Some(name) = self.channels.get(&channel).copied() else { return Ok(()) };
+        // Suspension : tout le trafic des canaux, pas seulement celui-ci (2.2.6.1.1).
+        if let Some(suspend) = vc::suspension(data) {
+            self.suspended = suspend;
+            if !suspend {
+                let held = core::mem::take(self.held.get_mut());
+                if held.dropped > 0 {
+                    ev.push(Event::Ignored(alloc::format!(
+                        "canaux : {} message(s) abandonné(s) pendant la suspension",
+                        held.dropped
+                    )));
+                }
+                ev.extend(held.frames.into_iter().map(Event::Send));
+            }
+            return Ok(());
+        }
         let Some(msg) = self.static_reassembly.entry(channel).or_default().feed(data)? else {
             return Ok(());
         };
@@ -423,8 +457,23 @@ impl Session {
         Ok(())
     }
 
-    /// Trames à envoyer pour un message de canal statique (`cliprdr`, `drdynvc`).
+    /// Trames à envoyer pour un message de canal statique (`cliprdr`, `drdynvc`). Vide pendant une
+    /// suspension : le message est retenu, puis rendu par `feed` (`Event::Send`) à la reprise.
     pub fn static_send(&self, name: &str, data: &[u8]) -> Vec<Vec<u8>> {
+        self.unless_suspended(self.frames(name, data))
+    }
+
+    /// Trames à envoyer pour un message sur un canal dynamique ouvert (retenues comme `static_send`).
+    pub fn dvc_send(&self, channel_id: u32, data: &[u8]) -> Vec<Vec<u8>> {
+        if !self.dvcs.contains_key(&channel_id) {
+            return Vec::new();
+        }
+        let frames =
+            vc::dvc_data(channel_id, data).iter().flat_map(|pdu| self.frames(DRDYNVC, pdu)).collect();
+        self.unless_suspended(frames)
+    }
+
+    fn frames(&self, name: &str, data: &[u8]) -> Vec<Vec<u8>> {
         let Some((&id, _)) = self.channels.iter().find(|(_, n)| **n == name) else { return Vec::new() };
         vc::chunks(data, name == CLIPRDR)
             .iter()
@@ -432,12 +481,20 @@ impl Session {
             .collect()
     }
 
-    /// Trames à envoyer pour un message sur un canal dynamique ouvert.
-    pub fn dvc_send(&self, channel_id: u32, data: &[u8]) -> Vec<Vec<u8>> {
-        if !self.dvcs.contains_key(&channel_id) {
-            return Vec::new();
+    /// Trames d'un message entier : rendues, ou retenues pendant une suspension.
+    fn unless_suspended(&self, frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if !self.suspended {
+            return frames;
         }
-        vc::dvc_data(channel_id, data).iter().flat_map(|pdu| self.static_send(DRDYNVC, pdu)).collect()
+        let mut held = self.held.borrow_mut();
+        let size: usize = frames.iter().map(Vec::len).sum();
+        if held.bytes + size <= MAX_HELD {
+            held.bytes += size;
+            held.frames.extend(frames);
+        } else {
+            held.dropped += 1;
+        }
+        Vec::new()
     }
 
     pub fn dvc_name(&self, channel_id: u32) -> Option<&str> {
@@ -582,5 +639,52 @@ mod tests {
         s.drdynvc(&[0x40, 2], &mut Vec::new()).unwrap(); // DYNVC_CLOSE
         assert!(opened(&mut s, 9));
         assert_eq!(s.dvcs.len(), MAX_DVCS);
+    }
+
+    /// SUSPEND retient les émissions des canaux (statiques et dynamiques) ; RESUME les rend dans l'ordre,
+    /// et le message reçu en cours de réassemblage se termine normalement.
+    #[test]
+    fn suspend_holds_channel_traffic_until_resume() {
+        let mut s = session();
+        s.state = State::Active;
+        s.user = 1007;
+        s.io_channel = 1003;
+        s.channels.insert(1004, CLIPRDR);
+        s.channels.insert(1005, DRDYNVC);
+        s.dvcs.insert(3, (DVC_DISPLAY_CONTROL.into(), vc::DvcReassembler::default()));
+        // Morceau de canal reçu : MCS Send Data Indication (T.125) portant l'en-tête de canal.
+        let incoming = |channel: u16, total: u32, flags: u32, data: &[u8]| {
+            let body = [&total.to_le_bytes()[..], &flags.to_le_bytes(), data].concat();
+            let mut pdu = alloc::vec![0x68];
+            pdu.extend(1002u16.to_be_bytes());
+            pdu.extend(channel.to_be_bytes());
+            pdu.extend([0x70, 0x80 | (body.len() >> 8) as u8, body.len() as u8]);
+            pdu.extend(body);
+            rdp_pdu::x224::data(&pdu)
+        };
+        let sends = |ev: &[Event]| -> Vec<Vec<u8>> {
+            ev.iter().filter_map(|e| if let Event::Send(b) = e { Some(b.clone()) } else { None }).collect()
+        };
+        let first = s.static_send(CLIPRDR, &[1, 2, 3]);
+        assert_eq!(first.len(), 1, "hors suspension : envoi direct");
+
+        // Message presse-papier entamé, puis suspension.
+        assert!(s.feed(&incoming(1004, 4, vc::CHANNEL_FLAG_FIRST, &[9, 8])).unwrap().is_empty());
+        assert!(s.feed(&incoming(1005, 0, vc::CHANNEL_FLAG_SUSPEND, &[])).unwrap().is_empty());
+        let clip = s.frames(CLIPRDR, &[4, 5]);
+        let dvc: Vec<_> = vc::dvc_data(3, &[6]).iter().flat_map(|p| s.frames(DRDYNVC, p)).collect();
+        assert!(s.static_send(CLIPRDR, &[4, 5]).is_empty(), "retenu pendant la suspension");
+        assert!(s.dvc_send(3, &[6]).is_empty(), "canal dynamique retenu aussi");
+        // La fin du message reçu passe toujours.
+        let ev = s.feed(&incoming(1004, 4, vc::CHANNEL_FLAG_LAST, &[7, 6])).unwrap();
+        assert_eq!(ev, [Event::Clipboard(alloc::vec![9, 8, 7, 6])]);
+
+        let ev = s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[])).unwrap();
+        assert_eq!(sends(&ev), [clip, dvc].concat(), "rendu dans l'ordre à la reprise");
+        assert_eq!(s.static_send(CLIPRDR, &[1, 2, 3]), first, "après la reprise : envoi direct");
+        assert!(
+            s.feed(&incoming(1004, 0, vc::CHANNEL_FLAG_RESUME, &[])).unwrap().is_empty(),
+            "rien à rendre"
+        );
     }
 }

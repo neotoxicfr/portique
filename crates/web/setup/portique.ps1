@@ -43,11 +43,11 @@ if ($Annuler) {
   Set-Dw 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 1
   netsh advfirewall firewall set rule group=$grp new enable=No | Out-Null
   $null = Test-Exit 'Pare-feu'
-  # Cartes memorisees a la preparation (une valeur par carte) ; a defaut, la carte active.
+  # Cartes memorisees a la preparation (une valeur par carte). La carte active seulement SANS journal : un
+  # journal vide est celui d'une annulation dont les cartes sont deja traitees (une autre etape a echoue).
   $cle = Get-Item -Path $mem -ErrorAction SilentlyContinue
-  $noms = @(if ($cle) { $cle.GetValueNames() })
-  if ($noms) {
-    foreach ($n in $noms) {
+  if ($cle) {
+    foreach ($n in $cle.GetValueNames()) {
       $desc = $cle.GetValue($n)
       powercfg /devicedisablewake $desc 2>$null | Out-Null
       # Carte traitee : oubliee, une nouvelle annulation ne vise que les cartes restantes.
@@ -62,7 +62,7 @@ if ($Annuler) {
   }
   gpupdate /force | Out-Null
   $null = Test-Exit 'gpupdate'
-  # Memo garde tant qu'une etape echoue : une nouvelle annulation vise la meme carte.
+  # Journal garde, meme vide, tant qu'une etape echoue : une nouvelle annulation ne vise que les cartes restantes.
   if (-not $echecs) { Remove-Item -Path $mem -ErrorAction SilentlyContinue }
   if ($echecs) {
     Write-Host "[!] Annulation INCOMPLETE : etapes en echec : $($echecs -join ', ')."

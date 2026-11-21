@@ -489,6 +489,9 @@ fn Editor(
     // Machines restées verrouillées faute de relecture, avec l'erreur de celle-ci : affichée seulement quand la
     // machine est sélectionnée, avec « Relire ».
     let stale = RwSignal::new(Vec::<(i64, String)>::new());
+    // Relectures « Relire » en vol, une par machine : une seconde réponse, plus ancienne, écraserait sinon le
+    // brouillon commencé ou l'enregistrement fait après la première.
+    let rereading = RwSignal::new(Vec::<i64>::new());
     let locked = move || f.busy.get() || f.editing.get().is_some_and(|id| writes.with(|w| w.contains(&id)));
     let save = move |ev: SubmitEvent| {
         ev.prevent_default();
@@ -593,8 +596,15 @@ fn Editor(
 
     // Nouvelle relecture d'une machine restée verrouillée.
     let retry = move |id: i64| {
+        if rereading.with_untracked(|r| r.contains(&id)) {
+            return;
+        }
+        rereading.update(|r| r.push(id));
         spawn_local(async move {
-            match reread(id, conns, f, open).await {
+            let r = reread(id, conns, f, open).await;
+            // Échec : « Relire » redevient disponible, le verrou d'écriture reste.
+            rereading.update(|r| r.retain(|x| *x != id));
+            match r {
                 Ok(()) => {
                     stale.update(|s| s.retain(|(x, _)| *x != id));
                     writes.update(|w| w.retain(|x| *x != id));
@@ -647,7 +657,8 @@ fn Editor(
                 {move || stale_err().map(|(id, e)| view! {
                     <div class="banner error" role="alert">
                         <span>{format!("État de la machine à relire : {}", sentence(&e))}</span>
-                        <button type="button" on:click=move |_| retry(id)>"Relire"</button>
+                        <button type="button" disabled=move || rereading.with(|r| r.contains(&id))
+                            on:click=move |_| retry(id)>"Relire"</button>
                     </div>
                 })}
                 <fieldset class="editor" disabled=locked>

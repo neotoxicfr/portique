@@ -110,22 +110,18 @@ if errorlevel 1 (
   echo [!] Pare-feu : echec de netsh, regles non desactivees.
   set "ECHEC=1"
 )
-rem Cartes memorisees a la preparation (une valeur par carte) ; a defaut, la carte active.
-set "NICDESC="
-for /f "tokens=1,2,*" %%a in ('reg query "HKLM\SOFTWARE\Portique" 2^>nul ^| findstr /c:"REG_SZ"') do (
-  set "NICDESC=%%c"
-  call :sans_reveil "%%c" "%%a"
-)
-if not defined NICDESC for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceDescription"`) do (
-  set "NICDESC=%%a"
-  call :sans_reveil "%%a" ""
-)
+rem Cartes memorisees a la preparation (une valeur par carte). La carte active seulement SANS journal : un
+rem journal vide est celui d'une annulation dont les cartes sont deja traitees (une autre etape a echoue).
+set "JOURNAL="
+reg query "HKLM\SOFTWARE\Portique" >nul 2>&1 && set "JOURNAL=1"
+for /f "tokens=1,2,*" %%a in ('reg query "HKLM\SOFTWARE\Portique" 2^>nul ^| findstr /c:"REG_SZ"') do call :sans_reveil "%%c" "%%a"
+if not defined JOURNAL for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceDescription"`) do call :sans_reveil "%%a" ""
 gpupdate /force >nul
 if errorlevel 1 (
   echo [!] Echec de gpupdate : strategies non appliquees ^(redemarrer ou relancer^).
   set "ECHEC=1"
 )
-rem Memo garde tant qu'une etape echoue : une nouvelle annulation vise la meme carte.
+rem Journal garde, meme vide, tant qu'une etape echoue : une nouvelle annulation ne vise que les cartes restantes.
 if not defined ECHEC reg delete "HKLM\SOFTWARE\Portique" /f >nul 2>&1
 if defined ECHEC (
   echo [!] Annulation INCOMPLETE : les etapes marquees [!] ont echoue.

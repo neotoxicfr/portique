@@ -99,6 +99,8 @@ struct Inner {
     /// d'abord : le bureau prendra la dernière, une nouvelle demande s'y compare (voir
     /// `single_layout` et `size_confirmed`).
     size_sent: VecDeque<(u32, u32)>,
+    /// Envoi de la dernière taille (ms, `Date.now()`), voir `forget_unanswered`.
+    size_sent_at: f64,
     desktop: (u32, u32),
     cursors: Vec<Option<String>>,
     pressed: HashSet<(u8, bool)>,
@@ -118,9 +120,9 @@ struct Inner {
     clip_pending_write: Option<(u32, Vec<rdp_clip::LocalData>, u64)>,
     /// Empreinte du dernier contenu commun aux deux côtés (évite l'écho PC → navigateur → PC) :
     /// reçu du PC, ou annoncé par nous ET accepté par Windows ; effacée quand Windows accepte une
-    /// autre de nos listes (remplacée ensuite, ou au contenu inconnu). Gardée quand Windows copie un
-    /// contenu sans format pris en charge (fichiers…) : le contenu local, plus ancien que cette
-    /// copie, ne doit pas l'écraser au prochain Ctrl+V.
+    /// autre de nos listes (remplacée ensuite, ou au contenu inconnu), et quand Windows copie
+    /// (inconnu jusqu'à la réception ; le contenu local d'avant reste protégé par `Announces`,
+    /// même pour une copie sans format pris en charge).
     clip_last: Option<u64>,
     /// Nos listes de formats sans réponse et leurs attentes : Windows n'accuse une liste qu'une
     /// fois notre contenu installé, c'est le moment de relâcher un Ctrl+V. Vidées à la fermeture.
@@ -222,6 +224,7 @@ impl Engine {
             touch: Touch::default(),
             desired: None,
             size_sent: VecDeque::new(),
+            size_sent_at: 0.0,
             desktop: (w, h),
             cursors: vec![None; 32],
             pressed: HashSet::new(),
@@ -639,7 +642,7 @@ impl Engine {
     fn reset_views(&self, width: u32, height: u32, monitors: &[Rect]) {
         let mut i = self.inner.borrow_mut();
         i.desktop = (width, height);
-        size_confirmed(&mut i.size_sent, (width, height));
+        let freed = size_confirmed(&mut i.size_sent, (width, height));
         let expected = i.multi.clone();
         let adopted = expected.as_ref().is_some_and(|rects| {
             let bw = rects.iter().map(|r| r.x + r.w).max().unwrap_or(0);
@@ -671,10 +674,14 @@ impl Engine {
             fell_back = i.multi.take().is_some();
         }
         i.views[0].set_rect(Rect { x: 0, y: 0, w: width, h: height });
+        let desired = i.desired;
         drop(i);
         self.input(&released);
         if fell_back {
             (self.on_single)("Disposition refusée par le PC");
+        } else if freed && let Some(((w, h), _)) = desired {
+            // Place libérée : la taille retenue faute de place part (forçage compris).
+            self.send_size(w, h, false);
         }
     }
 
@@ -1171,9 +1178,11 @@ impl Engine {
                 rdp_clip::ClipEvent::RemoteChanged(formats) => {
                     // Windows a copié (liste acceptée par `rdp-clip`) : nos annonces en attente sont
                     // dépassées, leur accusé ne validera rien ; une écriture locale en attente aussi.
+                    // Le contenu commun est inconnu jusqu'à la réponse de données.
                     {
                         let mut i = self.inner.borrow_mut();
-                        i.clip_announces.remote_changed();
+                        let Inner { clip_announces, clip_last, .. } = &mut *i;
+                        clip_announces.remote_changed(clip_last);
                         i.clip_write_gen = i.clip_write_gen.wrapping_add(1);
                         i.clip_pending_write = None;
                     }
@@ -1343,7 +1352,11 @@ impl Engine {
         let pending = {
             let mut i = self.inner.borrow_mut();
             match i.clip_pending_write.take() {
-                Some((g, items, fp)) if g == i.clip_write_gen => Some((g, items, fp)),
+                // Copie du PC déjà dans le presse-papier local (copiée là aussi) : plus rien à écrire,
+                // l'écrire encore pourrait écraser une copie locale faite depuis.
+                Some((g, items, fp)) if g == i.clip_write_gen && i.clip_announces.unwritten() => {
+                    Some((g, items, fp))
+                }
                 _ => None,
             }
         };
@@ -1461,14 +1474,22 @@ impl Engine {
     fn send_size(&self, width: u32, height: u32, force: bool) {
         let (channel, layout) = {
             let mut i = self.inner.borrow_mut();
-            let Inner { desired, size_sent, display_channel, display_caps, desktop, multi, .. } = &mut *i;
+            let Inner {
+                desired, size_sent, size_sent_at, display_channel, display_caps, desktop, multi, ..
+            } = &mut *i;
             // En multi-écran, la disposition vient des écrans, pas de la taille de la fenêtre.
             if multi.is_some() {
                 return;
             }
             let caps = display_caps.filter(|_| display_channel.is_some());
             let size = clamp_size(width, height);
-            (*display_channel, single_layout(desired, size_sent, caps, size, force, *desktop))
+            let now = js_sys::Date::now();
+            forget_unanswered(size_sent, *size_sent_at, now);
+            let layout = single_layout(desired, size_sent, caps, size, force, *desktop);
+            if matches!(layout, Ok(Some(_))) {
+                *size_sent_at = now;
+            }
+            (*display_channel, layout)
         };
         match (channel, layout) {
             (Some(channel), Ok(Some(monitor))) => self.dvc_send(channel, &views::layout_pdu(&[monitor], 0)),
@@ -1630,25 +1651,41 @@ fn single_layout(
     if !force && (w, h) == sent.back().copied().unwrap_or(desktop) {
         return Ok(None);
     }
+    // Trop de demandes sans réponse : aucune n'est oubliée (un Reset tardif serait pris pour celui
+    // d'une autre) ; la taille voulue, retenue dans `desired`, part quand une place se libère.
+    if sent.len() >= MAX_SIZES_IN_FLIGHT {
+        return Ok(None);
+    }
     *desired = Some((size, false));
     sent.push_back((w, h));
-    // Demandes jamais confirmées (taille ajustée par le PC) : seule la dernière sert de référence.
-    if sent.len() > MAX_SIZES_IN_FLIGHT {
-        sent.pop_front();
-    }
     Ok(Some(monitor))
 }
 
-/// Tailles en vol gardées au plus (voir `single_layout`).
+/// Tailles en vol au plus (voir `single_layout`).
 const MAX_SIZES_IN_FLIGHT: usize = 8;
+
+/// File pleine sans aucune réponse depuis la dernière demande : elles sont perdues (PC qui ignore
+/// une disposition ou répond à une autre taille). Oubliées, sinon le bureau ne suivrait plus la
+/// fenêtre de toute la session ; un Reset tardif de l'une d'elles ne correspond alors à rien.
+fn forget_unanswered(sent: &mut VecDeque<(u32, u32)>, last_sent: f64, now: f64) {
+    if sent.len() >= MAX_SIZES_IN_FLIGHT && now - last_sent > SIZE_ANSWER_MS {
+        sent.clear();
+    }
+}
+
+/// Délai de réponse d'une demande de taille au-delà duquel une file pleine est oubliée (ms).
+const SIZE_ANSWER_MS: f64 = 10_000.0;
 
 /// Reset Graphics à `size` : il répond à la plus ancienne demande en vol de cette taille (Windows
 /// les traite dans l'ordre), les précédentes sont dépassées. Les suivantes restent en vol : une
 /// demande plus récente de la même taille peut encore être contredite par un Reset intermédiaire.
-fn size_confirmed(sent: &mut VecDeque<(u32, u32)>, size: (u32, u32)) {
+/// Vrai s'il libère une place dans une file pleine : la taille voulue retenue peut partir.
+fn size_confirmed(sent: &mut VecDeque<(u32, u32)>, size: (u32, u32)) -> bool {
+    let full = sent.len() >= MAX_SIZES_IN_FLIGHT;
     if let Some(k) = sent.iter().position(|s| *s == size) {
         sent.drain(..=k);
     }
+    full && sent.len() < MAX_SIZES_IN_FLIGHT
 }
 
 /// Un Reset Graphics qui n'adopte pas la disposition attendue ramène-t-il à un écran ? Oui sans
@@ -1782,13 +1819,67 @@ mod tests {
         // Une seule demande en vol : la même taille n'est pas renvoyée.
         assert_eq!(single_layout(&mut desired, &mut sent, caps, a, false, b), monitor(a));
         assert_eq!(single_layout(&mut desired, &mut sent, caps, a, false, b), Ok(None));
-        // Demandes jamais confirmées : file bornée, la dernière reste la référence.
-        for k in 0..20 {
-            let size = (1000 + 2 * k, 700);
-            assert_eq!(single_layout(&mut desired, &mut sent, caps, size, false, b), monitor(size));
+    }
+
+    #[test]
+    fn sizes_beyond_the_queue_wait_for_a_free_slot() {
+        let caps = Some(DisplayCaps { max_monitors: 1, max_area: 8192 * 8192 });
+        let (mut desired, mut sent) = (None, VecDeque::new());
+        let monitor = |(w, h)| Ok(Some((0, 0, w, h)));
+        let start = (1600, 900);
+        // Huit demandes en vol (1280 à 1420) ; la neuvième, 1280 répétée, attend une place.
+        let widths = [1280, 1300, 1320, 1340, 1360, 1380, 1400, 1420];
+        for w in widths {
+            assert_eq!(
+                single_layout(&mut desired, &mut sent, caps, (w, 720), false, start),
+                monitor((w, 720))
+            );
         }
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1280, 720), false, start), Ok(None));
+        assert_eq!(desired, Some(((1280, 720), false)));
+        // Reset tardif de la 1re demande : il ne solde qu'elle, et la taille retenue part.
+        assert!(size_confirmed(&mut sent, (1280, 720)));
+        let held = desired.unwrap().0;
+        assert_eq!(single_layout(&mut desired, &mut sent, caps, held, false, (1280, 720)), monitor(held));
         assert_eq!(sent.len(), MAX_SIZES_IN_FLIGHT);
-        assert_eq!(single_layout(&mut desired, &mut sent, caps, (1038, 700), false, b), Ok(None));
+        // Reset 1300, puis la fenêtre demande 1300 : la file finit à 1280, elle repart (place libre).
+        assert!(size_confirmed(&mut sent, (1300, 720)));
+        assert_eq!(
+            single_layout(&mut desired, &mut sent, caps, (1300, 720), false, (1300, 720)),
+            monitor((1300, 720))
+        );
+        // Les confirmations restantes arrivent dans l'ordre : la file se vide sur la dernière voulue
+        // (seule la première libère une place dans une file pleine).
+        assert!(size_confirmed(&mut sent, (1320, 720)));
+        for w in [1340, 1360, 1380, 1400, 1420, 1280] {
+            assert!(!size_confirmed(&mut sent, (w, 720)));
+        }
+        assert_eq!(sent, [(1300, 720)]);
+        size_confirmed(&mut sent, (1300, 720));
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn unanswered_full_queue_is_forgotten() {
+        let caps = Some(DisplayCaps { max_monitors: 1, max_area: 8192 * 8192 });
+        let (mut desired, mut sent) = (None, VecDeque::new());
+        // Huit demandes auxquelles le PC ne répond pas (ignorées, ou Reset à une autre taille).
+        for w in (0..8).map(|k| 1280 + 20 * k) {
+            assert!(
+                single_layout(&mut desired, &mut sent, caps, (w, 720), false, (1600, 900)).unwrap().is_some()
+            );
+        }
+        let last = 1_000.0;
+        forget_unanswered(&mut sent, last, last + SIZE_ANSWER_MS);
+        assert_eq!(sent.len(), MAX_SIZES_IN_FLIGHT, "encore dans le délai : on attend");
+        forget_unanswered(&mut sent, last, last + SIZE_ANSWER_MS + 1.0);
+        assert!(sent.is_empty(), "délai passé : la fenêtre est de nouveau suivie");
+        assert!(
+            single_layout(&mut desired, &mut sent, caps, (1024, 768), false, (1600, 900)).unwrap().is_some()
+        );
+        // File pas pleine : jamais oubliée, même ancienne (le Reset peut encore venir).
+        forget_unanswered(&mut sent, last, last + 10.0 * SIZE_ANSWER_MS);
+        assert_eq!(sent.len(), 1);
     }
 
     #[test]

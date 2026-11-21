@@ -58,12 +58,15 @@ self.addEventListener("fetch", (e) => {
         // elle existe, vaut mieux qu'une page HTML donnée au chargeur d'un module (onglet resté sur l'ancienne
         // version). Un fichier valide du réseau reste préféré.
         if (file && (!r.ok || isHtml(r))) return (await caches.match(e.request)) || r;
-        if (r.ok && (navigate || file)) {
+        // « / » ne reçoit que la coquille HTML d'une navigation ; un fichier ouvert dans un onglet (icône…)
+        // garde sa propre URL.
+        const shell = navigate && !file && isHtml(r);
+        if (r.ok && (shell || file)) {
           const copy = r.clone();
-          caches.open(CACHE).then((c) => c.put(navigate ? "/" : e.request, copy));
+          caches.open(CACHE).then((c) => c.put(shell ? "/" : e.request, copy));
         }
         return r;
       })
-      .catch(() => caches.match(navigate ? "/" : e.request))
+      .catch(() => caches.match(navigate && !file ? "/" : e.request))
   );
 });

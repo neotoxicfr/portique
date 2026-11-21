@@ -184,6 +184,18 @@ pub enum AfterRead {
     Stalled,
 }
 
+/// Issue de la plus récente lecture conclue : une lecture plus ancienne qu'elle a dépassée la suit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Concluded {
+    /// Rien à attendre : contenu déjà commun, ou liste attendue acceptée.
+    #[default]
+    Settled,
+    /// Elle attend l'accusé de la dernière liste en vol (publiée ou rejointe).
+    Awaiting,
+    /// Windows a refusé cette liste : le PC n'a pas ce contenu, il faut relire.
+    Refused,
+}
+
 /// Nos listes de formats sans réponse, dans l'ordre d'envoi. Windows répond dans l'ordre : chaque
 /// réponse solde la plus ancienne, et seules les attentes de celle-ci reçoivent son verdict.
 #[derive(Default)]
@@ -200,8 +212,8 @@ pub struct Announces {
     /// `remote_copies` quand cette lecture a conclu : égal au compteur actuel, elle est plus récente
     /// que la dernière copie du PC.
     published_copies: u32,
-    /// Windows a refusé la dernière liste de cette lecture conclue (rien d'autre en vol depuis).
-    refused: bool,
+    /// Issue de cette lecture conclue.
+    concluded: Concluded,
     /// La dernière copie du PC n'est pas encore écrite localement (récupération ou écriture en cours,
     /// écriture refusée faute de focus, formats non pris en charge) : relire le contenu local d'avant
     /// (`local`) n'est pas une nouvelle copie, le republier écraserait la copie du PC.
@@ -244,10 +256,12 @@ impl Announces {
 
     /// Le PC a copié : nos listes en vol ne valident plus rien et ne se rejoignent plus ; leurs
     /// attentes recevront quand même leur propre verdict. Le contenu local d'avant est protégé dès
-    /// l'annonce, avant même la réponse de données.
-    pub fn remote_changed(&mut self) {
+    /// l'annonce, avant même la réponse de données. `common` est inconnu jusqu'à cette réponse :
+    /// il ne vaut que pour la copie courante du PC.
+    pub fn remote_changed(&mut self, common: &mut Option<u64>) {
         self.remote_copies = self.remote_copies.wrapping_add(1);
         self.unwritten = true;
+        *common = None;
         for a in &mut self.pending {
             a.fp = None;
         }
@@ -263,10 +277,17 @@ impl Announces {
         self.local = Some(fp);
     }
 
+    /// La copie du PC n'est-elle pas encore dans le presse-papier local ? Sinon, une écriture locale
+    /// en attente ne sert plus.
+    pub fn unwritten(&self) -> bool {
+        self.unwritten
+    }
+
     /// Lecture retenue d'empreinte `fp` : elle devient la référence locale, sauf pendant une copie du
-    /// PC non écrite où seule une publication la remplace.
-    fn seen(&mut self, fp: u64, published: bool) {
-        if published {
+    /// PC non écrite où seuls deux côtés à égalité la remplacent (`synced` : `fp` publié, ou
+    /// identique à la copie courante du PC).
+    fn seen(&mut self, fp: u64, synced: bool) {
+        if synced {
             self.unwritten = false;
         }
         if !self.unwritten {
@@ -302,34 +323,34 @@ impl Announces {
         // Windows muet : une liste de plus resterait sans réponse, une attente aussi.
         if self.pending.len() >= MAX_PENDING {
             if self.is_current(mark) {
-                self.seen(fp, false);
+                self.seen(fp, common == Some(fp));
             }
             return AfterRead::Stalled;
         }
-        // On attend l'accusé de la publication récente, si elle est encore en vol. Une lecture plus
-        // ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci. Accusé déjà reçu :
-        // un refus laisse le PC avec son ancien contenu, il faut relire.
+        // Même issue que la lecture récente : attendre l'accusé dont elle dépend s'il est encore en
+        // vol, relire si Windows l'a refusée, sinon rien (contenu déjà commun ou accepté). Une
+        // lecture plus ancienne qui aurait publié entre-temps ne l'emporte pas sur celle-ci.
         if overtaken {
-            return match (self.pending.is_empty(), self.refused) {
-                (false, _) => AfterRead::Join,
-                (true, true) => AfterRead::Retry,
-                (true, false) => AfterRead::Done,
+            return match self.concluded {
+                Concluded::Awaiting if !self.pending.is_empty() => AfterRead::Join,
+                Concluded::Refused => AfterRead::Retry,
+                _ => AfterRead::Done,
             };
         }
         // Toute lecture qui conclut fait référence, pas seulement celle qui publie : une lecture plus
         // ancienne encore en cours (conversion d'image) ne doit pas réannoncer un contenu dépassé.
         self.published_seq = mark.seq;
         self.published_copies = self.remote_copies;
-        self.refused = false;
         // Copie du PC pas encore écrite : relire le contenu local d'avant vaut contenu commun.
-        let common = if self.unwritten && self.local == Some(fp) { Some(fp) } else { common };
+        let shared = if self.unwritten && self.local == Some(fp) { Some(fp) } else { common };
         let next = match self.latest() {
             // Déjà annoncé, pas encore accepté (retour du focus juste avant un Ctrl+V) : même accusé.
             Some((a, at)) if a == fp && now - at < ANNOUNCE_TTL_MS => AfterRead::Join,
-            None if common == Some(fp) => AfterRead::Done,
+            None if shared == Some(fp) => AfterRead::Done,
             _ => AfterRead::Publish,
         };
-        self.seen(fp, next == AfterRead::Publish);
+        self.concluded = if next == AfterRead::Done { Concluded::Settled } else { Concluded::Awaiting };
+        self.seen(fp, next == AfterRead::Publish || common == Some(fp));
         next
     }
 
@@ -341,8 +362,8 @@ impl Announces {
     /// servi, le PC garde ses formats d'avant mais recevrait le contenu refusé s'il les demandait.
     pub fn answered(&mut self, ok: bool, common: &mut Option<u64>) {
         let Some(a) = self.pending.pop_front() else { return };
-        if self.pending.is_empty() {
-            self.refused = !ok;
+        if self.pending.is_empty() && self.concluded == Concluded::Awaiting {
+            self.concluded = if ok { Concluded::Settled } else { Concluded::Refused };
         }
         let verdict = match (self.pending.is_empty(), ok) {
             (false, _) => Ack::Replaced,
@@ -664,7 +685,7 @@ mod tests {
         common = Some(9);
         let (td, mut rd) = wait();
         a.sent(Some(4), 40.0, Some(td));
-        a.remote_changed();
+        a.remote_changed(&mut common);
         assert_eq!(a.latest(), None);
         a.answered(true, &mut common);
         assert_eq!(common, None, "acceptée, contenu inconnu");
@@ -695,7 +716,7 @@ mod tests {
         let mut common = None;
         // A vu localement et commun ; Windows copie B, reçu (commun = B) mais pas écrit localement.
         publish_accepted(&mut a, fa, &mut common, 0.0);
-        a.remote_changed();
+        a.remote_changed(&mut common);
         common = Some(fb);
         // Retour du focus : le presse-papier local contient toujours A, ce n'est pas une copie.
         let m = a.mark();
@@ -706,14 +727,14 @@ mod tests {
         a.sent(Some(fc), 20.0, None);
         a.answered(true, &mut common);
         // Windows recopie B, écrit localement cette fois (vu en dernier) : relire A est une copie.
-        a.remote_changed();
+        a.remote_changed(&mut common);
         common = Some(fb);
         a.written_locally(fb);
         let m = a.mark();
         assert_eq!(a.after_read(m, fa, common, 30.0), AfterRead::Publish);
         // Contenu local jamais vu : rien ne le distingue d'une copie, comme avant.
         let mut a = Announces::default();
-        a.remote_changed();
+        a.remote_changed(&mut common);
         let m = a.mark();
         assert_eq!(a.after_read(m, fa, Some(fb), 0.0), AfterRead::Publish);
     }
@@ -726,9 +747,9 @@ mod tests {
         // X vu localement et commun. Windows copie A (reçu, écriture locale refusée), puis B : la
         // récupération de B est en cours, aucune donnée encore reçue.
         publish_accepted(&mut a, fx, &mut common, 0.0);
-        a.remote_changed();
+        a.remote_changed(&mut common);
         common = Some(fa);
-        a.remote_changed();
+        a.remote_changed(&mut common);
         // Retour du focus : X relu avant la réponse de B, il n'écrase pas B.
         let m = a.mark();
         assert_eq!(a.after_read(m, fx, common, 10.0), AfterRead::Done);
@@ -750,7 +771,7 @@ mod tests {
             a.sent(Some(fx), now, None);
         }
         // Windows copie B, écriture locale refusée ; l'utilisateur copie C dans le navigateur.
-        a.remote_changed();
+        a.remote_changed(&mut common);
         common = Some(fb);
         let m = a.mark();
         assert_eq!(a.after_read(m, fc, common, 30_000.0), AfterRead::Stalled);
@@ -769,7 +790,7 @@ mod tests {
         // Ctrl+V : lecture de A (1) commencée. Windows copie C ; au retour du focus, une copie
         // locale B (2) est lue et annoncée.
         let ma = a.mark();
-        a.remote_changed();
+        a.remote_changed(&mut common);
         let mb = a.mark();
         assert_eq!(a.after_read(mb, 2, common, 0.0), AfterRead::Publish);
         a.sent(Some(2), 0.0, None);
@@ -780,7 +801,7 @@ mod tests {
         assert_eq!(a.after_read(ma, 1, common, 20.0), AfterRead::Retry);
         // Même course avec une nouvelle copie locale (3), acceptée : plus rien à attendre.
         let ma = a.mark();
-        a.remote_changed();
+        a.remote_changed(&mut common);
         let mb = a.mark();
         assert_eq!(a.after_read(mb, 3, common, 30.0), AfterRead::Publish);
         a.sent(Some(3), 30.0, None);
@@ -792,9 +813,55 @@ mod tests {
         let mc = a.mark();
         assert_eq!(a.after_read(mc, 4, common, 50.0), AfterRead::Publish);
         a.sent(Some(4), 50.0, None);
-        a.remote_changed();
+        a.remote_changed(&mut common);
         common = Some(5);
         assert_eq!(a.after_read(ma, 1, common, 60.0), AfterRead::Done);
+    }
+
+    #[test]
+    fn local_copy_of_the_remote_content_becomes_the_reference() {
+        let (fx, fb) = (1, 2);
+        let mut a = Announces::default();
+        let mut common = None;
+        publish_accepted(&mut a, fx, &mut common, 0.0);
+        // Windows copie B : contenu commun inconnu jusqu'à la réponse de données ; relire X le
+        // protège sans rien changer.
+        a.remote_changed(&mut common);
+        assert_eq!(common, None);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fx, common, 5.0), AfterRead::Done);
+        assert!(a.unwritten());
+        // B reçu, écriture locale refusée ; l'utilisateur copie B localement : les deux côtés l'ont.
+        common = Some(fb);
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fb, common, 10.0), AfterRead::Done);
+        assert!(!a.unwritten(), "plus d'écriture locale à faire");
+        // Recopier X est une nouvelle copie locale.
+        let m = a.mark();
+        assert_eq!(a.after_read(m, fx, common, 20.0), AfterRead::Publish);
+    }
+
+    #[test]
+    fn overtaken_read_waits_only_for_a_list_its_successor_depends_on() {
+        let mut a = Announces::default();
+        let mut common = None;
+        // X annoncé, accusé encore en vol. Ctrl+V : lecture commencée ; Windows copie B ; la
+        // lecture du retour du focus relit X : rien à annoncer (X plus ancien que B).
+        let m = a.mark();
+        assert_eq!(a.after_read(m, 1, common, 0.0), AfterRead::Publish);
+        a.sent(Some(1), 0.0, None);
+        let ma = a.mark();
+        a.remote_changed(&mut common);
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 1, common, 10.0), AfterRead::Done);
+        // La lecture dépassée conclut comme elle, sans attendre l'accusé (invalidé) de X.
+        assert_eq!(a.after_read(ma, 3, common, 20.0), AfterRead::Done);
+        // Un refus d'une liste dont aucune lecture conclue ne dépend ne fait pas relire.
+        let ma = a.mark();
+        let mb = a.mark();
+        assert_eq!(a.after_read(mb, 1, common, 30.0), AfterRead::Done);
+        a.answered(false, &mut common);
+        assert_eq!(a.after_read(ma, 3, common, 40.0), AfterRead::Done);
     }
 
     #[test]
@@ -839,8 +906,9 @@ mod tests {
     fn local_write_overtakes_reads_in_flight() {
         let (fa, fb) = (1, 2);
         let mut a = Announces::default();
+        let mut common = Some(fa);
         // A vu localement ; Windows copie B ; une lecture part, puis B est écrit localement.
-        a.remote_changed();
+        a.remote_changed(&mut common);
         let m = a.mark();
         a.written_locally(fb);
         // Elle rend A, que le presse-papier local ne contient plus : ni retenue, ni publiée.
@@ -923,7 +991,7 @@ mod tests {
         assert!(!a.is_current(ma), "dépassée par mb");
         // Copie sur le PC pendant la lecture : écartée.
         let m = a.mark();
-        a.remote_changed();
+        a.remote_changed(&mut common);
         assert_eq!(a.after_read(m, 5, common, 600.0), AfterRead::Done);
     }
 

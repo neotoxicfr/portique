@@ -62,100 +62,13 @@ pub fn validate_command(template: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Clé d'hôte SSH jamais approuvée : la connexion s'est arrêtée avant l'authentification.
-#[derive(Debug)]
-pub struct UnapprovedHostKey(pub String);
-
-impl std::fmt::Display for UnapprovedHostKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "clé SSH de l'hôte à approuver : {}", self.0)
-    }
-}
-
-impl std::error::Error for UnapprovedHostKey {}
-
-/// Réveil « par commande » : SSH vers `host` (clé du service, puis mot de passe s'il y en a un), puis
-/// `template` où `{mac}` est remplacé par l'adresse MAC. `pinned` : empreinte SHA-256 approuvée de la
-/// clé d'hôte. Sans elle, la connexion s'arrête AVANT l'authentification (rien ne part) et renvoie
-/// `UnapprovedHostKey` avec la clé présentée, à faire approuver par un admin.
-pub async fn ssh_command(
-    host: &str,
-    user: &str,
-    key: &russh::keys::PrivateKey,
-    password: Option<&str>,
-    template: &str,
-    mac: [u8; 6],
-    pinned: Option<&str>,
-) -> anyhow::Result<()> {
-    use std::sync::{Arc, Mutex};
-
-    use anyhow::Context;
-    use russh::client;
-
-    validate_command(template).map_err(|e| anyhow::anyhow!(e))?;
-
-    struct Check {
-        pinned: Option<String>,
-        seen: Arc<Mutex<Option<String>>>,
-    }
-    impl client::Handler for Check {
-        type Error = russh::Error;
-        async fn check_server_key(
-            &mut self,
-            key: &russh::keys::PublicKeyOrCertificate,
-        ) -> Result<bool, Self::Error> {
-            // Clé d'hôte simple attendue ; un certificat SSH n'est pas géré.
-            let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = key else { return Ok(false) };
-            let fp = key.fingerprint(russh::keys::HashAlg::Sha256).to_string();
-            let ok = self.pinned.as_deref() == Some(fp.as_str());
-            *self.seen.lock().unwrap() = Some(fp);
-            Ok(ok)
-        }
-    }
-
-    let seen = Arc::new(Mutex::new(None));
-    let handler = Check { pinned: pinned.map(str::to_owned), seen: seen.clone() };
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(10)),
-        ..Default::default()
-    });
-    let connect = client::connect(config, (host, 22), handler);
-    let mut session = match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let fp = seen.lock().unwrap().clone();
-            match (pinned, fp) {
-                (None, Some(got)) => return Err(UnapprovedHostKey(got).into()),
-                (Some(expected), Some(got)) if expected != got => {
-                    anyhow::bail!("la clé SSH de l'hôte a changé (attendue {expected}, reçue {got})")
-                }
-                _ => return Err(e).context("connexion SSH"),
-            }
-        }
-        Err(_) => anyhow::bail!("l'hôte SSH ne répond pas (délai dépassé)"),
-    };
-    let signer = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None);
-    let mut ok =
-        session.authenticate_publickey(user, signer).await.context("authentification SSH")?.success();
-    if !ok && let Some(pw) = password {
-        ok = session.authenticate_password(user, pw).await.context("authentification SSH")?.success();
-    }
-    anyhow::ensure!(
-        ok,
-        "identifiants SSH refusés (clé du service absente de l'hôte, mot de passe absent ou faux)"
-    );
-    let result = run_wake_command(&session, template, mac).await;
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "fr").await;
-    result
-}
-
 /// Durée maximale d'une commande de réveil, de l'ouverture du canal à sa fermeture.
 const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Sortie gardée pour y chercher une erreur ; au-delà, la commande n'est pas celle attendue.
 const MAX_OUTPUT: usize = 64 * 1024;
 
 /// Lance la commande de réveil (`template`, `{mac}` remplacé) sur une session SSH déjà authentifiée et
-/// vérifie son résultat. Commune au réveil par adresse saisie et au réveil par un hôte SSH déclaré.
+/// vérifie son résultat.
 pub async fn run_wake_command<H: russh::client::Handler>(
     session: &russh::client::Handle<H>,
     template: &str,

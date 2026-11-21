@@ -2,67 +2,131 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Préparer un PC Windows</title>
+<meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <style>
-:root{--bg:#f2f2f7;--card:#fff;--sep:rgba(60,60,67,.2);--fill:rgba(118,118,128,.12);--text:#1d1d1f;--muted:#636366;--link:#0066cc;--accent:#0071e3;--code:rgba(118,118,128,.12);--focus:#0071e3;--shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.06)}
-@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--sep:rgba(84,84,88,.6);--fill:rgba(118,118,128,.24);--text:#f5f5f7;--muted:#9a9a9f;--link:#2997ff;--code:rgba(118,118,128,.24);--focus:#0a84ff;--shadow:inset 0 .5px 0 rgba(255,255,255,.08)}}
+:root{--bg:#f2f2f7;--card:#fff;--bar:rgba(246,246,248,.78);--sep:rgba(60,60,67,.2);--fill:rgba(118,118,128,.12);--btn:rgba(120,120,128,.12);
+  --text:#1d1d1f;--muted:#636366;--link:#0066cc;--accent:#0071e3;--focus:#0071e3;
+  --blue:#0071e3;--indigo:#5856d6;--green:#34c759;--orange:#ff9500;--gray:#8e8e93;
+  --shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.06);
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--bar:rgba(22,22,23,.78);--sep:rgba(84,84,88,.6);--fill:rgba(118,118,128,.24);--btn:rgba(120,120,128,.24);
+  --text:#f5f5f7;--muted:#9a9a9f;--link:#2997ff;--focus:#0a84ff;--blue:#0a84ff;--indigo:#5e5ce6;--green:#30d158;--orange:#ff9f0a;--gray:#636366;
+  --shadow:inset 0 .5px 0 rgba(255,255,255,.08)}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;-webkit-text-size-adjust:100%}
-main{max-width:40rem;margin:0 auto;padding:max(24px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(40px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
-h1{font-size:28px;line-height:1.15;margin:8px 0 12px;letter-spacing:-.01em}
-h2{font-size:13px;font-weight:600;color:var(--muted);margin:28px 16px 8px}
-p{margin:0 0 12px}
-.card{background:var(--card);border-radius:16px;padding:16px;margin:12px 0;box-shadow:var(--shadow)}
-.card strong{display:block;font-size:17px;margin-bottom:8px}
-.card ul{margin:0}
-ul{padding-left:1.2rem;margin:0 0 12px}
-li+li{margin-top:6px}
-.group{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:4px 16px}
-.group p,.group li{margin:0}
-.group ul{list-style:none;padding:0;margin:0}
-.group li{padding:11px 0}
-.group li+li{border-top:.5px solid var(--sep);margin-top:0}
 a{color:var(--link)}
-a.button{display:inline-flex;align-items:center;min-height:44px;padding:0 18px;border-radius:999px;background:var(--accent);color:#fff;font-weight:600;text-decoration:none;margin:2px 6px 2px 0}
-a.button.secondary{background:var(--fill);color:var(--link)}
-a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}a:not(.button):focus-visible{border-radius:6px}
-code{font:13px ui-monospace,"SF Mono",Menlo,monospace;background:var(--code);padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
-.group p.pad{padding:11px 0}
-p.mut{color:var(--muted);font-size:13px;margin:16px 16px 0}
+a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+
+/* Barre translucide collante, comme celles de l'application. */
+.bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:8px;min-height:52px;
+  padding:env(safe-area-inset-top) max(12px,env(safe-area-inset-right)) 0 max(12px,env(safe-area-inset-left));
+  background:var(--bar);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--sep)}
+.back{display:grid;place-items:center;width:44px;height:44px;border-radius:50%;color:var(--link)}
+.back:hover{background:var(--btn)}
+.back svg{width:22px;height:22px}
+.bar-title{font-size:17px;font-weight:600}
+
+main{max-width:40rem;margin:0 auto;padding:20px max(16px,env(safe-area-inset-right)) max(40px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.lead{margin:4px 4px 8px;color:var(--muted)}
+h2{font-size:13px;font-weight:600;color:var(--muted);margin:26px 16px 8px}
+
+/* Groupes façon Réglages : rangées séparées par un filet. */
+.group{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:0 16px}
+.row{display:flex;gap:12px;align-items:flex-start;padding:12px 0}
+.row+.row{border-top:.5px solid var(--sep)}
+.row-body{flex:1;min-width:0;display:grid;gap:8px}
+.row-body strong{font-weight:600}
+.row-body span.detail{color:var(--muted)}
+.step{flex:none;display:grid;place-items:center;width:26px;height:26px;border-radius:50%;background:var(--fill);font-size:13px;font-weight:600;margin-top:-1px}
+
+/* Pastilles « icône d'app ». */
+.pastille{flex:none;display:grid;place-items:center;width:30px;height:30px;border-radius:7px;color:#fff;
+  background:linear-gradient(180deg,rgba(255,255,255,.22),rgba(255,255,255,0) 70%),var(--c)}
+.pastille svg{width:18px;height:18px}
+.blue{--c:var(--blue)}.indigo{--c:var(--indigo)}.green{--c:var(--green)}.orange{--c:var(--orange)}.gray{--c:var(--gray)}
+
+/* Téléchargements : boutons pleins, celui de l'annulation en gris. */
+.files{display:flex;flex-wrap:wrap;gap:8px}
+.file{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 18px;border-radius:999px;background:var(--accent);color:#fff;font-weight:600;text-decoration:none}
+.file.secondary{background:var(--btn);color:var(--link)}
+.file svg{width:18px;height:18px;flex:none}
+
+code{font:13px var(--mono);background:var(--fill);padding:2px 6px;border-radius:6px}
+/* Commande entière, sélectionnée d'un clic ; passe à la ligne aux espaces, jamais au milieu d'un mot. */
+pre.cmd{margin:0;font:13px/1.45 var(--mono);background:var(--fill);padding:10px 12px;border-radius:8px;white-space:pre-wrap;overflow-wrap:normal;
+  -webkit-user-select:all;user-select:all}
+.note{color:var(--muted);font-size:13px;margin:14px 16px 0}
+svg{fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
 </style>
 </head>
 <body>
+<header class="bar">
+  <a class="back" href="/" aria-label="Retour à Portique" title="Retour à Portique"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></a>
+  <span class="bar-title">Préparer un PC</span>
+</header>
 <main>
-<h1>Préparer un PC Windows</h1>
-<p>Ça règle tout ce qu'il faut pour Portique sur Windows 10/11 Pro, sans rien installer. Lance l'un des deux outils en administrateur (clic droit). Tu peux le relancer sans risque.</p>
-<div class="card">
-<strong>Option A : fichiers .reg + .cmd</strong>
-<ul>
-<li>Télécharge les trois fichiers dans le même dossier : <a class="button" href="portique.reg" download>portique.reg</a> <a class="button" href="portique.cmd" download>portique.cmd</a> <a class="button secondary" href="annuler.reg" download>annuler.reg</a></li>
-<li>Clic droit sur <code>portique.cmd</code> puis « Exécuter en tant qu'administrateur » : il importe le .reg et fait le reste.</li>
-</ul>
+<h1 class="sr-only">Préparer un PC Windows</h1>
+<p class="lead">Règle Windows 10/11 Pro pour Portique, sans rien installer. Lance l'un des deux outils en administrateur ; le relancer est sans risque.</p>
+
+<h2>Option A : fichiers .reg et .cmd</h2>
+<div class="group">
+  <div class="row"><span class="step" aria-hidden="true">1</span>
+    <div class="row-body"><span>Télécharge les trois fichiers dans le même dossier.</span>
+      <div class="files">
+        <a class="file" href="portique.reg" download><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>portique.reg</a>
+        <a class="file" href="portique.cmd" download><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>portique.cmd</a>
+        <a class="file secondary" href="annuler.reg" download><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>annuler.reg</a>
+      </div>
+    </div>
+  </div>
+  <div class="row"><span class="step" aria-hidden="true">2</span>
+    <div class="row-body"><span>Clic droit sur <code>portique.cmd</code>, puis « Exécuter en tant qu'administrateur ». Il importe le .reg et fait le reste.</span></div>
+  </div>
 </div>
-<div class="card">
-<strong>Option B : un seul script PowerShell</strong>
-<ul>
-<li>Télécharge <a class="button" href="portique.ps1" download>portique.ps1</a> puis dans PowerShell administrateur : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1</code></li>
-</ul>
+
+<h2>Option B : un seul script PowerShell</h2>
+<div class="group">
+  <div class="row"><span class="step" aria-hidden="true">1</span>
+    <div class="row-body"><span>Télécharge le script.</span>
+      <div class="files"><a class="file" href="portique.ps1" download><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>portique.ps1</a></div>
+    </div>
+  </div>
+  <div class="row"><span class="step" aria-hidden="true">2</span>
+    <div class="row-body"><span>Dans PowerShell administrateur, depuis son dossier :</span>
+      <pre class="cmd">powershell -ExecutionPolicy Bypass -File .\portique.ps1</pre>
+    </div>
+  </div>
 </div>
+
 <h2>Ce que ça change</h2>
-<div class="group"><ul>
-<li>Bureau à distance activé, authentification NLA obligatoire.</li>
-<li>Graphiques : H.264 AVC 4:4:4, encodage matériel et GPU pour toutes les sessions, 60 images/s, qualité d'image haute.</li>
-<li>Presse-papier, lecteurs, son et micro autorisés ; plus de déconnexion automatique.</li>
-<li>Pare-feu : règles « Bureau à distance » activées.</li>
-<li>Empreinte du certificat RDP affichée à la fin : à la première connexion, Portique montre une empreinte à l'admin, elle doit être <strong>identique</strong> avant de l'approuver.</li>
-<li>Réveil à distance : carte réseau autorisée à réveiller le PC, démarrage rapide désactivé, adresse MAC affichée (à recopier dans Portique). Active aussi Wake-on-LAN dans le BIOS/UEFI.</li>
-</ul></div>
+<div class="group">
+  <div class="row"><span class="pastille blue" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span>
+    <div class="row-body"><strong>Bureau à distance</strong><span class="detail">Activé, authentification NLA obligatoire.</span></div></div>
+  <div class="row"><span class="pastille indigo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18l5-6 4 4 7-9"/></svg></span>
+    <div class="row-body"><strong>Graphiques</strong><span class="detail">H.264 AVC 4:4:4, encodage matériel et GPU pour toutes les sessions, 60 images/s, qualité d'image haute.</span></div></div>
+  <div class="row"><span class="pastille green" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="4" width="10" height="16" rx="2"/><path d="M10 4V3h4v1"/></svg></span>
+    <div class="row-body"><strong>Redirections</strong><span class="detail">Presse-papier, lecteurs, son et micro autorisés ; plus de déconnexion automatique.</span></div></div>
+  <div class="row"><span class="pastille orange" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg></span>
+    <div class="row-body"><strong>Pare-feu</strong><span class="detail">Règles « Bureau à distance » activées.</span></div></div>
+  <div class="row"><span class="pastille gray" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="12" r="4"/><path d="M13 12h8M18 12v3M21 12v2"/></svg></span>
+    <div class="row-body"><strong>Certificat</strong><span class="detail">Son empreinte s'affiche à la fin. À la première connexion, Portique montre une empreinte à l'admin : elle doit être <strong>identique</strong> avant de l'approuver.</span></div></div>
+  <div class="row"><span class="pastille gray" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v9M7 6a8 8 0 1 0 10 0"/></svg></span>
+    <div class="row-body"><strong>Réveil à distance</strong><span class="detail">Carte réseau autorisée à réveiller le PC, démarrage rapide désactivé, adresse MAC affichée (à recopier dans Portique). Active aussi Wake-on-LAN dans le BIOS/UEFI.</span></div></div>
+</div>
+
 <h2>Annuler</h2>
-<div class="group"><p class="pad">Option A : importe <code>annuler.reg</code> puis lance <code>portique.cmd annuler</code> (ou seulement la seconde commande, elle importe le .reg). Option B : <code>powershell -ExecutionPolicy Bypass -File .\portique.ps1 -Annuler</code>.</p></div>
-<p class="mut">Un redémarrage peut être nécessaire pour que les réglages graphiques s'appliquent.</p>
+<div class="group">
+  <div class="row"><div class="row-body"><span><strong>Option A</strong> : lance, en administrateur (il importe <code>annuler.reg</code>) :</span>
+    <pre class="cmd">portique.cmd annuler</pre></div></div>
+  <div class="row"><div class="row-body"><span><strong>Option B</strong> : dans PowerShell administrateur :</span>
+    <pre class="cmd">powershell -ExecutionPolicy Bypass -File .\portique.ps1 -Annuler</pre></div></div>
+</div>
+<p class="note">Un redémarrage peut être nécessaire pour que les réglages graphiques s'appliquent.</p>
 </main>
 </body>
 </html>

@@ -153,8 +153,8 @@ pub struct SshAdmin {
     pub has_password: bool,
     /// Empreinte SHA-256 de la clé d'hôte approuvée (format OpenSSH).
     pub hostkey: Option<String>,
-    /// Hôte SSH de rebond (ProxyJump), lui-même éventuellement derrière un rebond.
-    pub jump_id: Option<i64>,
+    /// Rebond (ProxyJump) : hôte connu ou hôte saisi ; `None` = connexion directe.
+    pub jump: Option<HopAdmin>,
     /// Thème propre à cet hôte ; `None` = thème du compte.
     pub theme: Option<String>,
 }
@@ -167,8 +167,9 @@ pub struct SshInput {
     pub user: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Rebond ; `None` = connexion directe.
     #[serde(default)]
-    pub jump_id: Option<i64>,
+    pub jump: Option<HopInput>,
     #[serde(default)]
     pub theme: Option<String>,
     /// Oublie la clé d'hôte approuvée (machine réinstallée).
@@ -176,40 +177,66 @@ pub struct SshInput {
     pub forget_hostkey: bool,
 }
 
+/// Rebond SSH (WoL ou terminal) : un hôte connu de la liste, ou un hôte saisi pour cette machine seule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HopAdmin {
+    Known {
+        id: i64,
+    },
+    Host {
+        host: String,
+        port: u16,
+        user: String,
+        has_password: bool,
+        /// Hôte connu par lequel passe cet hôte saisi.
+        via_id: Option<i64>,
+        /// Empreinte SHA-256 de la clé d'hôte approuvée (format OpenSSH).
+        hostkey: Option<String>,
+        /// Clé présentée lors d'un essai, en attente d'approbation (aucun mot de passe n'est envoyé avant).
+        pending_hostkey: Option<String>,
+    },
+}
+
+/// Rebond à enregistrer. Pour un hôte saisi, `password: None` garde l'ancien, `Some("")` l'efface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HopInput {
+    Known {
+        id: i64,
+    },
+    Host {
+        host: String,
+        #[serde(default)]
+        port: Option<u16>,
+        user: String,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        via_id: Option<i64>,
+        /// Approuve la clé en attente (doit être identique à `pending_hostkey`).
+        #[serde(default)]
+        approve_hostkey: Option<String>,
+        /// Oublie la clé approuvée (hôte réinstallé) : la prochaine connexion la présentera à approuver.
+        #[serde(default)]
+        forget_hostkey: bool,
+    },
+}
+
 /// Réveil par commande : SSH vers `host` puis `command`, où `{mac}` est remplacé par l'adresse
 /// MAC (par exemple `wakeonlan {mac}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WolCommandAdmin {
-    /// Hôte SSH déclaré par lequel passe la commande ; `None` = adresse `host` saisie.
-    pub via_id: Option<i64>,
-    pub host: String,
-    pub user: String,
+    /// Hôte SSH par lequel passe la commande.
+    pub via: HopAdmin,
     pub command: String,
-    pub has_password: bool,
-    /// Empreinte de la clé d'hôte SSH approuvée.
-    pub hostkey: Option<String>,
-    /// Clé présentée par l'hôte lors d'un essai, en attente d'approbation (aucun mot de passe
-    /// n'est envoyé tant qu'elle n'est pas approuvée).
-    pub pending_hostkey: Option<String>,
 }
 
-/// `password: None` garde l'ancien.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WolCommandInput {
-    /// Hôte SSH déclaré par lequel passer (sa clé, son mot de passe, ses rebonds) ; s'il est donné,
-    /// `host`, `user` et `password` sont ignorés.
-    #[serde(default)]
-    pub via_id: Option<i64>,
-    #[serde(default)]
-    pub host: String,
-    #[serde(default)]
-    pub user: String,
+    /// Hôte SSH par lequel passer la commande.
+    pub via: HopInput,
     pub command: String,
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Approuve la clé en attente (doit être identique à `pending_hostkey`).
-    #[serde(default)]
-    pub approve_hostkey: Option<String>,
 }
 
 /// Création ou modification d'une connexion. `password: None` garde l'ancien,

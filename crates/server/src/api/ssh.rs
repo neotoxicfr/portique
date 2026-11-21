@@ -15,14 +15,16 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use portique_proto::{AuthMode, ServiceKey, SshControl, SshMessage};
 use russh::ChannelMsg;
+use sqlx::SqliteConnection;
 
 use crate::{
     api::{
         account::terminal_prefs,
-        connections::{Row, find_allowed},
+        connections::{find_allowed, find_hop},
         session::{REVALIDATE_EVERY, same_origin, still_allowed},
     },
     auth::{AdminUser, ClientIp, CurrentUser, UserRow},
+    crypto::Vault,
     ssh::{self, Hop, OpenError},
     state::{ApiResult, AppError, AppState, bad},
 };
@@ -131,12 +133,20 @@ async fn prepare(
         None => None,
     };
     let host_theme = row.ssh_theme.clone();
-    Ok((chain(state, row).await?, host_theme, trust))
+    Ok((chain(state, row.id).await?, host_theme, trust))
 }
 
-/// Chaîne des sauts, premier rebond d'abord, cible en dernier. Les rebonds n'ont pas à être
+/// Chaîne des sauts, premier rebond d'abord, cible en dernier, lue dans une transaction : une suppression
+/// d'hôte qui convertit les références entre deux lectures ne la casse pas. Les rebonds n'ont pas à être
 /// accessibles à l'utilisateur : seul l'accès à la cible compte.
-pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> {
+pub(crate) async fn chain(state: &AppState, target: i64) -> ApiResult<Vec<Hop>> {
+    let mut tx = state.db.begin().await?;
+    chain_in(&mut tx, &state.vault, target).await
+}
+
+/// `chain` sur une connexion déjà ouverte (et son instantané).
+pub(crate) async fn chain_in(db: &mut SqliteConnection, vault: &Vault, target: i64) -> ApiResult<Vec<Hop>> {
+    let target = find_hop(&mut *db, target).await?;
     // Vérifié ici pour tous les appelants (terminal, réveil par un hôte) : le SSH a pu être coupé depuis.
     if !target.ssh_enabled {
         return Err(bad(format!("« {} » n'a pas de SSH", target.name)));
@@ -146,7 +156,7 @@ pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> 
         if rows.len() >= ssh::MAX_HOPS || rows.iter().any(|r| r.id == jump) {
             return Err(bad("chaîne de rebonds invalide (boucle ou trop longue)"));
         }
-        let r = find_allowed(&state.db, 0, true, jump).await?;
+        let r = find_hop(&mut *db, jump).await?;
         if !r.ssh_enabled {
             return Err(bad(format!("le rebond « {} » n'a pas de SSH", r.name)));
         }
@@ -156,10 +166,9 @@ pub(crate) async fn chain(state: &AppState, target: Row) -> ApiResult<Vec<Hop>> 
     rows.into_iter()
         .map(|r| {
             let password = match &r.ssh_password {
-                Some(sealed) => Some(
-                    String::from_utf8_lossy(&state.vault.open(&format!("ssh:{}", r.id), sealed)?)
-                        .into_owned(),
-                ),
+                Some(sealed) => {
+                    Some(String::from_utf8_lossy(&vault.open(&format!("ssh:{}", r.id), sealed)?).into_owned())
+                }
                 None => None,
             };
             Ok(Hop {
@@ -187,7 +196,8 @@ async fn pin(state: &AppState, user: &UserRow, hops: &[Hop], pinned: &[(i64, Str
     for (id, fp) in pinned {
         let Some(hop) = hops.iter().find(|h| h.id == *id) else { continue };
         let done = sqlx::query(
-            "UPDATE connections SET ssh_hostkey = ? WHERE id = ? AND ssh_hostkey IS NULL AND host = ? AND ssh_port = ?",
+            "UPDATE connections SET ssh_hostkey = ?, ssh_hostkey_pending = NULL
+             WHERE id = ? AND ssh_hostkey IS NULL AND host = ? AND ssh_port = ?",
         )
         .bind(fp)
         .bind(id)
@@ -381,6 +391,11 @@ pub(crate) mod tests {
 
     /// État complet sur une base en mémoire, compte `admin` créé (servi aussi aux tests des autres modules).
     pub(crate) async fn state(mode: &'static str) -> crate::state::AppState {
+        state_on(mode, crate::open_db("sqlite::memory:").await.unwrap()).await
+    }
+
+    /// Comme `state`, sur une base déjà migrée (préparée à une version antérieure, par exemple).
+    pub(crate) async fn state_on(mode: &'static str, db: sqlx::SqlitePool) -> crate::state::AppState {
         let mut env = vec![
             ("PORTIQUE_PUBLIC_URL", "https://portique.example.com"),
             ("PORTIQUE_MASTER_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="), // gitleaks:allow (octets 0..31, factice)
@@ -390,7 +405,6 @@ pub(crate) mod tests {
         if mode == "proxy" {
             env.push(("PORTIQUE_TRUSTED_PROXIES", "127.0.0.1"));
         }
-        let db = crate::open_db("sqlite::memory:").await.unwrap();
         let s = crate::build_state(Config::from_env(&V(env)).unwrap(), db).unwrap();
         crate::bootstrap_admin(&s).await.unwrap();
         s
@@ -468,5 +482,36 @@ pub(crate) mod tests {
         let mut totp = user.clone();
         totp.totp_secret = Some(vec![1]);
         assert!(second_factor_gate(&s, &totp, &jar("sans")).await.is_err(), "TOTP actif : refusé aussi");
+    }
+
+    /// Clé approuvée depuis le terminal : celle qu'un réveil avait mise en attente n'est plus à approuver.
+    #[tokio::test]
+    async fn pinning_clears_the_pending_hostkey() {
+        let s = state("builtin").await;
+        let user = crate::auth::user_by_name(&s.db, "admin").await.unwrap().unwrap();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO connections (name, host, port, ssh_enabled, ssh_port, ssh_hostkey_pending)
+             VALUES ('saisi', '192.0.2.1', 3389, 1, 22, 'SHA256:vue') RETURNING id",
+        )
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        let hop = super::Hop {
+            id,
+            name: "saisi".into(),
+            host: "192.0.2.1".into(),
+            port: 22,
+            user: "root".into(),
+            password: None,
+            hostkey: None,
+        };
+        super::pin(&s, &user, &[hop], &[(id, "SHA256:vue".into())]).await;
+        let (key, pending): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT ssh_hostkey, ssh_hostkey_pending FROM connections WHERE id = ?")
+                .bind(id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!((key.as_deref(), pending), (Some("SHA256:vue"), None));
     }
 }

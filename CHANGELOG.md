@@ -2,6 +2,28 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.5.0] - à venir
+
+### Ajouté
+
+- Réveil en mode « Direct » (paquet UDP, sans hôte SSH) ou « Rebond ». En mode Rebond comme pour le terminal SSH,
+  la machine passe par un hôte connu de la liste ou par un « Hôte » saisi pour elle seule (adresse, port, compte,
+  mot de passe facultatif, clé d'hôte à approuver ou à oublier) ; « Accès à l'hôte » permet de joindre cet hôte
+  saisi par un hôte connu.
+- Supprimer un hôte connu ne coupe plus les machines qui passaient par lui : chacune reçoit un hôte saisi qui en
+  reprend l'adresse, le compte, le mot de passe et la clé, et l'accès par son propre rebond. Un rebond SSH inactif
+  (SSH coupé sur la machine) n'est pas copié : sa référence est retirée.
+- `publish-dev.sh` redéploie aussi les autres déploiements qui suivent `:dev` (`DEPLOY_OTHERS`).
+- Admin en mode proxy : la colonne de double authentification des comptes montre une information bleue (elle se
+  règle dans le proxy, que Portique ne voit pas) au lieu d'une alerte orange.
+
+### Modifié
+
+- API d'administration : `wol_command.via` et `ssh.jump` (hôte connu `{"kind":"known","id"}` ou hôte saisi
+  `{"kind":"host",…}`) remplacent `via_id`, `host`, `user`, `password`, `approve_hostkey` et `jump_id`.
+- Le réveil par adresse saisie des versions précédentes est repris au démarrage en hôte saisi (mot de passe et clé
+  d'hôte gardés). Migration 0009 : sauvegarder `/data` avant la mise à jour.
+
 ## [v0.4.0] - 2026-11-21
 
 ### Ajouté

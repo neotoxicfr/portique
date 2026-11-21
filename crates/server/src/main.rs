@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let mode = cfg.auth_mode;
     let state = build_state(cfg, db)?;
     bootstrap_admin(&state).await?;
+    portique_server::api::connections::convert_legacy_wol_hosts(&state).await?;
     // Proxys de confiance désignés par nom : résolus maintenant puis régulièrement.
     state.cfg.proxy.refresh_trusted_hosts().await;
     let proxy = state.cfg.proxy.clone();

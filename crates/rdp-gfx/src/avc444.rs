@@ -103,13 +103,15 @@ impl Planes444 {
     /// Vue auxiliaire (chroma manquante), sur les rectangles donnés.
     pub fn apply_aux(&mut self, f: &Yuv420<'_>, rects: &[Rect], v2: bool) -> Result<(), Error> {
         f.check()?;
-        self.aux_with(rects, v2, |s| f.at(s).map(|v| (v, true)));
+        let tw = v2_width(self.width, f.width);
+        self.aux_with(rects, v2, tw, |s| f.at(s).map(|v| (v, true)));
         Ok(())
     }
 
     /// Les blocs 2×2 entiers sont chargés, même au bord d'une zone : le filtre inverse d'une
     /// position paire-paire lit ses trois voisins. Seuls les blocs à luma valable sont touchés.
-    fn aux_with(&mut self, rects: &[Rect], v2: bool, at: impl Fn(Src) -> Option<(u8, bool)>) {
+    /// `tw` : largeur de rangement de la vue auxiliaire v2 (voir `v2_width`).
+    fn aux_with(&mut self, rects: &[Rect], v2: bool, tw: u32, at: impl Fn(Src) -> Option<(u8, bool)>) {
         let (w, h, hw) = (self.width, self.height, self.hw());
         for r in rects {
             let Some(r) = r.clip(w, h) else { continue };
@@ -122,7 +124,7 @@ impl Planes444 {
                     if partial && !self.luma_ok[c] {
                         continue;
                     }
-                    let Some((su, sv)) = aux_src(x, y, w, v2) else { continue };
+                    let Some((su, sv)) = aux_src(x, y, tw, v2) else { continue };
                     if let Some((u, ok)) = at(su) {
                         self.u[i] = if ok { u } else { self.mu[c] };
                     }
@@ -210,7 +212,16 @@ impl Yuv420<'_> {
     }
 }
 
-/// Échantillons de la vue auxiliaire qui portent U et V du pixel (x, y), s'il en porte.
+/// Largeur selon laquelle l'encodeur range la vue auxiliaire v2 (moitiés de la luma, quarts de la
+/// chroma) : celle de la surface arrondie au multiple de 32 supérieur, sans dépasser l'image décodée,
+/// comme FreeRDP. Avec la largeur de la surface telle quelle, un bureau dont la largeur n'est pas un
+/// multiple de 32 (téléphone) lisait la chroma V quelques colonnes à côté : points colorés décalés.
+pub(crate) fn v2_width(surface: u32, frame: u32) -> u32 {
+    (surface.div_ceil(32) * 32).min(frame)
+}
+
+/// Échantillons de la vue auxiliaire qui portent U et V du pixel (x, y), s'il en porte. `w` : largeur
+/// de rangement v2 (`v2_width`), sans effet en v1.
 fn aux_src(x: u32, y: u32, w: u32, v2: bool) -> Option<(Src, Src)> {
     if !v2 {
         if !y.is_multiple_of(2) {
@@ -554,7 +565,7 @@ impl FromRgb {
 impl Planes444 {
     /// Chroma de la vue principale (Ũ, Ṽ) aux positions que portent les échantillons U et V du
     /// bloc (cx, cy) de la vue auxiliaire : c'est ce qu'on en attend faute de mieux.
-    fn aux_prior(&self, cx: u32, cy: u32, v2: bool) -> Option<(u8, u8)> {
+    fn aux_prior(&self, cx: u32, cy: u32, v2: bool, tw: u32) -> Option<(u8, u8)> {
         let hw = self.hw();
         let main = |x: u32, y: u32, v: bool| -> Option<u8> {
             let i = (y / 2) as usize * hw + (x / 2) as usize;
@@ -563,14 +574,14 @@ impl Planes444 {
         if !v2 {
             return Some((main(2 * cx + 1, 2 * cy, false)?, main(2 * cx + 1, 2 * cy, true)?));
         }
-        let qw = self.width / 4;
+        let qw = tw / 4;
         let (x, v) = if cx < qw { (cx, false) } else { (cx - qw, true) };
         Some((main(4 * x, 2 * cy + 1, v)?, main(4 * x + 2, 2 * cy + 1, v)?))
     }
 
     /// Zones de la vue auxiliaire qui portent la chroma des zones `rects` de l'image (débords
     /// découpés par `FromRgb::new`).
-    fn aux_blocks(&self, rects: &[Rect], v2: bool) -> Vec<Rect> {
+    fn aux_blocks(&self, rects: &[Rect], v2: bool, tw: u32) -> Vec<Rect> {
         let mut out = Vec::new();
         for r in rects {
             let Some(r) = r.clip(self.width, self.height) else { continue };
@@ -582,7 +593,7 @@ impl Planes444 {
                 // Colonnes à demi-largeur : moitié gauche (U), moitié droite (V).
                 let (x0, x1) = (r.x / 4 * 2, (r.x + r.w) / 2 + 2);
                 let (y0, h) = (r.y & !1, r.h + 2);
-                let right = (self.width / 4 * 2).min(self.width / 2);
+                let right = (tw / 4 * 2).min(tw / 2);
                 out.push(Rect { x: x0, y: y0, w: x1 - x0, h });
                 out.push(Rect { x: right + x0, y: y0, w: x1 - x0 + 2, h });
             }
@@ -593,11 +604,13 @@ impl Planes444 {
     /// Vue auxiliaire rendue en RGB par le navigateur, retrouvée en s'aidant de la vue principale
     /// déjà appliquée.
     pub fn aux_from_rgba(&self, f: &crate::Rgba<'_>, rects: &[Rect], v2: bool) -> Result<FromRgb, Error> {
-        FromRgb::new(f, &self.aux_blocks(rects, v2), |cx, cy| self.aux_prior(cx, cy, v2))
+        let tw = v2_width(self.width, f.width);
+        FromRgb::new(f, &self.aux_blocks(rects, v2, tw), |cx, cy| self.aux_prior(cx, cy, v2, tw))
     }
 
     pub fn apply_aux_from(&mut self, aux: &FromRgb, rects: &[Rect], v2: bool) {
-        self.aux_with(rects, v2, |s| aux.at(s));
+        let tw = v2_width(self.width, aux.width);
+        self.aux_with(rects, v2, tw, |s| aux.at(s));
     }
 
     /// Preuve que le navigateur convertit bien en BT.709 pleine plage, tirée des zones unies de la
@@ -609,6 +622,7 @@ impl Planes444 {
     /// constante (indiscernable d'un écart de conversion) occupe la zone.
     pub fn aux_proven(&self, aux: &FromRgb, rects: &[Rect], v2: bool) -> bool {
         let (w, h, hw) = (self.width, self.height, self.hw());
+        let tw = v2_width(w, aux.width);
         // Écarts signés cumulés par classe : couleur (Ũ, Ṽ par pas de 32) et plan source (la luma
         // et la chroma de la vue auxiliaire ne sont pas déformées de la même façon).
         let (mut sum, mut cnt) = ([0i64; 128], [0i64; 128]);
@@ -632,7 +646,7 @@ impl Planes444 {
                     let class = |m: i32| ((m as usize + 16) >> 5).min(7);
                     let k = class(mu) * 8 + class(mv);
                     for (x, y) in [(2 * cx + 1, 2 * cy), (2 * cx, 2 * cy + 1), (2 * cx + 1, 2 * cy + 1)] {
-                        let Some((su, sv)) = aux_src(x, y, w, v2) else { continue };
+                        let Some((su, sv)) = aux_src(x, y, tw, v2) else { continue };
                         for (s, m) in [(su, mu), (sv, mv)] {
                             if let Some(v) = aux.exact(s) {
                                 let k = k + if matches!(s, Src::Y(..)) { 64 } else { 0 };
@@ -765,6 +779,75 @@ mod tests {
     #[test]
     fn v1_roundtrip() {
         roundtrip(false);
+    }
+
+    #[test]
+    fn v2_layout_follows_the_32_aligned_width() {
+        // Bureau de 40 px (pas un multiple de 32), comme un téléphone : l'encodeur range la vue
+        // auxiliaire sur 64 px, U des colonnes impaires à gauche, V à partir de 32.
+        let (w, h, tw) = (40u32, 16u32, 64u32);
+        assert_eq!(v2_width(w, tw), 64);
+        assert_eq!(v2_width(1920, 1920), 1920, "1920 : rien ne change");
+        let mut rng = Rng(11);
+        let y: Vec<u8> = (0..w * h).map(|_| rng.next()).collect();
+        let u: Vec<u8> = (0..w * h).map(|_| rng.next()).collect();
+        let v: Vec<u8> = (0..w * h).map(|_| rng.next()).collect();
+        let at = |p: &[u8], x: u32, y: u32| p[(y * w + x) as usize];
+        let (thw, thh) = ((tw / 2) as usize, (h / 2) as usize);
+        let mut my = vec![0u8; (tw * h) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                my[(yy * tw + xx) as usize] = y[(yy * w + xx) as usize];
+            }
+        }
+        let (mut mu, mut mv) = (vec![128u8; thw * thh], vec![128u8; thw * thh]);
+        for cy in 0..h / 2 {
+            for cx in 0..w / 2 {
+                let avg = |p: &[u8]| {
+                    ((at(p, 2 * cx, 2 * cy) as u32
+                        + at(p, 2 * cx + 1, 2 * cy) as u32
+                        + at(p, 2 * cx, 2 * cy + 1) as u32
+                        + at(p, 2 * cx + 1, 2 * cy + 1) as u32
+                        + 2)
+                        / 4) as u8
+                };
+                mu[cy as usize * thw + cx as usize] = avg(&u);
+                mv[cy as usize * thw + cx as usize] = avg(&v);
+            }
+        }
+        let mut ay = vec![0u8; (tw * h) as usize];
+        for yy in 0..h {
+            for x in 0..w / 2 {
+                ay[(yy * tw + x) as usize] = at(&u, 2 * x + 1, yy);
+                ay[(yy * tw + tw / 2 + x) as usize] = at(&v, 2 * x + 1, yy);
+            }
+        }
+        let (mut au, mut av) = (vec![0u8; thw * thh], vec![0u8; thw * thh]);
+        for cy in 0..h / 2 {
+            for x in 0..w / 4 {
+                let row = cy as usize * thw;
+                au[row + x as usize] = at(&u, 4 * x, 2 * cy + 1);
+                au[row + (tw / 4 + x) as usize] = at(&v, 4 * x, 2 * cy + 1);
+                av[row + x as usize] = at(&u, 4 * x + 2, 2 * cy + 1);
+                av[row + (tw / 4 + x) as usize] = at(&v, 4 * x + 2, 2 * cy + 1);
+            }
+        }
+        let stride = tw / 2;
+        let main = Yuv420 { width: tw, height: h, y: &my, u: &mu, v: &mv, y_stride: tw, uv_stride: stride };
+        let aux = Yuv420 { width: tw, height: h, y: &ay, u: &au, v: &av, y_stride: tw, uv_stride: stride };
+        let full = [Rect { x: 0, y: 0, w, h }];
+        let mut p = Planes444::new(w, h);
+        p.apply_main(&main, &full).unwrap();
+        p.apply_aux(&aux, &full, true).unwrap();
+        for yy in 0..h {
+            for xx in 0..w {
+                if xx.is_multiple_of(2) && yy.is_multiple_of(2) {
+                    continue;
+                }
+                let i = (yy * w + xx) as usize;
+                assert_eq!((p.u[i], p.v[i]), (u[i], v[i]), "({xx},{yy})");
+            }
+        }
     }
 
     #[test]

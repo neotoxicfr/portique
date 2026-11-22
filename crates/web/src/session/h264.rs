@@ -384,12 +384,36 @@ impl Drop for H264 {
 
 async fn copy_planes(frame: &VideoFrame) -> Result<Decoded, String> {
     let rect = frame.visible_rect().ok_or("image sans zone visible")?;
-    let (width, height) = (rect.width() as u32, rect.height() as u32);
     let format = frame.format().ok_or("format d'image inconnu")?;
-    let size = frame.allocation_size().map_err(|e| format!("{e:?}"))?;
-    let buf = Uint8Array::new_with_length(size);
-    let layouts =
-        JsFuture::from(frame.copy_to_with_u8_array(&buf)).await.map_err(|e| format!("copie : {e:?}"))?;
+    // Image décodée entière (largeur codée, multiple de 16) quand la zone visible part du coin : la vue
+    // auxiliaire AVC444 v2 range sa chroma V jusqu'à la largeur arrondie à 32, au-delà de la zone
+    // visible d'un bureau dont la largeur n'en est pas un multiple. Sinon, ou si le navigateur refuse,
+    // la zone visible comme avant.
+    let coded = (rect.x() == 0.0 && rect.y() == 0.0).then(|| {
+        let r = web_sys::DomRectInit::new();
+        r.set_x(0.0);
+        r.set_y(0.0);
+        r.set_width(frame.coded_width() as f64);
+        r.set_height(frame.coded_height() as f64);
+        let o = web_sys::VideoFrameCopyToOptions::new();
+        o.set_rect(&r);
+        o
+    });
+    let sized = coded.as_ref().and_then(|o| frame.allocation_size_with_options(o).ok().map(|n| (o, n)));
+    let (width, height, buf, copy) = match sized {
+        Some((o, n)) => {
+            let buf = Uint8Array::new_with_length(n);
+            let copy = frame.copy_to_with_u8_array_and_options(&buf, o);
+            (frame.coded_width(), frame.coded_height(), buf, copy)
+        }
+        None => {
+            let n = frame.allocation_size().map_err(|e| format!("{e:?}"))?;
+            let buf = Uint8Array::new_with_length(n);
+            let copy = frame.copy_to_with_u8_array(&buf);
+            (rect.width() as u32, rect.height() as u32, buf, copy)
+        }
+    };
+    let layouts = JsFuture::from(copy).await.map_err(|e| format!("copie : {e:?}"))?;
     let layouts: Array = layouts.unchecked_into();
     let plane = |i: u32| -> (u32, u32) {
         let l: PlaneLayout = layouts.get(i).unchecked_into();

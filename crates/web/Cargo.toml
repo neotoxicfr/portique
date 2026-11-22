@@ -64,6 +64,7 @@ web-sys = { version = "0.3.106", features = [
     "HtmlTextAreaElement",
     "HtmlButtonElement",
     "DomRect",
+    "DomRectInit",
     "DomRectReadOnly",
     "AddEventListenerOptions",
     "VideoDecoder",

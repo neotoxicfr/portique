@@ -7,11 +7,15 @@ Merci de ton intérêt ! Ce guide tient en une page.
 - Rust stable, avec `rustfmt` et `clippy`
 - cible wasm : `rustup target add wasm32-unknown-unknown`
 - [trunk](https://trunkrs.dev) pour le front : `cargo install --locked trunk`
+- les contrôles de `scripts/ci.sh` : `cargo install --locked cargo-nextest@0.9.152 cargo-deny@0.22.1 cargo-machete@0.10.1`
 - `curl`, `openssl` et `flock` (util-linux) : `scripts/vendor-xterm.sh` télécharge xterm.js, vérifie son
   empreinte et attend la fin d'une autre exécution en cours
 
 ```sh
-cargo test --workspace --exclude portique-web
+cargo nextest run --workspace --exclude portique-web
+cargo test --doc --workspace --exclude portique-web   # nextest ne lance pas les doctests
+cargo deny check                                       # failles connues, licences, doublons, provenance
+cargo machete                                          # dépendances déclarées mais inutilisées
 cargo clippy --workspace --exclude portique-web --all-targets -- -D warnings
 cargo clippy -p portique-web --target wasm32-unknown-unknown -- -D warnings   # le front ne compile qu'en wasm
 cargo fmt --all --check

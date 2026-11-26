@@ -12,15 +12,16 @@ cargo clippy --workspace --exclude portique-web --all-targets --locked -- -D war
 step "clippy (front, wasm uniquement)"
 cargo clippy -p portique-web --target wasm32-unknown-unknown --locked -- -D warnings
 step "tests"
-cargo test --workspace --exclude portique-web --locked
+cargo nextest run --workspace --exclude portique-web --locked
+cargo test --doc --workspace --exclude portique-web --locked   # nextest ne lance pas les doctests
 step "tests du front (logique pure, en natif)"
 # Dossier cible à part : RUSTFLAGS différent, il invaliderait le cache des autres étapes.
-CARGO_TARGET_DIR=target/web-natif RUSTFLAGS=--cfg=web_sys_unstable_apis cargo test -p portique-web --locked
+CARGO_TARGET_DIR=target/web-natif RUSTFLAGS=--cfg=web_sys_unstable_apis cargo nextest run -p portique-web --locked
 step "front"
 ./scripts/vendor-xterm.sh
 (cd crates/web && trunk build --release --dist ../../dist)
-if command -v cargo-audit >/dev/null; then
-  step "audit des dépendances"
-  cargo audit
-fi
+step "dépendances : failles connues, licences, doublons, provenance (deny.toml)"
+cargo deny --locked check --hide-inclusion-graph
+step "dépendances déclarées mais inutilisées"
+cargo machete
 printf '\nCI locale OK\n'

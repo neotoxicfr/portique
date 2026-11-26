@@ -1,4 +1,4 @@
-# CI publique : la même chose que scripts/ci.sh en local (format, clippy, tests, front, audit).
+# CI publique : la même chose que scripts/ci.sh en local (format, clippy, tests, front, dépendances).
 name: CI
 on:
   push:
@@ -23,5 +23,5 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
-          tool: trunk,cargo-audit
+          tool: trunk,cargo-deny@0.22.1,cargo-nextest@0.9.152,cargo-machete@0.10.1
       - run: ./scripts/ci.sh

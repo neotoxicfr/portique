@@ -257,11 +257,12 @@ séquence de connexion et les comportements mesurés sur Windows : [`docs/rdp-co
 
 ## Développer
 
-Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), `curl`, `openssl` et
-`flock` (xterm.js est téléchargé et vérifié au build ; détail dans [CONTRIBUTING.md](CONTRIBUTING.md)).
+Prérequis : Rust stable, cible `wasm32-unknown-unknown`, [trunk](https://trunkrs.dev), cargo-nextest,
+cargo-deny et cargo-machete (contrôles de `scripts/ci.sh`), `curl`, `openssl` et `flock` (xterm.js est téléchargé
+et vérifié au build). Commandes d'installation dans [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```sh
-./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, cargo audit
+./scripts/ci.sh                          # format, clippy (serveur et wasm), tests, front, dépendances
 (cd crates/web && trunk build --release --dist ../../dist)
 (umask 077; mkdir -p secrets; [ -s secrets/master_key ] || openssl rand -base64 32 > secrets/master_key)
 chmod 600 secrets/master_key             # clé stable : ./data en dépend

@@ -9,7 +9,8 @@
 ## Liste de contrôle
 
 - [ ] `./scripts/ci.sh` passe (ou, à défaut, les étapes ci-dessous)
-- [ ] `cargo test --workspace --exclude portique-web`
+- [ ] `cargo nextest run --workspace --exclude portique-web` et `cargo test --doc --workspace --exclude portique-web`
+- [ ] `cargo deny check` et `cargo machete`
 - [ ] `cargo clippy` (hôte sans `portique-web`, puis `portique-web` en `--target wasm32-unknown-unknown`) et `cargo fmt --all --check`
 - [ ] `trunk build --release` si le front change
 - [ ] sections de spec citées pour tout nouveau PDU

@@ -1,0 +1,33 @@
+# cargo deny (lancé par scripts/ci.sh) : failles connues, licences, doublons, provenance des paquets.
+
+[graph]
+# Seules les cibles réellement compilées : serveur amd64/arm64 et front wasm.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+
+[advisories]
+# Chaque exception dit pourquoi elle n'est pas atteignable.
+ignore = [
+    # rsa 0.10 (Marvin, timing sur le déchiffrement/la signature RSA), aucun correctif publié.
+    # Seul russh l'utilise, côté client SSH : vérification de la clé publique de l'hôte, aucune clé
+    # privée RSA chez nous.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via russh : clé publique de l'hôte seulement, aucune clé privée RSA" },
+]
+
+[licenses]
+# Licences permissives, plus MPL-2.0 (webauthn-rs : copyleft par fichier, sources non modifiées).
+allow = [
+    "0BSD", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "BSL-1.0", "CC0-1.0", "ISC",
+    "MIT", "MIT-0", "MPL-2.0", "Unicode-3.0", "Unlicense", "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Plusieurs versions d'un même paquet : signalées, pas bloquantes (elles viennent des dépendances).
+multiple-versions = "warn"
+wildcards = "deny"
+# Les paquets du dépôt se référencent par chemin, sans version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

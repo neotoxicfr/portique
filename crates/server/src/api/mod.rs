@@ -1,6 +1,7 @@
 pub mod account;
 pub mod auth;
 pub mod connections;
+pub mod machine;
 pub mod session;
 pub mod ssh;
 pub mod users;

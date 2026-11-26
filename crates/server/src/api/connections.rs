@@ -52,6 +52,7 @@ macro_rules! columns {
          ssh_jump_id, ssh_theme, wol_via_id, inline_for"
     };
 }
+pub(crate) use columns;
 
 /// Maillons saisis d'un emplacement : la ligne cachée `?1` de `?2`, puis les lignes cachées de `?2` par
 /// lesquelles elle passe (copies laissées par la suppression d'un hôte connu), `?3` au plus.
@@ -162,24 +163,25 @@ pub async fn wake(
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     let row = find_allowed(&state.db, u.id, u.is_admin, id).await?;
+    wake_row(&state, &row, &u.username, u.is_admin).await
+}
+
+/// Réveil de `row` : commande sur son hôte de réveil, sinon paquet UDP. `by` nomme le demandeur dans le
+/// journal ; `detail` rend l'erreur d'une commande telle quelle (admin), sinon un résumé.
+pub(crate) async fn wake_row(state: &AppState, row: &Row, by: &str, detail: bool) -> ApiResult<StatusCode> {
     let mac = row.wol_mac.as_deref().and_then(wol::parse_mac).ok_or_else(|| bad("WoL non configuré"))?;
     // Pas de double authentification exigée ici, même par l'hôte SSH : la commande est celle de l'admin
     // et la MAC vient de la base. L'utilisateur ne peut que réveiller sa machine, comme par paquet UDP.
     if let (Some(via), Some(template)) = (row.wol_via_id, row.wol_ssh_command.as_deref()) {
-        let result = wake_via(&state, via, template, mac).await;
+        let result = wake_via(state, via, template, mac).await;
         return match result {
             Ok(name) => {
-                tracing::info!(
-                    user = u.username,
-                    connection = row.name,
-                    ssh = name,
-                    "WoL envoyé par commande"
-                );
+                tracing::info!(user = by, connection = row.name, ssh = name, "WoL envoyé par commande");
                 Ok(StatusCode::NO_CONTENT)
             }
             Err(e) => {
-                tracing::warn!(user = u.username, connection = row.name, "échec du réveil : {e:#}");
-                Err(bad(if u.is_admin {
+                tracing::warn!(user = by, connection = row.name, "échec du réveil : {e:#}");
+                Err(bad(if detail {
                     format!("réveil par commande : {e:#}")
                 } else {
                     "le réveil a échoué ; un admin trouvera le détail dans le journal".to_owned()
@@ -194,7 +196,7 @@ pub async fn wake(
     let target = wol::parse_target(row.wol_target.as_deref().unwrap_or(wol::DEFAULT_TARGET))
         .ok_or_else(|| bad("adresse WoL invalide"))?;
     wol::send(mac, target).await.map_err(|e| anyhow::anyhow!("envoi WoL vers {target} : {e}"))?;
-    tracing::info!(user = u.username, connection = row.name, %target, "paquet WoL envoyé");
+    tracing::info!(user = by, connection = row.name, %target, "paquet WoL envoyé");
     Ok(StatusCode::NO_CONTENT)
 }
 

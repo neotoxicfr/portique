@@ -91,6 +91,7 @@ pub async fn open(
     Ok(ws.max_message_size(1 << 20).on_upgrade(move |mut socket| async move {
         match prepared {
             Ok((hops, host_theme, trust)) => {
+                let _live = state.live.enter(id, crate::state::Live::Ssh);
                 run(state, user, ip, hops, host_theme, trust, size, token, socket).await
             }
             Err(e) => {

@@ -55,7 +55,10 @@ pub async fn open(
     let prepared = prepare(&state, &user, id, q.trust.as_deref()).await;
     Ok(ws.max_message_size(1 << 20).on_upgrade(move |socket| async move {
         match prepared {
-            Ok((row, trust)) => run(state, user, ip, row, trust, token, socket).await,
+            Ok((row, trust)) => {
+                let _live = state.live.enter(row.id, crate::state::Live::Rdp);
+                run(state, user, ip, row, trust, token, socket).await
+            }
             Err(e) => {
                 // Refus (accès, hôte sans RDP, empreinte invalide) : durable. Erreur interne (base
                 // momentanément indisponible) ou trop de tentatives : la reconnexion peut réussir.

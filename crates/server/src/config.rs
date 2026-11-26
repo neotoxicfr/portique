@@ -173,13 +173,14 @@ impl Config {
     }
 }
 
-/// Clé de tableau de bord : 32 caractères au moins (ex. `openssl rand -hex 32`), sans espace.
+/// Clé de tableau de bord : 32 caractères ASCII visibles au moins (ex. `openssl rand -hex 32`), seuls admis
+/// dans un en-tête `Authorization` lu comme texte.
 fn machine_key(env: &dyn Env, name: &str) -> anyhow::Result<Option<String>> {
     let key = secret(env, name)?;
     if let Some(k) = &key
-        && (k.len() < 32 || k.chars().any(char::is_whitespace))
+        && (k.len() < 32 || !k.bytes().all(|b| b.is_ascii_graphic()))
     {
-        bail!("{PREFIX}{name} : 32 caractères au moins, sans espace (openssl rand -hex 32)");
+        bail!("{PREFIX}{name} : 32 caractères ASCII au moins, sans espace (openssl rand -hex 32)");
     }
     Ok(key)
 }
@@ -301,6 +302,7 @@ mod tests {
         };
         assert!(with("trop-courte", "fedcba9876543210fedcba9876543210").is_err());
         assert!(with("0123456789abcdef 123456789abcdef0", "fedcba9876543210fedcba9876543210").is_err());
+        assert!(with("éééééééééééééééééééééééééééééééé", "fedcba9876543210fedcba9876543210").is_err());
         assert!(with(long, long).is_err(), "une même clé pour lire et réveiller");
         let c = with(long, "fedcba9876543210fedcba9876543210").unwrap();
         assert_eq!((c.status_key.as_deref(), c.wake_key.is_some()), (Some(long), true));

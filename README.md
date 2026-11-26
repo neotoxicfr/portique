@@ -194,7 +194,7 @@ Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets) ; définir les deux �
 | `PORTIQUE_DATA_DIR` | `/data` | base SQLite |
 | `PORTIQUE_STATIC_DIR` | `/app/web` | front compilé |
 | `PORTIQUE_INSECURE_COOKIES` | aucun | `1` = cookies sans `Secure` (développement en HTTP seulement) |
-| `PORTIQUE_STATUS_KEY(_FILE)` | aucun | clé d'un tableau de bord pour lire l'état des machines (32 caractères minimum) |
+| `PORTIQUE_STATUS_KEY(_FILE)` | aucun | clé d'un tableau de bord pour lire l'état des machines (32 caractères ASCII minimum) |
 | `PORTIQUE_WAKE_KEY(_FILE)` | aucun | clé d'un tableau de bord pour réveiller une machine, différente de la précédente |
 
 **Mode proxy.** La connexion intégrée est désactivée ; les comptes sont créés à partir de `Remote-User` et le

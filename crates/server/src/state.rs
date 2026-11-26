@@ -28,6 +28,48 @@ pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub limiter: Arc<LoginLimiter>,
     pub ceremonies: Arc<Ceremonies>,
+    pub live: Arc<LiveSessions>,
+}
+
+/// Sessions ouvertes par machine (bureau, terminal), en mémoire : ce que lit un tableau de bord.
+#[derive(Default)]
+pub struct LiveSessions(Mutex<HashMap<i64, [u32; 2]>>);
+
+#[derive(Clone, Copy)]
+pub enum Live {
+    Rdp = 0,
+    Ssh = 1,
+}
+
+/// Compte une session tant qu'il vit.
+pub struct LiveGuard {
+    set: Arc<LiveSessions>,
+    id: i64,
+    kind: Live,
+}
+
+impl LiveSessions {
+    pub fn enter(self: &Arc<Self>, id: i64, kind: Live) -> LiveGuard {
+        self.0.lock().unwrap().entry(id).or_default()[kind as usize] += 1;
+        LiveGuard { set: self.clone(), id, kind }
+    }
+
+    /// Bureaux et terminaux ouverts sur la machine `id`.
+    pub fn count(&self, id: i64) -> [u32; 2] {
+        self.0.lock().unwrap().get(&id).copied().unwrap_or_default()
+    }
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        let mut map = self.set.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.id) {
+            n[self.kind as usize] = n[self.kind as usize].saturating_sub(1);
+            if *n == [0, 0] {
+                map.remove(&self.id);
+            }
+        }
+    }
 }
 
 pub enum Ceremony {
@@ -154,6 +196,20 @@ mod tests {
     use webauthn_rs::prelude::Passkey;
 
     use super::*;
+
+    /// Une session compte tant que sa garde vit ; la machine disparaît du compte à la dernière.
+    #[test]
+    fn live_sessions_follow_their_guards() {
+        let live = Arc::new(LiveSessions::default());
+        let a = live.enter(7, Live::Rdp);
+        let b = live.enter(7, Live::Ssh);
+        let c = live.enter(7, Live::Ssh);
+        assert_eq!((live.count(7), live.count(8)), ([1, 2], [0, 0]));
+        drop((a, b));
+        assert_eq!(live.count(7), [0, 1]);
+        drop(c);
+        assert!(live.0.lock().unwrap().is_empty());
+    }
 
     /// Passkey ES256 factice (clé publique de l'exemple de webauthn-rs-core).
     const PASSKEY: &str = r#"{"cred":{"cred_id":"uZcVDBVS68E_MtAgeQpElJxldF_6cY9sSvbWqx_qRh8wiu42lyRBRmh5yFeD_r9k130dMbFHBHI9RTFgdJQIzQ","cred":{"type_":"ES256","key":{"EC_EC2":{"curve":"SECP256R1","x":[194,126,127,109,252,23,131,21,252,6,223,99,44,254,140,27,230,17,94,5,133,28,104,41,144,69,171,149,161,26,200,243],"y":[143,123,183,156,24,178,21,248,117,159,162,69,171,52,188,252,26,59,6,47,103,92,19,58,117,103,249,0,219,8,95,196]}}},"counter":2,"user_verified":false,"backup_eligible":false,"backup_state":false,"registration_policy":"preferred","extensions":{"cred_protect":"NotRequested","hmac_create_secret":"NotRequested"},"attestation":{"data":"None","metadata":"None"},"attestation_format":"None"}}"#;

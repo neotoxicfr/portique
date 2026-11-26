@@ -194,12 +194,29 @@ Chaque secret accepte `VAR` ou `VAR_FILE` (Docker secrets) ; définir les deux �
 | `PORTIQUE_DATA_DIR` | `/data` | base SQLite |
 | `PORTIQUE_STATIC_DIR` | `/app/web` | front compilé |
 | `PORTIQUE_INSECURE_COOKIES` | aucun | `1` = cookies sans `Secure` (développement en HTTP seulement) |
+| `PORTIQUE_STATUS_KEY(_FILE)` | aucun | clé d'un tableau de bord pour lire l'état des machines (32 caractères ASCII minimum) |
+| `PORTIQUE_WAKE_KEY(_FILE)` | aucun | clé d'un tableau de bord pour réveiller une machine, différente de la précédente |
 
 **Mode proxy.** La connexion intégrée est désactivée ; les comptes sont créés à partir de `Remote-User` et le
 rôle admin suit le groupe à chaque requête. Seuls les proxys de confiance peuvent fournir ces en-têtes. Le proxy
 doit authentifier **toutes** les requêtes : une règle de contournement, pour le réseau local par exemple, laisse
 passer des requêtes sans `Remote-User`, que l'API refuse. Il doit aussi exiger la double authentification si
 tu utilises le SSH.
+
+**Tableau de bord.** Avec ces clés (par exemple `openssl rand -hex 32`), un tableau de bord appelle Portique
+directement, sans passer par le proxy, avec l'en-tête `Authorization: Bearer <clé>` :
+
+- `GET /api/machine/status` (clé de lecture) renvoie chaque machine avec son nom, ses accès (RDP, SSH,
+  réveil), si son port répond (`online`, `null` si Portique ne la joint que par un rebond) et ses sessions
+  ouvertes. La réponse ne contient ni adresse, ni MAC, ni compte.
+- `POST /api/machine/wake/<id>` (clé de réveil, sans corps) réveille la machine `<id>` comme son bouton.
+
+Chaque clé n'ouvre que sa route, rien d'autre de l'API. Sans clé, la route répond 404.
+
+```json
+{"machines": [{"id": 1, "name": "PC", "rdp": true, "ssh": false, "can_wake": true, "online": true,
+  "sessions": {"rdp": 1, "ssh": 0}}], "online": 1, "sessions": {"rdp": 1, "ssh": 0}}
+```
 
 **Haute disponibilité.** Portique ne gère pas plusieurs instances : chacune a sa base. Pour une instance de
 secours, laisse le reverse proxy basculer (par exemple un service `failover` de Traefik, healthcheck sur
@@ -219,6 +236,8 @@ comptes (ou le mode proxy), ses machines et ses approbations de certificats et d
 - CSP stricte (seul le script d'amorce du wasm est autorisé, par son empreinte) ; cookies `SameSite=Strict` ;
   en-tête anti-CSRF ; contrôle d'origine du WebSocket ; limitation des tentatives de connexion.
 - Sessions RDP et SSH coupées dès que la session web est révoquée ou l'accès retiré.
+- Clés de tableau de bord facultatives et séparées : l'une ne fait que lire l'état des machines, l'autre ne
+  fait que les réveiller ; elles n'ouvrent ni bureau, ni terminal, ni administration.
 - Budgets de mémoire et de CPU sur tout ce qui vient du PC (surfaces, cache, régions H.264).
 
 Pour signaler une faille : [SECURITY.md](SECURITY.md).

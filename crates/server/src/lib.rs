@@ -67,6 +67,7 @@ pub fn build_state(cfg: Config, db: SqlitePool) -> anyhow::Result<AppState> {
         webauthn: Arc::new(webauthn),
         limiter: Arc::new(LoginLimiter::default()),
         ceremonies: Arc::new(Ceremonies::default()),
+        live: Arc::default(),
     })
 }
 
@@ -181,10 +182,10 @@ pub fn app(state: AppState) -> Router {
         ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
     );
 
-    let api = api::router().layer(middleware::from_fn(csrf_guard)).layer(SetResponseHeaderLayer::overriding(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    ));
+    // Routes d'un tableau de bord : clé Bearer, ni cookie ni en-tête CSRF (voir api::machine).
+    let api = api::router().layer(middleware::from_fn(csrf_guard)).merge(api::machine::router()).layer(
+        SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+    );
 
     let hdr = |name: &'static str, value: &'static str| {
         SetResponseHeaderLayer::overriding(HeaderName::from_static(name), HeaderValue::from_static(value))

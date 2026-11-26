@@ -25,6 +25,10 @@ pub struct Config {
     pub proxy: ProxyConfig,
     /// Cookies `Secure` : désactivable seulement pour du développement en HTTP local.
     pub secure_cookies: bool,
+    /// Clés d'un tableau de bord (`Authorization: Bearer`) : lecture de l'état des machines, réveil.
+    /// Absentes : les routes `/api/machine/*` répondent 404.
+    pub status_key: Option<String>,
+    pub wake_key: Option<String>,
 }
 
 // Debug à la main : la clé maîtresse et le mot de passe admin ne doivent jamais finir dans un journal.
@@ -40,6 +44,8 @@ impl std::fmt::Debug for Config {
             .field("auth_mode", &self.auth_mode)
             .field("proxy", &self.proxy)
             .field("secure_cookies", &self.secure_cookies)
+            .field("status_key", &self.status_key.as_ref().map(|_| "<masquée>"))
+            .field("wake_key", &self.wake_key.as_ref().map(|_| "<masquée>"))
             .finish()
     }
 }
@@ -138,6 +144,12 @@ impl Config {
             bail!("PORTIQUE_AUTH_MODE=proxy exige PORTIQUE_TRUSTED_PROXIES (IP, CIDR ou nom du proxy)");
         }
 
+        let status_key = machine_key(env, "STATUS_KEY")?;
+        let wake_key = machine_key(env, "WAKE_KEY")?;
+        if status_key.is_some() && status_key == wake_key {
+            bail!("PORTIQUE_STATUS_KEY et PORTIQUE_WAKE_KEY doivent être différentes");
+        }
+
         Ok(Self {
             listen,
             data_dir,
@@ -155,8 +167,22 @@ impl Config {
                 admin_group: plain(env, "PROXY_ADMIN_GROUP"),
             },
             secure_cookies: plain(env, "INSECURE_COOKIES").as_deref() != Some("1"),
+            status_key,
+            wake_key,
         })
     }
+}
+
+/// Clé de tableau de bord : 32 caractères ASCII visibles au moins (ex. `openssl rand -hex 32`), seuls admis
+/// dans un en-tête `Authorization` lu comme texte.
+fn machine_key(env: &dyn Env, name: &str) -> anyhow::Result<Option<String>> {
+    let key = secret(env, name)?;
+    if let Some(k) = &key
+        && (k.len() < 32 || !k.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        bail!("{PREFIX}{name} : 32 caractères ASCII au moins, sans espace (openssl rand -hex 32)");
+    }
+    Ok(key)
 }
 
 /// Fréquence de résolution des proxys désignés par nom, et durée de validité d'un résultat.
@@ -260,6 +286,27 @@ mod tests {
             ("PORTIQUE_AUTH_MODE", "proxy"),
         ];
         assert!(Config::from_env(&env).is_err());
+    }
+
+    #[test]
+    fn machine_keys_long_and_distinct() {
+        let long = "0123456789abcdef0123456789abcdef";
+        let with = |status: &'static str, wake: &'static str| {
+            let env = [
+                ("PORTIQUE_PUBLIC_URL", "https://rdp.example.com"),
+                ("PORTIQUE_MASTER_KEY", KEY),
+                ("PORTIQUE_STATUS_KEY", status),
+                ("PORTIQUE_WAKE_KEY", wake),
+            ];
+            Config::from_env(&env)
+        };
+        assert!(with("trop-courte", "fedcba9876543210fedcba9876543210").is_err());
+        assert!(with("0123456789abcdef 123456789abcdef0", "fedcba9876543210fedcba9876543210").is_err());
+        assert!(with("éééééééééééééééééééééééééééééééé", "fedcba9876543210fedcba9876543210").is_err());
+        assert!(with(long, long).is_err(), "une même clé pour lire et réveiller");
+        let c = with(long, "fedcba9876543210fedcba9876543210").unwrap();
+        assert_eq!((c.status_key.as_deref(), c.wake_key.is_some()), (Some(long), true));
+        assert!(!format!("{c:?}").contains(long), "clé dans le Debug");
     }
 
     #[test]

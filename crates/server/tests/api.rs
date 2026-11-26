@@ -546,3 +546,118 @@ async fn missing_fingerprinted_asset_is_not_cached_forever() {
     assert!(!res.status().is_success());
     assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
 }
+
+const STATUS_KEY: &str = "status-0123456789abcdef0123456789abcdef";
+const WAKE_KEY: &str = "wake-fedcba9876543210fedcba9876543210";
+
+/// Requête d'un tableau de bord : clé Bearer seule, sans cookie ni en-tête CSRF.
+async fn bearer(app: &Router, method: &str, uri: &str, key: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(k) = key {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {k}"));
+    }
+    let res = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Tableau de bord : état sans adresse, MAC ni compte ; réveil seul ; chaque clé n'ouvre que sa route.
+#[tokio::test]
+async fn dashboard_keys_read_status_and_wake_only() {
+    let app =
+        setup(&[("PORTIQUE_STATUS_KEY", STATUS_KEY), ("PORTIQUE_WAKE_KEY", WAKE_KEY)], "203.0.113.5:4000")
+            .await;
+    let admin = login(&app, "admin", ADMIN_PW).await;
+    let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = open.local_addr().unwrap().port();
+    let down = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = udp.local_addr().unwrap().to_string();
+    let create = |body: Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let r = call(&app, "POST", "/api/admin/connections", Some(&admin), Some(body), &[]).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+            r.body["id"].as_i64().unwrap()
+        }
+    };
+    let pc = create(json!({"name": "PC", "host": "127.0.0.1", "port": up, "username": "alice",
+        "wol_mac": "00:11:22:33:44:55", "wol_target": target}))
+    .await;
+    create(json!({"name": "Éteint", "host": "127.0.0.1", "port": down, "username": "alice"})).await;
+    let gw = create(json!({"name": "Passerelle", "host": "127.0.0.1", "rdp": false,
+        "ssh": {"user": "root", "port": up}}))
+    .await;
+    create(json!({"name": "Serveur", "host": "192.0.2.7", "rdp": false,
+        "ssh": {"user": "root", "jump": {"kind": "known", "id": gw}}}))
+    .await;
+
+    // Sans clé, mauvaise clé, clé de réveil : refusé.
+    for key in [None, Some("mauvaise"), Some(WAKE_KEY)] {
+        let (s, _) = bearer(&app, "GET", "/api/machine/status", key).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{key:?}");
+    }
+    let (s, body) = bearer(&app, "GET", "/api/machine/status", Some(STATUS_KEY)).await;
+    assert_eq!(s, StatusCode::OK, "{body:?}");
+    let text = body.to_string();
+    for secret in ["127.0.0.1", "192.0.2.7", "00:11:22", "alice", "root"] {
+        assert!(!text.contains(secret), "{secret} dans {text}");
+    }
+    let m =
+        |name: &str| body["machines"].as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
+    assert_eq!((m("PC")["online"].clone(), m("PC")["can_wake"].clone()), (json!(true), json!(true)));
+    assert_eq!(m("Éteint")["online"], json!(false));
+    assert_eq!(m("Passerelle")["online"], json!(true), "SSH direct sondé");
+    assert_eq!(m("Serveur")["online"], Value::Null, "joint par un rebond : inconnu");
+    assert_eq!(body["online"], 2);
+    assert_eq!(body["sessions"], json!({"rdp": 0, "ssh": 0}));
+
+    // Réveil : clé de lecture refusée, POST sans corps ni en-tête CSRF accepté, paquet magique envoyé.
+    let uri = format!("/api/machine/wake/{pc}");
+    for key in [None, Some(STATUS_KEY)] {
+        let (s, _) = bearer(&app, "POST", &uri, key).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{key:?}");
+    }
+    let (s, body) = bearer(&app, "POST", &uri, Some(WAKE_KEY)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{body:?}");
+    let mut packet = [0u8; 200];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (n, &packet[..6], &packet[6..12]),
+        (102, &[0xFF; 6][..], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55][..])
+    );
+    // Rebond caché ou machine inconnue : introuvable ; machine sans WoL : refus explicite.
+    let (s, _) = bearer(&app, "POST", "/api/machine/wake/9999", Some(WAKE_KEY)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = bearer(&app, "POST", &format!("/api/machine/wake/{gw}"), Some(WAKE_KEY)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // La clé de réveil n'ouvre rien d'autre de l'API.
+    let r = call(
+        &app,
+        "GET",
+        "/api/connections",
+        None,
+        None,
+        &[("authorization", &format!("Bearer {WAKE_KEY}"))],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    drop(open);
+}
+
+/// Sans clé configurée, les routes du tableau de bord n'existent pas.
+#[tokio::test]
+async fn dashboard_routes_off_without_keys() {
+    let app = setup(&[], "203.0.113.5:4000").await;
+    let (s, _) = bearer(&app, "GET", "/api/machine/status", Some(STATUS_KEY)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = bearer(&app, "POST", "/api/machine/wake/1", Some(WAKE_KEY)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}

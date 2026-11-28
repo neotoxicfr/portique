@@ -10,7 +10,7 @@
 ![WebAssembly](https://img.shields.io/badge/front-Leptos%20%2B%20wasm-654ff0?logo=webassembly)
 ![Images](https://img.shields.io/badge/images-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)
 ![Licence](https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-blue)
-![Version](https://img.shields.io/badge/version-v0.5.1-green)
+![Version](https://img.shields.io/badge/version-v0.5.2-green)
 
 </div>
 
@@ -211,7 +211,8 @@ directement, sans passer par le proxy, avec l'en-tête `Authorization: Bearer <c
   ouvertes. La réponse ne contient ni adresse, ni MAC, ni compte.
 - `POST /api/machine/wake/<id>` (clé de réveil, sans corps) réveille la machine `<id>` comme son bouton.
 
-Chaque clé n'ouvre que sa route, rien d'autre de l'API. Sans clé, la route répond 404.
+Chaque clé n'ouvre que sa route, rien d'autre de l'API. Une route dont la clé n'est pas configurée répond
+404 ; une clé absente ou fausse, 401.
 
 ```json
 {"machines": [{"id": 1, "name": "PC", "rdp": true, "ssh": false, "can_wake": true, "online": true,

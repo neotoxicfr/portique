@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "portique-proto"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "uuid",
@@ -2941,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "portique-server"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "portique-web"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "console_error_panic_hook",
  "futures",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-auth"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "hmac",
  "md-5",
@@ -3225,15 +3225,15 @@ dependencies = [
 
 [[package]]
 name = "rdp-clip"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "rdp-codecs"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "rdp-connect"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rand 0.10.4",
  "rdp-auth",
@@ -3247,18 +3247,18 @@ dependencies = [
 
 [[package]]
 name = "rdp-gfx"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rdp-codecs",
 ]
 
 [[package]]
 name = "rdp-pdu"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "rdp-probe"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "png",
@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-session"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rdp-pdu",
 ]

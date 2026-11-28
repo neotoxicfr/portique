@@ -8,7 +8,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [S
 
 - Clés de tableau de bord, facultatives et distinctes : `PORTIQUE_STATUS_KEY(_FILE)` ouvre `GET /api/machine/status`
   (machines, accès, port joignable, sessions ouvertes ; ni adresse, ni MAC, ni compte) et `PORTIQUE_WAKE_KEY(_FILE)`
-  ouvre `POST /api/machine/wake/<id>` (réveil seul), avec `Authorization: Bearer`. Sans clé, ces routes répondent 404.
+  ouvre `POST /api/machine/wake/<id>` (réveil seul), avec `Authorization: Bearer`. Une route dont la clé n'est pas configurée répond 404 ; une clé absente
+  ou fausse, 401.
 - `scripts/ci.sh` lance aussi cargo-deny (`deny.toml` : failles, licences, doublons, provenance), cargo-nextest
   (et `cargo test --doc`) et cargo-machete (dépendances inutilisées) ; cargo-deny remplace cargo-audit.
 

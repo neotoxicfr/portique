@@ -211,7 +211,8 @@ directement, sans passer par le proxy, avec l'en-tête `Authorization: Bearer <c
   ouvertes. La réponse ne contient ni adresse, ni MAC, ni compte.
 - `POST /api/machine/wake/<id>` (clé de réveil, sans corps) réveille la machine `<id>` comme son bouton.
 
-Chaque clé n'ouvre que sa route, rien d'autre de l'API. Sans clé, la route répond 404.
+Chaque clé n'ouvre que sa route, rien d'autre de l'API. Une route dont la clé n'est pas configurée répond
+404 ; une clé absente ou fausse, 401.
 
 ```json
 {"machines": [{"id": 1, "name": "PC", "rdp": true, "ssh": false, "can_wake": true, "online": true,

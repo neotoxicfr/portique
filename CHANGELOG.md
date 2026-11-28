@@ -2,6 +2,25 @@
 
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions : [SemVer](https://semver.org/lang/fr/).
 
+## [v0.5.2] - 2026-11-28
+
+### Ajouté
+
+- Clés de tableau de bord, facultatives et distinctes : `PORTIQUE_STATUS_KEY(_FILE)` ouvre `GET /api/machine/status`
+  (machines, accès, port joignable, sessions ouvertes ; ni adresse, ni MAC, ni compte) et `PORTIQUE_WAKE_KEY(_FILE)`
+  ouvre `POST /api/machine/wake/<id>` (réveil seul), avec `Authorization: Bearer`. Sans clé, ces routes répondent 404.
+- `scripts/ci.sh` lance aussi cargo-deny (`deny.toml` : failles, licences, doublons, provenance), cargo-nextest
+  (et `cargo test --doc`) et cargo-machete (dépendances inutilisées) ; cargo-deny remplace cargo-audit.
+
+### Corrigé
+
+- Bureau RDP en H.264 4:4:4 sur iPhone (images NV12) : plus de points de couleur à droite des icônes et du texte.
+  La vue auxiliaire AVC444v2 se découpe selon la largeur arrondie au multiple de 32, comme le fait l'encodeur.
+- Barre d'onglets du téléphone plus près du bas de l'écran.
+- Image arm64 : wasm-opt installé une fois, dans une couche en cache, empreinte vérifiée ; un lien lent ne fait plus
+  échouer la construction.
+- `cookie` 0.18.3 (RUSTSEC-2026-0594, non atteignable : cookies simples, aucun fork).
+
 ## [v0.5.1] - 2026-11-21
 
 ### Corrigé
